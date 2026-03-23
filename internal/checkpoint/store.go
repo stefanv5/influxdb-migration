@@ -1,0 +1,211 @@
+package checkpoint
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/migration-tools/influx-migrator/pkg/types"
+)
+
+type SQLiteStore struct {
+	db *sql.DB
+}
+
+func NewSQLiteStore(dir string) (*SQLiteStore, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create checkpoint dir: %w", err)
+	}
+
+	dbPath := filepath.Join(dir, "checkpoints.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite: %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping sqlite: %w", err)
+	}
+
+	store := &SQLiteStore{db: db}
+	if err := store.initSchema(); err != nil {
+		return nil, fmt.Errorf("failed to init schema: %w", err)
+	}
+
+	return store, nil
+}
+
+func (s *SQLiteStore) initSchema() error {
+	schema := `
+	CREATE TABLE IF NOT EXISTS checkpoints (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id TEXT NOT NULL,
+		task_name TEXT NOT NULL,
+		source_table TEXT NOT NULL,
+		target_meas TEXT NOT NULL,
+		last_id INTEGER DEFAULT 0,
+		last_timestamp TEXT,
+		processed_rows INTEGER DEFAULT 0,
+		status TEXT DEFAULT 'pending',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		error_message TEXT,
+		UNIQUE(task_id, source_table)
+	);
+
+	CREATE TABLE IF NOT EXISTS migration_tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id TEXT UNIQUE NOT NULL,
+		task_name TEXT NOT NULL,
+		source_adapter TEXT NOT NULL,
+		target_adapter TEXT NOT NULL,
+		status TEXT DEFAULT 'pending',
+		total_rows INTEGER DEFAULT 0,
+		migrated_rows INTEGER DEFAULT 0,
+		failed_rows INTEGER DEFAULT 0,
+		started_at TEXT,
+		completed_at TEXT,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	`
+
+	_, err := s.db.Exec(schema)
+	return err
+}
+
+func (s *SQLiteStore) Close() error {
+	return s.db.Close()
+}
+
+func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
+	query := `
+	INSERT INTO checkpoints (task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(task_id, source_table) DO UPDATE SET
+		last_id = excluded.last_id,
+		last_timestamp = excluded.last_timestamp,
+		processed_rows = excluded.processed_rows,
+		status = excluded.status,
+		updated_at = excluded.updated_at,
+		error_message = excluded.error_message
+	`
+
+	now := time.Now().UTC()
+	ts := ""
+	if !cp.LastTimestamp.IsZero() {
+		ts = cp.LastTimestamp.Format(time.RFC3339)
+	}
+
+	_, err := s.db.Exec(query,
+		cp.TaskID, cp.TaskName, cp.SourceTable, cp.TargetMeas,
+		cp.LastID, ts, cp.ProcessedRows, cp.Status,
+		now.Format(time.RFC3339), now.Format(time.RFC3339),
+		cp.ErrorMessage,
+	)
+	return err
+}
+
+func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpoint, error) {
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message
+	          FROM checkpoints WHERE task_id = ? AND source_table = ?`
+
+	var cp types.Checkpoint
+	var lastTS, createdAt, updatedAt sql.NullString
+
+	err := s.db.QueryRow(query, taskID, sourceTable).Scan(
+		&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
+		&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
+		&createdAt, &updatedAt, &cp.ErrorMessage,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if lastTS.Valid {
+		cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
+	}
+
+	return &cp, nil
+}
+
+func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error) {
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message
+	          FROM checkpoints WHERE task_id = ?`
+
+	rows, err := s.db.Query(query, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var checkpoints []*types.Checkpoint
+	for rows.Next() {
+		var cp types.Checkpoint
+		var lastTS, createdAt, updatedAt sql.NullString
+
+		err := rows.Scan(
+			&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
+			&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
+			&createdAt, &updatedAt, &cp.ErrorMessage,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if lastTS.Valid {
+			cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
+		}
+
+		checkpoints = append(checkpoints, &cp)
+	}
+
+	return checkpoints, rows.Err()
+}
+
+func (s *SQLiteStore) UpdateTaskStatus(taskID string, status types.CheckpointStatus, errMsg string) error {
+	query := `UPDATE checkpoints SET status = ?, updated_at = ?, error_message = ? WHERE task_id = ?`
+	now := time.Now().UTC()
+	_, err := s.db.Exec(query, status, now.Format(time.RFC3339), errMsg, taskID)
+	return err
+}
+
+func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.Checkpoint, error) {
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message
+	          FROM checkpoints WHERE status = ?`
+
+	rows, err := s.db.Query(query, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var checkpoints []*types.Checkpoint
+	for rows.Next() {
+		var cp types.Checkpoint
+		var lastTS, createdAt, updatedAt sql.NullString
+
+		err := rows.Scan(
+			&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
+			&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
+			&createdAt, &updatedAt, &cp.ErrorMessage,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if lastTS.Valid {
+			cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
+		}
+
+		checkpoints = append(checkpoints, &cp)
+	}
+
+	return checkpoints, rows.Err()
+}

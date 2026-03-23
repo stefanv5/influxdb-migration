@@ -1,0 +1,33 @@
+# Binaries
+migrate
+*.exe
+
+# Test binary
+*.test
+
+# Output
+output/
+
+# Checkpoints
+checkpoints/
+
+# Reports
+reports/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+*.log
+
+# Config (keep example)
+config.yaml
+!config.yaml.example
