@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/migration-tools/influx-migrator/internal/adapter"
@@ -75,7 +76,10 @@ func (a *TDengineAdapter) Connect(ctx context.Context, config map[string]interfa
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
-	a.client = &http.Client{Transport: transport}
+	a.client = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	return nil
 }
@@ -84,7 +88,9 @@ func (a *TDengineAdapter) Disconnect(ctx context.Context) error {
 	if a.client != nil {
 		a.client.CloseIdleConnections()
 	}
-	logger.Info("disconnecting from TDengine", zap.String("database", a.config.Database))
+	if a.config != nil {
+		logger.Info("disconnecting from TDengine", zap.String("database", a.config.Database))
+	}
 	return nil
 }
 
@@ -96,7 +102,7 @@ func (a *TDengineAdapter) Ping(ctx context.Context) error {
 func (a *TDengineAdapter) DiscoverTables(ctx context.Context) ([]string, error) {
 	query := "SHOW TABLES"
 	if a.config != nil && a.config.Database != "" {
-		query = fmt.Sprintf("SHOW TABLES FROM %s", a.config.Database)
+		query = fmt.Sprintf("SHOW TABLES FROM %s", tdengineQuoteIdentifier(a.config.Database))
 	}
 
 	data, err := a.executeQuery(ctx, query)
@@ -299,10 +305,8 @@ func decodeTDConfig(config map[string]interface{}, cfg interface{}) error {
 
 func tdengineQuoteIdentifier(s string) string {
 	if s == "" {
-		return s
+		return "`" + "`"
 	}
-	if s[0] != '`' {
-		return "`" + s + "`"
-	}
-	return s
+	result := "`" + strings.ReplaceAll(s, "`", "``") + "`"
+	return result
 }

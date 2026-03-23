@@ -2,6 +2,7 @@ package engine
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/migration-tools/influx-migrator/pkg/types"
 )
@@ -98,8 +99,10 @@ func toFloat64(value interface{}) float64 {
 	case int64:
 		return float64(v)
 	case string:
-		var f float64
-		return f
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+		return 0
 	default:
 		return 0
 	}
@@ -111,7 +114,17 @@ func toInt64(value interface{}) int64 {
 		return v
 	case int:
 		return int64(v)
+	case int32:
+		return int64(v)
+	case uint64:
+		return int64(v)
+	case uint:
+		return int64(v)
+	case uint32:
+		return int64(v)
 	case float64:
+		return int64(v)
+	case float32:
 		return int64(v)
 	case string:
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -129,12 +142,22 @@ func toString(value interface{}) string {
 		return v
 	case float64:
 		return strconv.FormatFloat(v, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
 	case int64:
 		return strconv.FormatInt(v, 10)
 	case int:
 		return strconv.Itoa(v)
-	case float32:
-		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case int32:
+		return strconv.FormatInt(int64(v), 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	case uint:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10)
+	case bool:
+		return strconv.FormatBool(v)
 	default:
 		return ""
 	}
@@ -145,8 +168,13 @@ func toBool(value interface{}) bool {
 	case bool:
 		return v
 	case string:
-		return v == "true" || v == "1"
+		lower := strings.ToLower(v)
+		return lower == "true" || lower == "yes" || lower == "on" || lower == "1"
 	case int64:
+		return v != 0
+	case int:
+		return v != 0
+	case float64:
 		return v != 0
 	default:
 		return false

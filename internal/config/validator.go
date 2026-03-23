@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/migration-tools/influx-migrator/pkg/types"
@@ -75,7 +76,7 @@ func (v *ConfigValidator) validateSourceSSL(src types.SourceConfig) {
 	}
 
 	if src.Type == "influxdb" {
-		if len(src.InfluxDB.URL) > 0 && src.InfluxDB.URL[:5] != "https" {
+		if len(src.InfluxDB.URL) >= 5 && !strings.HasPrefix(src.InfluxDB.URL, "https") {
 			v.errors = append(v.errors, fmt.Errorf("source %s: influxdb URL must use https when SSL is enabled", src.Name))
 		}
 	}

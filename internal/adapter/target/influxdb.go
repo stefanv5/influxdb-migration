@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/migration-tools/influx-migrator/internal/adapter"
 	"github.com/migration-tools/influx-migrator/pkg/types"
@@ -65,7 +66,10 @@ func (a *InfluxDBV1TargetAdapter) Connect(ctx context.Context, config map[string
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
-	a.client = &http.Client{Transport: transport}
+	a.client = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	return nil
 }
@@ -241,7 +245,11 @@ func (a *InfluxDBV1TargetAdapter) writeLines(ctx context.Context, body string) e
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("write failed with status %d: %s", resp.StatusCode, string(respBody))
+		bodyStr := string(respBody)
+		if len(bodyStr) > 200 {
+			bodyStr = bodyStr[:200] + "..."
+		}
+		return fmt.Errorf("write failed with status %d: %s", resp.StatusCode, bodyStr)
 	}
 
 	return nil
@@ -399,7 +407,10 @@ func (a *InfluxDBV2TargetAdapter) Connect(ctx context.Context, config map[string
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
-	a.client = &http.Client{Transport: transport}
+	a.client = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	return nil
 }
@@ -508,7 +519,11 @@ func (a *InfluxDBV2TargetAdapter) writeLines(ctx context.Context, lines []string
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("write failed with status %d: %s", resp.StatusCode, string(respBody))
+		bodyStr := string(respBody)
+		if len(bodyStr) > 200 {
+			bodyStr = bodyStr[:200] + "..."
+		}
+		return fmt.Errorf("write failed with status %d: %s", resp.StatusCode, bodyStr)
 	}
 
 	return nil

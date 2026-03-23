@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/migration-tools/influx-migrator/internal/adapter"
 	"github.com/migration-tools/influx-migrator/internal/logger"
@@ -76,7 +77,10 @@ func (a *TDengineTargetAdapter) Connect(ctx context.Context, config map[string]i
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
-	a.client = &http.Client{Transport: transport}
+	a.client = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	return nil
 }

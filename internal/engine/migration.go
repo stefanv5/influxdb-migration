@@ -18,6 +18,7 @@ type MigrationEngine struct {
 	targetRegistry *adapter.AdapterRegistry
 	checkpointMgr  *checkpoint.Manager
 	rateLimiter    *RateLimiter
+	transformer    *TransformEngine
 	config         *types.MigrationConfig
 	taskQueue      chan *MigrationTask
 	wg             sync.WaitGroup
@@ -47,6 +48,7 @@ func NewMigrationEngine(cfg *types.MigrationConfig, checkpointMgr *checkpoint.Ma
 		targetRegistry: adapter.GetRegistry(),
 		checkpointMgr:  checkpointMgr,
 		rateLimiter:    rateLimiter,
+		transformer:    NewTransformEngine(),
 		config:         cfg,
 		taskQueue:      make(chan *MigrationTask, cfg.Migration.ParallelTasks*2),
 	}
@@ -172,7 +174,7 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	switch task.Mapping.TimeRange.Start {
 	case "":
 		_, err = sourceAdapter.QueryData(ctx, sourceTable, lastCheckpoint, func(records []types.Record) error {
-			return e.processBatch(ctx, task, records, targetAdapter, task.Mapping.TargetMeasurement)
+			return e.processBatch(ctx, task.Mapping, records, targetAdapter)
 		})
 	default:
 		_, err = e.queryWithTimeRange(ctx, sourceAdapter, sourceTable, task.Mapping, lastCheckpoint, targetAdapter)
@@ -234,7 +236,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 		}
 
 		cp, err := sourceAdapter.QueryData(ctx, table, currentCp, func(records []types.Record) error {
-			return e.processBatch(ctx, nil, records, targetAdapter, mapping.TargetMeasurement)
+			return e.processBatch(ctx, &windowMapping, records, targetAdapter)
 		})
 
 		if err != nil {
@@ -255,7 +257,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 	}, nil
 }
 
-func (e *MigrationEngine) processBatch(ctx context.Context, task *MigrationTask, records []types.Record, targetAdapter adapter.TargetAdapter, measurement string) error {
+func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.MappingConfig, records []types.Record, targetAdapter adapter.TargetAdapter) error {
 	if e.rateLimiter != nil {
 		e.rateLimiter.Wait(len(records))
 	}
@@ -266,12 +268,20 @@ func (e *MigrationEngine) processBatch(ctx context.Context, task *MigrationTask,
 		transformed = append(transformed, *filtered)
 	}
 
+	if mapping != nil && (len(mapping.Schema.Fields) > 0 || len(mapping.Schema.Tags) > 0) {
+		schemaTransformed := make([]types.Record, 0, len(transformed))
+		for i := range transformed {
+			result := e.transformer.Transform(&transformed[i], mapping)
+			schemaTransformed = append(schemaTransformed, *result)
+		}
+		transformed = schemaTransformed
+	}
+
 	logger.Debug("processing batch",
 		zap.Int("input_records", len(records)),
-		zap.Int("output_records", len(transformed)),
-		zap.String("measurement", measurement))
+		zap.Int("output_records", len(transformed)))
 
-	return targetAdapter.WriteBatch(ctx, measurement, transformed)
+	return targetAdapter.WriteBatch(ctx, mapping.TargetMeasurement, transformed)
 }
 
 func filterNilValues(record *types.Record) *types.Record {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/migration-tools/influx-migrator/internal/adapter"
@@ -67,7 +68,10 @@ func (a *InfluxDBV1Adapter) Connect(ctx context.Context, config map[string]inter
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
-	a.client = &http.Client{Transport: transport}
+	a.client = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	return nil
 }
@@ -130,7 +134,7 @@ func (a *InfluxDBV1Adapter) DiscoverTables(ctx context.Context) ([]string, error
 }
 
 func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
-	query := fmt.Sprintf("SHOW SERIES FROM \"%s\"", measurement)
+	query := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
 	results, err := a.executeQuery(ctx, query)
 	if err != nil {
 		return nil, err
@@ -170,8 +174,8 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 	totalRecords := 0
 
 	for {
-		query := fmt.Sprintf(`SELECT * FROM "%s" WHERE time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
-			measurement, startTime, endTime, batchSize)
+		query := fmt.Sprintf(`SELECT * FROM %s WHERE time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
+			influxQuoteIdentifier(measurement), startTime, endTime, batchSize)
 
 		records, err := a.executeSelectQuery(ctx, query)
 		if err != nil {
@@ -418,7 +422,10 @@ func (a *InfluxDBV2Adapter) Connect(ctx context.Context, config map[string]inter
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
-	a.client = &http.Client{Transport: transport}
+	a.client = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	return nil
 }
@@ -673,4 +680,11 @@ func decodeInfluxV2Config(config map[string]interface{}, cfg interface{}) error 
 	}
 
 	return nil
+}
+
+func influxQuoteIdentifier(s string) string {
+	if s == "" {
+		return `""`
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
