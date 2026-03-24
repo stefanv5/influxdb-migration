@@ -116,3 +116,12 @@ func (m *Manager) MarkTaskInProgress(ctx context.Context, taskID, sourceTable st
 		zap.String("source_table", sourceTable))
 	return m.store.SaveCheckpoint(cp)
 }
+
+
+func (m *Manager) ResetAll(ctx context.Context) error {
+	return m.store.ResetAll()
+}
+
+func (m *Manager) DeleteCheckpoint(ctx context.Context, taskID, sourceTable string) error {
+	return m.store.DeleteCheckpoint(taskID, sourceTable)
+}

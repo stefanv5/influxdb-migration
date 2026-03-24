@@ -401,8 +401,27 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 		return fmt.Errorf("failed to get failed tasks: %w", err)
 	}
 
+	inProgressTasks, err := e.checkpointMgr.GetInProgressTasks(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get in-progress tasks: %w", err)
+	}
+
 	for _, cp := range failedTasks {
-		logger.Info("resuming task",
+		logger.Info("resuming failed task",
+			zap.String("task_id", cp.TaskID),
+			zap.String("source_table", cp.SourceTable))
+
+		task := &MigrationTask{
+			ID:      cp.TaskID,
+			Mapping: &types.MappingConfig{SourceTable: cp.SourceTable, TargetMeasurement: cp.TargetMeas},
+			Status:  types.StatusPending,
+		}
+
+		e.taskQueue <- task
+	}
+
+	for _, cp := range inProgressTasks {
+		logger.Info("resuming interrupted task",
 			zap.String("task_id", cp.TaskID),
 			zap.String("source_table", cp.SourceTable))
 
@@ -424,4 +443,19 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 
 	e.wg.Wait()
 	return nil
+}
+
+func (e *MigrationEngine) MarkInProgressAsInterrupted(ctx context.Context) {
+	inProgress, err := e.checkpointMgr.GetInProgressTasks(ctx)
+	if err != nil {
+		logger.Error("failed to get in-progress tasks", zap.Error(err))
+		return
+	}
+
+	for _, cp := range inProgress {
+		logger.Info("marking task as interrupted", zap.String("task_id", cp.TaskID))
+		if err := e.checkpointMgr.MarkTaskFailed(ctx, cp.TaskID, cp.SourceTable, "interrupted by user"); err != nil {
+			logger.Error("failed to mark task as interrupted", zap.Error(err))
+		}
+	}
 }

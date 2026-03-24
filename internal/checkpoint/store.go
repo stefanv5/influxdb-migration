@@ -209,3 +209,16 @@ func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.
 
 	return checkpoints, rows.Err()
 }
+
+
+func (s *SQLiteStore) ResetAll() error {
+	query := `DELETE FROM checkpoints`
+	_, err := s.db.Exec(query)
+	return err
+}
+
+func (s *SQLiteStore) DeleteCheckpoint(taskID, sourceTable string) error {
+	query := `DELETE FROM checkpoints WHERE task_id = ? AND source_table = ?`
+	_, err := s.db.Exec(query, taskID, sourceTable)
+	return err
+}
