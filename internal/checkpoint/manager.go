@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/migration-tools/influx-migrator/internal/logger"
 	"github.com/migration-tools/influx-migrator/pkg/types"
@@ -32,7 +31,7 @@ func (m *Manager) CreateCheckpoint(task *types.Checkpoint) error {
 	return m.store.SaveCheckpoint(task)
 }
 
-func (m *Manager) SaveCheckpoint(ctx context.Context, taskID, sourceTable string, lastID int64, lastTS time.Time, processedRows int64, status types.CheckpointStatus) error {
+func (m *Manager) SaveCheckpoint(ctx context.Context, taskID, sourceTable string, lastID int64, lastTS int64, processedRows int64, status types.CheckpointStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

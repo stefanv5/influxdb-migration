@@ -106,8 +106,8 @@ func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 
 	now := time.Now().UTC()
 	ts := ""
-	if !cp.LastTimestamp.IsZero() {
-		ts = cp.LastTimestamp.Format(time.RFC3339)
+	if cp.LastTimestamp != 0 {
+		ts = time.Unix(0, cp.LastTimestamp).Format(time.RFC3339Nano)
 	}
 
 	var mappingConfigJSON []byte
@@ -148,7 +148,11 @@ func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpo
 	}
 
 	if lastTS.Valid {
-		cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
+		if t, err := time.Parse(time.RFC3339Nano, lastTS.String); err == nil {
+			cp.LastTimestamp = t.UnixNano()
+		} else if t, err := time.Parse(time.RFC3339, lastTS.String); err == nil {
+			cp.LastTimestamp = t.UnixNano()
+		}
 	}
 
 	if mappingConfigJSON.Valid && mappingConfigJSON.String != "" {
@@ -185,7 +189,11 @@ func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error
 		}
 
 		if lastTS.Valid {
-			cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
+			if t, err := time.Parse(time.RFC3339Nano, lastTS.String); err == nil {
+				cp.LastTimestamp = t.UnixNano()
+			} else if t, err := time.Parse(time.RFC3339, lastTS.String); err == nil {
+				cp.LastTimestamp = t.UnixNano()
+			}
 		}
 
 		if mappingConfigJSON.Valid && mappingConfigJSON.String != "" {
@@ -198,13 +206,6 @@ func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error
 	}
 
 	return checkpoints, rows.Err()
-}
-
-func (s *SQLiteStore) UpdateTaskStatus(taskID string, status types.CheckpointStatus, errMsg string) error {
-	query := `UPDATE checkpoints SET status = ?, updated_at = ?, error_message = ? WHERE task_id = ?`
-	now := time.Now().UTC()
-	_, err := s.db.Exec(query, status, now.Format(time.RFC3339), errMsg, taskID)
-	return err
 }
 
 func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.Checkpoint, error) {
@@ -232,7 +233,11 @@ func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.
 		}
 
 		if lastTS.Valid {
-			cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
+			if t, err := time.Parse(time.RFC3339Nano, lastTS.String); err == nil {
+				cp.LastTimestamp = t.UnixNano()
+			} else if t, err := time.Parse(time.RFC3339, lastTS.String); err == nil {
+				cp.LastTimestamp = t.UnixNano()
+			}
 		}
 
 		if mappingConfigJSON.Valid && mappingConfigJSON.String != "" {

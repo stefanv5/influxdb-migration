@@ -311,7 +311,7 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	defer targetAdapter.Disconnect(ctx)
 
 	var lastCheckpoint *types.Checkpoint
-	var lastTimestamp time.Time
+	var lastTimestamp int64
 	var totalProcessed int64
 
 	if existingCP != nil && existingCP.Status == types.StatusInProgress {
@@ -397,7 +397,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 
 	currentCp := lastCp
 	totalProcessed := int64(0)
-	lastTimestamp := startTime
+	var lastTimestamp int64
 
 	for windowStart := startTime; windowStart.Before(endTime); windowStart = windowStart.Add(windowDuration) {
 		windowEnd := windowStart.Add(windowDuration)
@@ -432,7 +432,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 
 		if cp != nil {
 			totalProcessed = cp.ProcessedRows
-			if !cp.LastTimestamp.IsZero() {
+			if cp.LastTimestamp != 0 {
 				lastTimestamp = cp.LastTimestamp
 			}
 			currentCp = cp

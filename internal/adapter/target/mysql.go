@@ -214,7 +214,12 @@ func (a *MySQLTargetAdapter) recordToValues(record types.Record, columns []strin
 
 	for _, col := range columns {
 		if col == "timestamp" {
-			values = append(values, record.Time)
+			if record.Time != 0 {
+				t := time.Unix(0, record.Time)
+				values = append(values, t.Format("2006-01-02 15:04:05.000"))
+			} else {
+				values = append(values, nil)
+			}
 			continue
 		}
 

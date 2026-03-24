@@ -138,7 +138,7 @@ func (a *MySQLAdapter) DiscoverSeries(ctx context.Context, measurement string) (
 
 func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
 	var lastID int64
-	var lastTS time.Time
+	var lastTS int64
 	batchSize := 10000
 
 	if lastCheckpoint != nil {
@@ -193,12 +193,12 @@ func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoi
 
 type mysqlRecord struct {
 	ID     int64
-	Time   time.Time
+	Time   int64
 	Fields map[string]interface{}
 	Tags   map[string]string
 }
 
-func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, lastTS time.Time, lastID int64, batchSize int) ([]types.Record, error) {
+func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, lastTS int64, lastID int64, batchSize int) ([]types.Record, error) {
 	query := fmt.Sprintf(`
 		SELECT id, timestamp, host_id, cpu_usage, memory_usage
 		FROM %s
@@ -206,7 +206,12 @@ func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, lastTS time
 		ORDER BY timestamp, id
 		LIMIT ?`, quoteIdentifier(table))
 
-	rows, err := a.db.QueryContext(ctx, query, lastTS, lastTS, lastID, batchSize)
+	lastTSString := ""
+	if lastTS > 0 {
+		lastTSString = time.Unix(0, lastTS).Format("2006-01-02 15:04:05.000000000")
+	}
+
+	rows, err := a.db.QueryContext(ctx, query, lastTSString, lastTSString, lastID, batchSize)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -217,7 +222,7 @@ func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, lastTS time
 	var records []types.Record
 	for rows.Next() {
 		var id int64
-		var ts time.Time
+		var ts sql.NullString
 		var hostID sql.NullString
 		var cpuUsage, memoryUsage sql.NullFloat64
 
@@ -227,7 +232,11 @@ func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, lastTS time
 
 		record := types.NewRecord()
 		record.ID = id
-		record.Time = ts
+		if ts.Valid {
+			if parsed, err := time.Parse("2006-01-02 15:04:05.000000000", ts.String); err == nil {
+				record.Time = parsed.UnixNano()
+			}
+		}
 
 		if hostID.Valid {
 			record.AddTag("host_id", hostID.String)

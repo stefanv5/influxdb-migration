@@ -20,7 +20,7 @@ type Checkpoint struct {
 	SourceTable   string
 	TargetMeas    string
 	LastID        int64
-	LastTimestamp time.Time
+	LastTimestamp int64
 	ProcessedRows int64
 	Status        CheckpointStatus
 	CreatedAt     time.Time

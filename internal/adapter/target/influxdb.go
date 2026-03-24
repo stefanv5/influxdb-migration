@@ -140,8 +140,8 @@ func (a *InfluxDBV1TargetAdapter) formatInfluxLine(measurement string, r types.R
 	}
 
 	timestampStr := ""
-	if !r.Time.IsZero() {
-		timestampStr = fmt.Sprintf(" %d", r.Time.UnixNano())
+	if r.Time != 0 {
+		timestampStr = fmt.Sprintf(" %d", r.Time)
 	}
 
 	return fmt.Sprintf("%s,%s %s%s", measurement, tagsStr, fieldsStr, timestampStr)
@@ -475,7 +475,7 @@ func (a *InfluxDBV2TargetAdapter) formatFluxRecords(measurement string, records 
 				formatTags(r.Tags),
 				field,
 				formatFieldValue(value),
-				r.Time.UnixNano())
+				r.Time)
 
 			lines = append(lines, line)
 		}

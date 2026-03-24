@@ -159,7 +159,7 @@ func (a *TDengineTargetAdapter) writeTableBatched(ctx context.Context, table str
 		if err != nil {
 			return err
 		}
-		timestamp := record.Time.UnixNano()
+		timestamp := record.Time
 		valueStrings = append(valueStrings, fmt.Sprintf("('%d', %s)", timestamp, fieldStr))
 	}
 
@@ -196,7 +196,7 @@ func (a *TDengineTargetAdapter) writeSTABLEBatched(ctx context.Context, table st
 			tagValues = append(tagValues, fmt.Sprintf("'%s'", escapeTDengineTagValue(v)))
 		}
 
-		timestamp := record.Time.UnixNano()
+		timestamp := record.Time
 		childTable := fmt.Sprintf("%s_%d", table, timestamp)
 
 		if len(tagValues) > 0 {
@@ -303,7 +303,7 @@ func (a *TDengineTargetAdapter) recordToLineProtocol(table string, record types.
 		tagStr = "," + strings.Join(tagParts, ",")
 	}
 
-	timestamp := record.Time.UnixNano()
+	timestamp := record.Time
 
 	return fmt.Sprintf("%s%s %s %d", table, tagStr, strings.Join(fieldParts, ","), timestamp), nil
 }

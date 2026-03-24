@@ -146,16 +146,19 @@ func (a *TDengineAdapter) DiscoverSeries(ctx context.Context, measurement string
 }
 
 func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
-	var lastTS time.Time
+	var lastTS int64
 	if lastCheckpoint != nil {
 		lastTS = lastCheckpoint.LastTimestamp
 	}
 
-	startTime := lastTS.Format("2006-01-02 15:04:05.000")
-	endTime := lastTS.Add(7 * 24 * time.Hour).Format("2006-01-02 15:04:05.000")
-
-	if lastTS.IsZero() {
+	var startTime string
+	var endTime string
+	if lastTS == 0 {
 		startTime = "1970-01-01 00:00:00.000"
+		endTime = "1970-01-08 00:00:00.000"
+	} else {
+		startTime = time.Unix(0, lastTS).Format("2006-01-02 15:04:05.000")
+		endTime = time.Unix(0, lastTS).Add(7 * 24 * time.Hour).Format("2006-01-02 15:04:05.000")
 	}
 
 	query := fmt.Sprintf(`SELECT *, tbname FROM %s WHERE ts >= '%s' AND ts < '%s' PARTITION BY TBNAME ORDER BY ts`,
@@ -167,7 +170,7 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 	}
 
 	records := make([]types.Record, 0, len(data))
-	var maxTS time.Time
+	var maxTS int64
 	totalProcessed := int64(0)
 
 	if lastCheckpoint != nil {
@@ -181,9 +184,9 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 			if i == 0 {
 				if ts, ok := val.(string); ok {
 					if t, err := time.Parse("2006-01-02 15:04:05.000", ts); err == nil {
-						record.Time = t
-						if t.After(maxTS) {
-							maxTS = t
+						record.Time = t.UnixNano()
+						if t.UnixNano() > maxTS {
+							maxTS = t.UnixNano()
 						}
 					} else {
 						logger.Warn("failed to parse TDengine timestamp",

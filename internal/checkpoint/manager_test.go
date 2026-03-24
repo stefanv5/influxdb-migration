@@ -72,7 +72,7 @@ func TestManager_SaveAndLoadCheckpoint(t *testing.T) {
 		SourceTable:   "source_table1",
 		TargetMeas:    "target_meas1",
 		LastID:        100,
-		LastTimestamp: time.Now(),
+		LastTimestamp: time.Now().UnixNano(),
 		ProcessedRows: 500,
 		Status:        types.StatusInProgress,
 	}

@@ -39,7 +39,7 @@ func TestTransformEngine_FilterNulls(t *testing.T) {
 	engine := NewTransformEngine()
 
 	record := types.NewRecord()
-	record.Time = time.Now()
+	record.Time = time.Now().UnixNano()
 	record.AddField("field1", "value1")
 	record.AddField("field2", nil)
 	record.AddField("field3", 0)
@@ -89,7 +89,7 @@ func TestTransformEngine_ApplySchemaMapping(t *testing.T) {
 	}
 
 	record := types.NewRecord()
-	record.Time = time.Now()
+	record.Time = time.Now().UnixNano()
 	record.AddField("host_id", "server1")
 	record.AddField("cpu_usage", 85.5)
 	record.AddField("disk_usage", 75.0)
@@ -131,7 +131,7 @@ func TestTransformEngine_ApplySchemaMapping_TagFromField(t *testing.T) {
 	}
 
 	record := types.NewRecord()
-	record.Time = time.Now()
+	record.Time = time.Now().UnixNano()
 	record.AddField("location", "us-east-1")
 
 	transformed := engine.ApplySchemaMapping(record, mapping)
@@ -250,7 +250,7 @@ func TestTransformEngine_Transform(t *testing.T) {
 	}
 
 	record := types.NewRecord()
-	record.Time = time.Now()
+	record.Time = time.Now().UnixNano()
 	record.AddField("cpu_usage", 85.5)
 	record.AddField("memory_usage", "4096") // string value, should be converted
 
@@ -284,7 +284,7 @@ func TestTransformEngine_FilterNulls_AllNil(t *testing.T) {
 	engine := NewTransformEngine()
 
 	record := types.NewRecord()
-	record.Time = time.Now()
+	record.Time = time.Now().UnixNano()
 	record.AddField("field1", nil)
 	record.AddField("field2", nil)
 	record.AddTag("tag1", "")

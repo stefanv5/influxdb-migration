@@ -155,7 +155,7 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 }
 
 func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
-	var lastTS time.Time
+	var lastTS int64
 	var totalProcessed int64
 
 	if lastCheckpoint != nil {
@@ -163,9 +163,11 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 		totalProcessed = lastCheckpoint.ProcessedRows
 	}
 
-	startTime := lastTS.Format(time.RFC3339)
-	if lastTS.IsZero() {
+	var startTime string
+	if lastTS == 0 {
 		startTime = "1970-01-01T00:00:00Z"
+	} else {
+		startTime = time.Unix(0, lastTS).Format(time.RFC3339Nano)
 	}
 
 	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
@@ -195,7 +197,7 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 
 		maxTS := records[len(records)-1].Time
 		lastTS = maxTS
-		startTime = maxTS.Add(1 * time.Nanosecond).Format(time.RFC3339)
+		startTime = fmt.Sprintf("%d", maxTS+1)
 
 		logger.Debug("fetched batch from InfluxDB V1",
 			zap.String("measurement", measurement),
@@ -288,8 +290,12 @@ func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}) 
 		switch col {
 		case "time":
 			if ts, ok := val.(string); ok {
-				if t, err := time.Parse(time.RFC3339, ts); err == nil {
-					record.Time = t
+				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+					record.Time = t.UnixNano()
+				} else if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					record.Time = t.UnixNano()
+					logger.Warn("timestamp parsed with reduced precision",
+						zap.String("timestamp", ts))
 				} else {
 					logger.Warn("failed to parse InfluxDB timestamp",
 						zap.String("timestamp_string", ts),
@@ -517,10 +523,10 @@ schema.tagKeys(bucket: "%s", measurement: "%s")`, a.config.Bucket, measurement)
 func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
 	var startTime string
 	var totalProcessed int64
-	var lastTS time.Time
+	var lastTS int64
 
-	if lastCheckpoint != nil && !lastCheckpoint.LastTimestamp.IsZero() {
-		startTime = lastCheckpoint.LastTimestamp.Format(time.RFC3339Nano)
+	if lastCheckpoint != nil && lastCheckpoint.LastTimestamp != 0 {
+		startTime = fmt.Sprintf("%d", lastCheckpoint.LastTimestamp)
 		lastTS = lastCheckpoint.LastTimestamp
 	} else {
 		startTime = "1970-01-01T00:00:00Z"
@@ -557,7 +563,7 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 
 		maxTS := records[len(records)-1].Time
 		lastTS = maxTS
-		startTime = maxTS.Add(1 * time.Nanosecond).Format(time.RFC3339Nano)
+		startTime = fmt.Sprintf("%d", maxTS+1)
 
 		logger.Debug("fetched batch from InfluxDB V2",
 			zap.String("measurement", measurement),
@@ -622,7 +628,7 @@ func (a *InfluxDBV2Adapter) executeFluxSelect(ctx context.Context, query string)
 	var records []types.Record
 	for _, r := range result.Records {
 		record := types.NewRecord()
-		record.Time = r.Time
+		record.Time = r.Time.UnixNano()
 		record.AddField(r.Field, r.Value)
 		record.AddTag("_measurement", r.Measurement)
 		records = append(records, *record)

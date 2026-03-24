@@ -343,7 +343,7 @@ func TestFormatCheckpointsTable(t *testing.T) {
 		{
 			Table:         "table1",
 			LastID:        100,
-			LastTimestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+			LastTimestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
 			ProcessedRows: 500,
 		},
 	}

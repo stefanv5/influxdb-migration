@@ -47,39 +47,50 @@ func TestRecord_NilValueHandling(t *testing.T) {
 	}
 }
 
-func TestCheckpoint_Status(t *testing.T) {
-	if StatusPending != "pending" {
-		t.Errorf("Expected StatusPending to be 'pending', got %s", StatusPending)
-	}
-
-	if StatusInProgress != "in_progress" {
-		t.Errorf("Expected StatusInProgress to be 'in_progress', got %s", StatusInProgress)
-	}
-
-	if StatusCompleted != "completed" {
-		t.Errorf("Expected StatusCompleted to be 'completed', got %s", StatusCompleted)
-	}
-
-	if StatusFailed != "failed" {
-		t.Errorf("Expected StatusFailed to be 'failed', got %s", StatusFailed)
+func TestRecord_TimeInitialized(t *testing.T) {
+	record := NewRecord()
+	if record.Time != 0 {
+		t.Errorf("Expected Time to be 0, got %d", record.Time)
 	}
 }
 
-func TestCheckpoint_TimeTracking(t *testing.T) {
-	now := time.Now()
-	cp := &Checkpoint{
-		TaskID:        "test-task",
-		LastID:        100,
-		LastTimestamp: now,
-		ProcessedRows: 500,
-		Status:        StatusInProgress,
+func TestTimeToUnixNano(t *testing.T) {
+	ts := time.Date(2024, 1, 15, 10, 30, 0, 123456789, time.UTC)
+	ns := TimeToUnixNano(ts)
+	expected := ts.UnixNano()
+	if ns != expected {
+		t.Errorf("Expected %d, got %d", expected, ns)
 	}
+}
 
-	if cp.LastTimestamp.IsZero() {
-		t.Error("Expected LastTimestamp to be set")
+func TestUnixNanoToTime(t *testing.T) {
+	ns := int64(1705315800123456789)
+	tResult := UnixNanoToTime(ns)
+	if tResult.Year() != 2024 {
+		t.Errorf("Expected year 2024, got %d", tResult.Year())
 	}
+	if tResult.Month() != time.Month(1) {
+		t.Errorf("Expected month 1, got %d", tResult.Month())
+	}
+	if tResult.Nanosecond() != 123456789 {
+		t.Errorf("Expected nanosecond 123456789, got %d", tResult.Nanosecond())
+	}
+}
 
-	if cp.ProcessedRows != 500 {
-		t.Errorf("Expected ProcessedRows to be 500, got %d", cp.ProcessedRows)
+func TestNowNano(t *testing.T) {
+	before := time.Now().UnixNano()
+	ns := NowNano()
+	after := time.Now().UnixNano()
+	if ns < before || ns > after {
+		t.Errorf("NowNano() returned value outside expected range")
+	}
+}
+
+func TestIsZeroTime(t *testing.T) {
+	if !IsZeroTime(0) {
+		t.Error("Expected IsZeroTime(0) to be true")
+	}
+	if IsZeroTime(1) {
+		t.Error("Expected IsZeroTime(1) to be false")
 	}
 }

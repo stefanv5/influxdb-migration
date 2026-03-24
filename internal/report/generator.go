@@ -62,7 +62,7 @@ type CheckpointEntry struct {
 	Measurement   string    `json:"measurement"`
 	TargetMeas    string    `json:"target_measurement"`
 	LastID        int64     `json:"last_id"`
-	LastTimestamp time.Time `json:"last_timestamp"`
+	LastTimestamp int64     `json:"last_timestamp"`
 	ProcessedRows int64     `json:"processed_rows"`
 	Status        string    `json:"status"`
 	SavedAt       time.Time `json:"saved_at"`
@@ -226,8 +226,8 @@ func (g *Generator) formatCheckpointsTable(checkpoints []CheckpointEntry) string
 	var lines []string
 	for _, cp := range checkpoints {
 		ts := ""
-		if !cp.LastTimestamp.IsZero() {
-			ts = cp.LastTimestamp.Format(time.RFC3339)
+		if cp.LastTimestamp != 0 {
+			ts = time.Unix(0, cp.LastTimestamp).Format(time.RFC3339)
 		}
 		lines = append(lines, fmt.Sprintf("| %s | %s | %s | %d | %s |",
 			cp.Table, cp.TargetMeas, cp.Status, cp.ProcessedRows, ts))
