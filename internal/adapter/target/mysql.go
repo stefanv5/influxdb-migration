@@ -128,8 +128,14 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 		return nil
 	}
 
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
 	colList, placeholders, updateColumns, err := a.buildInsertSQL(records[0])
 	if err != nil {
+		tx.Rollback()
 		return err
 	}
 
@@ -139,6 +145,7 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 	for _, record := range records {
 		values, err := a.recordToValues(record, colList)
 		if err != nil {
+			tx.Rollback()
 			return err
 		}
 		valueStrings = append(valueStrings, "("+placeholders+")")
@@ -148,8 +155,13 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s ON DUPLICATE KEY UPDATE %s",
 		quoteIdentifier(table), strings.Join(colList, ", "), strings.Join(valueStrings, ","), updateColumns)
 
-	_, err = a.db.ExecContext(ctx, query, valueArgs...)
-	return err
+	_, err = tx.ExecContext(ctx, query, valueArgs...)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (a *MySQLTargetAdapter) buildInsertSQL(record types.Record) ([]string, string, string, error) {
@@ -251,8 +263,11 @@ func (a *MySQLTargetAdapter) CreateMeasurement(ctx context.Context, schema *type
 
 func (a *MySQLTargetAdapter) buildCreateTableDDL(schema *types.Schema) (string, error) {
 	var columns []string
+	var uniqueKeyCols []string
 
 	columns = append(columns, "id BIGINT AUTO_INCREMENT PRIMARY KEY")
+
+	uniqueKeyCols = append(uniqueKeyCols, "timestamp")
 
 	for _, tag := range schema.Tags {
 		colName := tag.TargetName
@@ -260,6 +275,7 @@ func (a *MySQLTargetAdapter) buildCreateTableDDL(schema *types.Schema) (string, 
 			colName = tag.SourceName
 		}
 		columns = append(columns, fmt.Sprintf("%s VARCHAR(255)", quoteIdentifier(colName)))
+		uniqueKeyCols = append(uniqueKeyCols, quoteIdentifier(colName))
 	}
 
 	for _, field := range schema.Fields {
@@ -272,7 +288,7 @@ func (a *MySQLTargetAdapter) buildCreateTableDDL(schema *types.Schema) (string, 
 	}
 
 	columns = append(columns, "timestamp DATETIME(3) NOT NULL")
-	columns = append(columns, "UNIQUE KEY uk_timestamp (timestamp)")
+	columns = append(columns, fmt.Sprintf("UNIQUE KEY uk_identity (%s)", strings.Join(uniqueKeyCols, ", ")))
 
 	tableName := quoteIdentifier(schema.Measurement)
 	ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
@@ -287,12 +303,10 @@ func (a *MySQLTargetAdapter) goTypeToMySQLType(dataType string) string {
 		return "DOUBLE"
 	case "float32":
 		return "FLOAT"
-	case "int", "int32":
-		return "INT"
-	case "int64", "bigint":
+	case "int", "int32", "int64", "bigint", "uint", "uint32", "uint64":
 		return "BIGINT"
 	case "string", "varchar", "text":
-		return "VARCHAR(255)"
+		return "VARCHAR(1024)"
 	case "bool", "boolean":
 		return "TINYINT(1)"
 	case "datetime", "time":

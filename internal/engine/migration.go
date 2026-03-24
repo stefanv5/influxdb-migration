@@ -288,7 +288,53 @@ func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.Mappi
 		zap.Int("input_records", len(records)),
 		zap.Int("output_records", len(transformed)))
 
-	return targetAdapter.WriteBatch(ctx, mapping.TargetMeasurement, transformed)
+	return e.writeWithRetry(ctx, mapping.TargetMeasurement, transformed, targetAdapter)
+}
+
+func (e *MigrationEngine) writeWithRetry(ctx context.Context, measurement string, records []types.Record, targetAdapter adapter.TargetAdapter) error {
+	maxAttempts := e.config.Retry.MaxAttempts
+	if maxAttempts == 0 {
+		maxAttempts = 3
+	}
+
+	var lastErr error
+	delay := e.config.Retry.InitialDelay
+	if delay == 0 {
+		delay = 1 * time.Second
+	}
+	maxDelay := e.config.Retry.MaxDelay
+	if maxDelay == 0 {
+		maxDelay = 60 * time.Second
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := targetAdapter.WriteBatch(ctx, measurement, records)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+		logger.Warn("write batch failed, will retry",
+			zap.Int("attempt", attempt),
+			zap.Int("max_attempts", maxAttempts),
+			zap.Duration("delay", delay),
+			zap.Error(err))
+
+		if attempt < maxAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+
+			delay *= time.Duration(e.config.Retry.BackoffMultiplier)
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+
+	return fmt.Errorf("write batch failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
 func filterNilValues(record *types.Record) *types.Record {

@@ -195,7 +195,25 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 					}
 				case float64:
 					record.AddField(fmt.Sprintf("col_%d", i), v)
+				case float32:
+					record.AddField(fmt.Sprintf("col_%d", i), float64(v))
 				case int64:
+					record.AddField(fmt.Sprintf("col_%d", i), v)
+				case int:
+					record.AddField(fmt.Sprintf("col_%d", i), int64(v))
+				case int32:
+					record.AddField(fmt.Sprintf("col_%d", i), int64(v))
+				case int16:
+					record.AddField(fmt.Sprintf("col_%d", i), int64(v))
+				case int8:
+					record.AddField(fmt.Sprintf("col_%d", i), int64(v))
+				case uint64:
+					record.AddField(fmt.Sprintf("col_%d", i), int64(v))
+				case uint:
+					record.AddField(fmt.Sprintf("col_%d", i), int64(v))
+				case uint32:
+					record.AddField(fmt.Sprintf("col_%d", i), int64(v))
+				case bool:
 					record.AddField(fmt.Sprintf("col_%d", i), v)
 				}
 			}

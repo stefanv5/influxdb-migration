@@ -27,6 +27,7 @@ func main() {
 	rootCmd.AddCommand(reportCmd)
 	rootCmd.AddCommand(verifyCmd)
 	rootCmd.AddCommand(resetCmd)
+	rootCmd.AddCommand(dryrunCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
