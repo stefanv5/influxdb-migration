@@ -133,7 +133,7 @@ func (a *MySQLAdapter) DiscoverTables(ctx context.Context) ([]string, error) {
 }
 
 func (a *MySQLAdapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
-	return nil, fmt.Errorf("DiscoverSeries not supported for MySQL, use DiscoverTables instead")
+	return []string{measurement}, nil
 }
 
 func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {

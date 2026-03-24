@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +67,23 @@ func (e *MigrationEngine) closeQueueOnce() {
 func (e *MigrationEngine) Run(ctx context.Context) error {
 	taskCount := 0
 	for _, taskConfig := range e.config.Tasks {
-		for _, mapping := range taskConfig.Mappings {
+		sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(taskConfig.Source)
+		if err != nil {
+			return fmt.Errorf("failed to get source adapter: %w", err)
+		}
+
+		sourceConfig := e.getSourceConfig(taskConfig.Source)
+		if err := sourceAdapter.Connect(ctx, sourceConfig); err != nil {
+			return fmt.Errorf("failed to connect to source: %w", err)
+		}
+
+		mappings, err := e.discoverMappings(ctx, taskConfig, sourceAdapter)
+		sourceAdapter.Disconnect(ctx)
+		if err != nil {
+			return err
+		}
+
+		for _, mapping := range mappings {
 			mappingPtr := mapping
 			task := &MigrationTask{
 				ID:            fmt.Sprintf("%s-%s", taskConfig.Name, mapping.TargetMeasurement),
@@ -106,6 +123,127 @@ func (e *MigrationEngine) Run(ctx context.Context) error {
 
 	e.wg.Wait()
 	return nil
+}
+
+func (e *MigrationEngine) discoverMappings(ctx context.Context, taskConfig types.TaskConfig, sourceAdapter adapter.SourceAdapter) ([]types.MappingConfig, error) {
+	var allTables []string
+
+	for _, mapping := range taskConfig.Mappings {
+		if mapping.SourceTable == "" || mapping.SourceTable == "*" {
+			tables, err := sourceAdapter.DiscoverTables(ctx)
+			if err != nil {
+				logger.Warn("failed to discover tables, using empty list",
+					zap.String("source", taskConfig.Source),
+					zap.Error(err))
+				continue
+			}
+			logger.Info("discovered tables",
+				zap.String("source", taskConfig.Source),
+				zap.Int("count", len(tables)))
+			allTables = append(allTables, tables...)
+		} else {
+			allTables = append(allTables, mapping.SourceTable)
+		}
+	}
+
+	var result []types.MappingConfig
+	seen := make(map[string]bool)
+
+	for _, table := range allTables {
+		if seen[table] {
+			continue
+		}
+		seen[table] = true
+
+		series, err := sourceAdapter.DiscoverSeries(ctx, table)
+		if err != nil {
+			logger.Debug("DiscoverSeries not supported or failed, treating as single table",
+				zap.String("table", table),
+				zap.Error(err))
+			series = []string{table}
+		}
+
+		for _, serie := range series {
+			for _, baseMapping := range taskConfig.Mappings {
+				if baseMapping.SourceTable != "" && baseMapping.SourceTable != "*" && baseMapping.SourceTable != table {
+					continue
+				}
+
+				mapping := baseMapping
+
+				if mapping.SourceTable == "" || mapping.SourceTable == "*" {
+					mapping.SourceTable = table
+				}
+
+				if mapping.TargetMeasurement == "" {
+					if serie != table {
+						mapping.TargetMeasurement = fmt.Sprintf("%s_%s", table, serie)
+					} else {
+						mapping.TargetMeasurement = table
+					}
+				}
+
+				if len(mapping.TagFilters) > 0 {
+					if !e.matchTagFilters(serie, mapping.TagFilters) {
+						logger.Debug("skipping series due to tag filters",
+							zap.String("series", serie),
+							zap.Any("filters", mapping.TagFilters))
+						continue
+					}
+				}
+
+				if mapping.SubtablePattern != "" && len(series) > 1 {
+					mapping.TargetMeasurement = e.applySubtablePattern(table, serie, mapping.SubtablePattern)
+				}
+
+				result = append(result, mapping)
+			}
+		}
+	}
+
+	if len(result) == 0 && len(allTables) > 0 {
+		for _, baseMapping := range taskConfig.Mappings {
+			if baseMapping.SourceTable != "" && baseMapping.SourceTable != "*" {
+				result = append(result, baseMapping)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func (e *MigrationEngine) matchTagFilters(series string, filters map[string][]string) bool {
+	for tagKey, allowedValues := range filters {
+		if len(allowedValues) == 0 {
+			continue
+		}
+		found := false
+		for _, val := range allowedValues {
+			if strings.Contains(series, fmt.Sprintf("%s=%s", tagKey, val)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *MigrationEngine) applySubtablePattern(table, series, pattern string) string {
+	parts := strings.Split(series, ",")
+	result := pattern
+	for i, part := range parts {
+		kv := strings.Split(part, "=")
+		if len(kv) == 2 {
+			result = strings.ReplaceAll(result, fmt.Sprintf("{{tag%d}}", i+1), kv[0])
+			result = strings.ReplaceAll(result, fmt.Sprintf("{{value%d}}", i+1), kv[1])
+		}
+	}
+	result = strings.ReplaceAll(result, "{{table}}", table)
+	result = strings.ReplaceAll(result, "{{series}}", series)
+	return result
 }
 
 func (e *MigrationEngine) worker(ctx context.Context, workerID int) {
