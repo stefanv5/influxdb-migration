@@ -164,7 +164,7 @@ func TestBuildMySQLDSN(t *testing.T) {
 	}
 
 	dsn := buildMySQLDSN(cfg)
-	expected := "root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local"
+	expected := "root:password@tcp(localhost:3306)/testdb?charset=utf8mb4&parseTime=True&loc=UTC"
 	if dsn != expected {
 		t.Errorf("Expected DSN %q, got %q", expected, dsn)
 	}

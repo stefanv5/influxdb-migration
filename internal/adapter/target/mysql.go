@@ -78,7 +78,7 @@ func (a *MySQLTargetAdapter) Connect(ctx context.Context, config map[string]inte
 
 func buildMySQLDSN(cfg *MySQLTargetConfig) string {
 	charset := "utf8mb4"
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=Local",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=UTC",
 		cfg.Username, cfg.Password, cfg.Host, cfg.Port, cfg.Database, charset)
 	return dsn
 }

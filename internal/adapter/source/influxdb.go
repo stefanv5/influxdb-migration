@@ -194,6 +194,7 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 		totalProcessed += int64(len(records))
 
 		maxTS := records[len(records)-1].Time
+		lastTS = maxTS
 		startTime = maxTS.Add(1 * time.Nanosecond).Format(time.RFC3339)
 
 		logger.Debug("fetched batch from InfluxDB V1",

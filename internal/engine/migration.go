@@ -110,6 +110,13 @@ func (e *MigrationEngine) Run(ctx context.Context) error {
 
 func (e *MigrationEngine) worker(ctx context.Context, workerID int) {
 	defer e.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("worker recovered from panic",
+				zap.Int("worker_id", workerID),
+				zap.Any("panic", r))
+		}
+	}()
 
 	for task := range e.taskQueue {
 		if err := e.runTask(ctx, task); err != nil {
