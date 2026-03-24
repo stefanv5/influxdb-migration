@@ -94,11 +94,12 @@ func (e *MigrationEngine) Run(ctx context.Context) error {
 			}
 
 			cp := &types.Checkpoint{
-				TaskID:      task.ID,
-				TaskName:    taskConfig.Name,
-				SourceTable: getSourceTable(&mappingPtr),
-				TargetMeas:  mappingPtr.TargetMeasurement,
-				Status:      types.StatusPending,
+				TaskID:        task.ID,
+				TaskName:      taskConfig.Name,
+				SourceTable:   getSourceTable(&mappingPtr),
+				TargetMeas:    mappingPtr.TargetMeasurement,
+				Status:        types.StatusPending,
+				MappingConfig: mappingPtr,
 			}
 
 			if err := e.checkpointMgr.CreateCheckpoint(cp); err != nil {
@@ -310,26 +311,55 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	defer targetAdapter.Disconnect(ctx)
 
 	var lastCheckpoint *types.Checkpoint
+	var lastTimestamp time.Time
+	var totalProcessed int64
+
 	if existingCP != nil && existingCP.Status == types.StatusInProgress {
 		lastCheckpoint = existingCP
+		lastTimestamp = existingCP.LastTimestamp
+		totalProcessed = existingCP.ProcessedRows
 	}
 
 	sourceTable := getSourceTable(task.Mapping)
 
 	switch task.Mapping.TimeRange.Start {
 	case "":
-		_, err = sourceAdapter.QueryData(ctx, sourceTable, lastCheckpoint, func(records []types.Record) error {
-			return e.processBatch(ctx, task.Mapping, records, targetAdapter)
+		checkpoint, queryErr := sourceAdapter.QueryData(ctx, sourceTable, lastCheckpoint, func(records []types.Record) error {
+			err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
+			if err != nil {
+				return err
+			}
+			if len(records) > 0 {
+				lastRecord := records[len(records)-1]
+				totalProcessed += int64(len(records))
+				lastTimestamp = lastRecord.Time
+				e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+					0, lastTimestamp, totalProcessed, types.StatusInProgress)
+			}
+			return nil
 		})
+		if queryErr != nil {
+			e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, queryErr.Error())
+			return queryErr
+		}
+		if checkpoint != nil {
+			totalProcessed = checkpoint.ProcessedRows
+			lastTimestamp = checkpoint.LastTimestamp
+		}
 	default:
-		_, err = e.queryWithTimeRange(ctx, sourceAdapter, sourceTable, task.Mapping, lastCheckpoint, targetAdapter)
+		checkpoint, queryErr := e.queryWithTimeRange(ctx, sourceAdapter, sourceTable, task.Mapping, lastCheckpoint, targetAdapter, task.ID)
+		if queryErr != nil {
+			e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, queryErr.Error())
+			return queryErr
+		}
+		if checkpoint != nil {
+			totalProcessed = checkpoint.ProcessedRows
+			lastTimestamp = checkpoint.LastTimestamp
+		}
 	}
 
-	if err != nil {
-		e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, err.Error())
-		return err
-	}
-
+	e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+		0, lastTimestamp, totalProcessed, types.StatusCompleted)
 	e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable)
 	logger.Info("task completed successfully",
 		zap.String("task_id", task.ID))
@@ -337,7 +367,7 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	return nil
 }
 
-func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter adapter.SourceAdapter, table string, mapping *types.MappingConfig, lastCp *types.Checkpoint, targetAdapter adapter.TargetAdapter) (*types.Checkpoint, error) {
+func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter adapter.SourceAdapter, table string, mapping *types.MappingConfig, lastCp *types.Checkpoint, targetAdapter adapter.TargetAdapter, taskID string) (*types.Checkpoint, error) {
 	startTime, err := time.Parse(time.RFC3339, mapping.TimeRange.Start)
 	if err != nil {
 		logger.Error("invalid start time in time range",
@@ -367,6 +397,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 
 	currentCp := lastCp
 	totalProcessed := int64(0)
+	lastTimestamp := startTime
 
 	for windowStart := startTime; windowStart.Before(endTime); windowStart = windowStart.Add(windowDuration) {
 		windowEnd := windowStart.Add(windowDuration)
@@ -381,7 +412,18 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 		}
 
 		cp, err := sourceAdapter.QueryData(ctx, table, currentCp, func(records []types.Record) error {
-			return e.processBatch(ctx, &windowMapping, records, targetAdapter)
+			err := e.processBatch(ctx, &windowMapping, records, targetAdapter)
+			if err != nil {
+				return err
+			}
+			if len(records) > 0 {
+				lastRecord := records[len(records)-1]
+				totalProcessed += int64(len(records))
+				lastTimestamp = lastRecord.Time
+				e.checkpointMgr.SaveCheckpoint(ctx, taskID, table,
+					0, lastTimestamp, totalProcessed, types.StatusInProgress)
+			}
+			return nil
 		})
 
 		if err != nil {
@@ -389,7 +431,10 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 		}
 
 		if cp != nil {
-			totalProcessed += cp.ProcessedRows
+			totalProcessed = cp.ProcessedRows
+			if !cp.LastTimestamp.IsZero() {
+				lastTimestamp = cp.LastTimestamp
+			}
 			currentCp = cp
 		}
 
@@ -398,7 +443,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 
 	return &types.Checkpoint{
 		ProcessedRows: totalProcessed,
-		LastTimestamp: currentCp.LastTimestamp,
+		LastTimestamp: lastTimestamp,
 	}, nil
 }
 
@@ -586,6 +631,15 @@ func getSourceTable(mapping *types.MappingConfig) string {
 	return mapping.Measurement
 }
 
+func (e *MigrationEngine) getAdaptersForTask(taskName string) (string, string) {
+	for _, task := range e.config.Tasks {
+		if task.Name == taskName {
+			return task.Source, task.Target
+		}
+	}
+	return "", ""
+}
+
 func (e *MigrationEngine) Resume(ctx context.Context) error {
 	failedTasks, err := e.checkpointMgr.GetFailedTasks(ctx)
 	if err != nil {
@@ -602,10 +656,14 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 			zap.String("task_id", cp.TaskID),
 			zap.String("source_table", cp.SourceTable))
 
+		sourceAdapter, targetAdapter := e.getAdaptersForTask(cp.TaskName)
+
 		task := &MigrationTask{
-			ID:      cp.TaskID,
-			Mapping: &types.MappingConfig{SourceTable: cp.SourceTable, TargetMeasurement: cp.TargetMeas},
-			Status:  types.StatusPending,
+			ID:            cp.TaskID,
+			SourceAdapter: sourceAdapter,
+			TargetAdapter: targetAdapter,
+			Mapping:       &cp.MappingConfig,
+			Status:        types.StatusPending,
 		}
 
 		e.taskQueue <- task
@@ -616,10 +674,14 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 			zap.String("task_id", cp.TaskID),
 			zap.String("source_table", cp.SourceTable))
 
+		sourceAdapter, targetAdapter := e.getAdaptersForTask(cp.TaskName)
+
 		task := &MigrationTask{
-			ID:      cp.TaskID,
-			Mapping: &types.MappingConfig{SourceTable: cp.SourceTable, TargetMeasurement: cp.TargetMeas},
-			Status:  types.StatusPending,
+			ID:            cp.TaskID,
+			SourceAdapter: sourceAdapter,
+			TargetAdapter: targetAdapter,
+			Mapping:       &cp.MappingConfig,
+			Status:        types.StatusPending,
 		}
 
 		e.taskQueue <- task

@@ -2,6 +2,7 @@ package checkpoint
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,6 +54,7 @@ func (s *SQLiteStore) initSchema() error {
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		error_message TEXT,
+		mapping_config TEXT,
 		UNIQUE(task_id, source_table)
 	);
 
@@ -71,9 +73,16 @@ func (s *SQLiteStore) initSchema() error {
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS schema_version (
+		version INTEGER PRIMARY KEY
+	);
 	`
 
 	_, err := s.db.Exec(schema)
+
+	_, _ = s.db.Exec(`ALTER TABLE checkpoints ADD COLUMN mapping_config TEXT`)
+
 	return err
 }
 
@@ -83,15 +92,16 @@ func (s *SQLiteStore) Close() error {
 
 func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 	query := `
-	INSERT INTO checkpoints (task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO checkpoints (task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(task_id, source_table) DO UPDATE SET
 		last_id = excluded.last_id,
 		last_timestamp = excluded.last_timestamp,
 		processed_rows = excluded.processed_rows,
 		status = excluded.status,
 		updated_at = excluded.updated_at,
-		error_message = excluded.error_message
+		error_message = excluded.error_message,
+		mapping_config = excluded.mapping_config
 	`
 
 	now := time.Now().UTC()
@@ -100,26 +110,35 @@ func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 		ts = cp.LastTimestamp.Format(time.RFC3339)
 	}
 
+	var mappingConfigJSON []byte
+	if cp.MappingConfig.SourceTable != "" {
+		var err error
+		mappingConfigJSON, err = json.Marshal(cp.MappingConfig)
+		if err != nil {
+			return fmt.Errorf("failed to marshal mapping config: %w", err)
+		}
+	}
+
 	_, err := s.db.Exec(query,
 		cp.TaskID, cp.TaskName, cp.SourceTable, cp.TargetMeas,
 		cp.LastID, ts, cp.ProcessedRows, cp.Status,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
-		cp.ErrorMessage,
+		cp.ErrorMessage, string(mappingConfigJSON),
 	)
 	return err
 }
 
 func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpoint, error) {
-	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config
 	          FROM checkpoints WHERE task_id = ? AND source_table = ?`
 
 	var cp types.Checkpoint
-	var lastTS, createdAt, updatedAt sql.NullString
+	var lastTS, createdAt, updatedAt, mappingConfigJSON sql.NullString
 
 	err := s.db.QueryRow(query, taskID, sourceTable).Scan(
 		&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
 		&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
-		&createdAt, &updatedAt, &cp.ErrorMessage,
+		&createdAt, &updatedAt, &cp.ErrorMessage, &mappingConfigJSON,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -132,11 +151,17 @@ func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpo
 		cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
 	}
 
+	if mappingConfigJSON.Valid && mappingConfigJSON.String != "" {
+		if err := json.Unmarshal([]byte(mappingConfigJSON.String), &cp.MappingConfig); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal mapping config: %w", err)
+		}
+	}
+
 	return &cp, nil
 }
 
 func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error) {
-	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config
 	          FROM checkpoints WHERE task_id = ?`
 
 	rows, err := s.db.Query(query, taskID)
@@ -148,12 +173,12 @@ func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error
 	var checkpoints []*types.Checkpoint
 	for rows.Next() {
 		var cp types.Checkpoint
-		var lastTS, createdAt, updatedAt sql.NullString
+		var lastTS, createdAt, updatedAt, mappingConfigJSON sql.NullString
 
 		err := rows.Scan(
 			&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
 			&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
-			&createdAt, &updatedAt, &cp.ErrorMessage,
+			&createdAt, &updatedAt, &cp.ErrorMessage, &mappingConfigJSON,
 		)
 		if err != nil {
 			return nil, err
@@ -161,6 +186,12 @@ func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error
 
 		if lastTS.Valid {
 			cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
+		}
+
+		if mappingConfigJSON.Valid && mappingConfigJSON.String != "" {
+			if err := json.Unmarshal([]byte(mappingConfigJSON.String), &cp.MappingConfig); err != nil {
+				return nil, err
+			}
 		}
 
 		checkpoints = append(checkpoints, &cp)
@@ -177,7 +208,7 @@ func (s *SQLiteStore) UpdateTaskStatus(taskID string, status types.CheckpointSta
 }
 
 func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.Checkpoint, error) {
-	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config
 	          FROM checkpoints WHERE status = ?`
 
 	rows, err := s.db.Query(query, status)
@@ -189,12 +220,12 @@ func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.
 	var checkpoints []*types.Checkpoint
 	for rows.Next() {
 		var cp types.Checkpoint
-		var lastTS, createdAt, updatedAt sql.NullString
+		var lastTS, createdAt, updatedAt, mappingConfigJSON sql.NullString
 
 		err := rows.Scan(
 			&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
 			&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
-			&createdAt, &updatedAt, &cp.ErrorMessage,
+			&createdAt, &updatedAt, &cp.ErrorMessage, &mappingConfigJSON,
 		)
 		if err != nil {
 			return nil, err
@@ -204,12 +235,17 @@ func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.
 			cp.LastTimestamp, _ = time.Parse(time.RFC3339, lastTS.String)
 		}
 
+		if mappingConfigJSON.Valid && mappingConfigJSON.String != "" {
+			if err := json.Unmarshal([]byte(mappingConfigJSON.String), &cp.MappingConfig); err != nil {
+				return nil, err
+			}
+		}
+
 		checkpoints = append(checkpoints, &cp)
 	}
 
 	return checkpoints, rows.Err()
 }
-
 
 func (s *SQLiteStore) ResetAll() error {
 	query := `DELETE FROM checkpoints`

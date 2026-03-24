@@ -14,32 +14,33 @@ const (
 )
 
 type Checkpoint struct {
-	ID             int64
-	TaskID         string
-	TaskName       string
-	SourceTable    string
-	TargetMeas     string
-	LastID         int64
-	LastTimestamp  time.Time
-	ProcessedRows   int64
-	Status         CheckpointStatus
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	ErrorMessage   string
+	ID            int64
+	TaskID        string
+	TaskName      string
+	SourceTable   string
+	TargetMeas    string
+	LastID        int64
+	LastTimestamp time.Time
+	ProcessedRows int64
+	Status        CheckpointStatus
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	ErrorMessage  string
+	MappingConfig MappingConfig
 }
 
 type MigrationTask struct {
-	ID             int64
-	TaskID         string
-	TaskName       string
-	SourceAdapter  string
-	TargetAdapter  string
-	Status         CheckpointStatus
-	TotalRows      int64
-	MigratedRows   int64
-	FailedRows     int64
-	StartedAt      time.Time
-	CompletedAt    time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID            int64
+	TaskID        string
+	TaskName      string
+	SourceAdapter string
+	TargetAdapter string
+	Status        CheckpointStatus
+	TotalRows     int64
+	MigratedRows  int64
+	FailedRows    int64
+	StartedAt     time.Time
+	CompletedAt   time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
