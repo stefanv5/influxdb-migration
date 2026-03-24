@@ -33,27 +33,38 @@ type Report struct {
 }
 
 type Summary struct {
-	Source          string `json:"source"`
-	Target          string `json:"target"`
-	TotalRows       int64  `json:"total_rows"`
-	TransferredRows int64  `json:"transferred_rows"`
-	FailedRows      int64  `json:"failed_rows"`
-	BatchCount      int    `json:"batch_count"`
-	AvgBatchDurMs   int64  `json:"avg_batch_duration_ms"`
+	Source           string `json:"source"`
+	Target           string `json:"target"`
+	SourceDB         string `json:"source_db"`
+	TargetDB         string `json:"target_db"`
+	SourceRP         string `json:"source_rp,omitempty"`
+	TargetRP         string `json:"target_rp,omitempty"`
+	SourceType       string `json:"source_type"`
+	TargetType       string `json:"target_type"`
+	TotalRows        int64  `json:"total_rows"`
+	TransferredRows  int64  `json:"transferred_rows"`
+	FailedRows       int64  `json:"failed_rows"`
+	BatchCount       int    `json:"batch_count"`
+	MeasurementCount int    `json:"measurement_count"`
 }
 
 type ErrorEntry struct {
-	BatchID   int       `json:"batch_id"`
-	Timestamp time.Time `json:"timestamp"`
-	Error     string    `json:"error"`
-	Retryable bool      `json:"retryable"`
+	BatchID     int       `json:"batch_id"`
+	Table       string    `json:"table"`
+	Measurement string    `json:"measurement"`
+	Timestamp   time.Time `json:"timestamp"`
+	Error       string    `json:"error"`
+	Retryable   bool      `json:"retryable"`
 }
 
 type CheckpointEntry struct {
 	Table         string    `json:"table"`
+	Measurement   string    `json:"measurement"`
+	TargetMeas    string    `json:"target_measurement"`
 	LastID        int64     `json:"last_id"`
 	LastTimestamp time.Time `json:"last_timestamp"`
 	ProcessedRows int64     `json:"processed_rows"`
+	Status        string    `json:"status"`
 	SavedAt       time.Time `json:"saved_at"`
 }
 
@@ -68,6 +79,10 @@ func NewGenerator(checkpointMgr *checkpoint.Manager, reportDir string) *Generato
 }
 
 func (g *Generator) Generate(ctx context.Context, migrationID, taskName string) (*Report, error) {
+	return g.GenerateWithDetails(ctx, migrationID, taskName, "", "", "", "", "", "", "", "")
+}
+
+func (g *Generator) GenerateWithDetails(ctx context.Context, migrationID, taskName, sourceName, targetName, sourceDB, targetDB, sourceRP, targetRP, sourceType, targetType string) (*Report, error) {
 	checkpoints, err := g.checkpointMgr.ListCheckpoints(ctx, migrationID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list checkpoints: %w", err)
@@ -76,9 +91,11 @@ func (g *Generator) Generate(ctx context.Context, migrationID, taskName string) 
 	var totalRows, transferredRows, failedRows int64
 	var latestTime time.Time
 	status := "completed"
+	measurementSet := make(map[string]bool)
 
 	for _, cp := range checkpoints {
 		totalRows += cp.ProcessedRows
+		measurementSet[cp.TargetMeas] = true
 		if cp.Status == types.StatusCompleted {
 			transferredRows += cp.ProcessedRows
 		} else if cp.Status == types.StatusFailed {
@@ -103,10 +120,19 @@ func (g *Generator) Generate(ctx context.Context, migrationID, taskName string) 
 		CompletedAt:  latestTime,
 		DurationSecs: int64(latestTime.Sub(startedAt).Seconds()),
 		Summary: Summary{
-			TotalRows:       totalRows,
-			TransferredRows: transferredRows,
-			FailedRows:      failedRows,
-			BatchCount:      len(checkpoints),
+			Source:           sourceName,
+			Target:           targetName,
+			SourceDB:         sourceDB,
+			TargetDB:         targetDB,
+			SourceRP:         sourceRP,
+			TargetRP:         targetRP,
+			SourceType:       sourceType,
+			TargetType:       targetType,
+			TotalRows:        totalRows,
+			TransferredRows:  transferredRows,
+			FailedRows:       failedRows,
+			BatchCount:       len(checkpoints),
+			MeasurementCount: len(measurementSet),
 		},
 		Checkpoints: make([]CheckpointEntry, len(checkpoints)),
 	}
@@ -114,9 +140,12 @@ func (g *Generator) Generate(ctx context.Context, migrationID, taskName string) 
 	for i, cp := range checkpoints {
 		report.Checkpoints[i] = CheckpointEntry{
 			Table:         cp.SourceTable,
+			Measurement:   cp.SourceTable,
+			TargetMeas:    cp.TargetMeas,
 			LastID:        cp.LastID,
 			LastTimestamp: cp.LastTimestamp,
 			ProcessedRows: cp.ProcessedRows,
+			Status:        string(cp.Status),
 			SavedAt:       cp.UpdatedAt,
 		}
 	}
@@ -150,7 +179,7 @@ func (g *Generator) SaveMarkdown(report *Report) error {
 
 	content := fmt.Sprintf(`# Migration Report
 
-## Summary
+## Migration Info
 
 | Field | Value |
 |-------|-------|
@@ -161,23 +190,33 @@ func (g *Generator) SaveMarkdown(report *Report) error {
 | Completed At | %s |
 | Duration | %d seconds |
 
+## Source & Target
+
+| Component | Type | Database | RP |
+|-----------|------|----------|-----|
+| Source | %s | %s | %s |
+| Target | %s | %s | %s |
+
 ## Data Summary
 
 | Metric | Value |
 |--------|-------|
-| Total Rows | %d |
-| Transferred Rows | %d |
-| Failed Rows | %d |
-| Batch Count | %d |
+| Total Rows | %s |
+| Transferred Rows | %s |
+| Failed Rows | %s |
+| Measurements | %d |
+| Batches | %d |
 
-## Checkpoints
+## Migration Details
 
-| Table | Last ID | Last Timestamp | Processed Rows |
-|-------|---------|----------------|----------------|
+| Source Table | Target Measurement | Status | Rows Processed | Last Timestamp |
+|--------------|-------------------|--------|----------------|---------------|
 %s
 `, report.MigrationID, report.TaskName, report.Status,
 		report.StartedAt.Format(time.RFC3339), report.CompletedAt.Format(time.RFC3339), report.DurationSecs,
-		report.Summary.TotalRows, report.Summary.TransferredRows, report.Summary.FailedRows, report.Summary.BatchCount,
+		report.Summary.SourceType, report.Summary.SourceDB, report.Summary.SourceRP,
+		report.Summary.TargetType, report.Summary.TargetDB, report.Summary.TargetRP,
+		fmt.Sprintf("%d", report.Summary.TotalRows), fmt.Sprintf("%d", report.Summary.TransferredRows), fmt.Sprintf("%d", report.Summary.FailedRows), report.Summary.MeasurementCount, report.Summary.BatchCount,
 		g.formatCheckpointsTable(report.Checkpoints))
 
 	return os.WriteFile(path, []byte(content), 0644)
@@ -186,8 +225,12 @@ func (g *Generator) SaveMarkdown(report *Report) error {
 func (g *Generator) formatCheckpointsTable(checkpoints []CheckpointEntry) string {
 	var lines []string
 	for _, cp := range checkpoints {
-		lines = append(lines, fmt.Sprintf("| %s | %d | %s | %d |",
-			cp.Table, cp.LastID, cp.LastTimestamp.Format(time.RFC3339), cp.ProcessedRows))
+		ts := ""
+		if !cp.LastTimestamp.IsZero() {
+			ts = cp.LastTimestamp.Format(time.RFC3339)
+		}
+		lines = append(lines, fmt.Sprintf("| %s | %s | %s | %d | %s |",
+			cp.Table, cp.TargetMeas, cp.Status, cp.ProcessedRows, ts))
 	}
 	return strings.Join(lines, "\n")
 }

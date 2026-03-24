@@ -86,7 +86,45 @@ var runCmd = &cobra.Command{
 		}
 
 		reportGen := report.NewGenerator(checkpointMgr, cfg.Global.ReportDir)
-		migrationReport, err := reportGen.Generate(ctx, cfg.Global.Name, cfg.Global.Name)
+
+		sourceName, targetName := "", ""
+		sourceDB, targetDB := "", ""
+		sourceRP, targetRP := "", ""
+		sourceType, targetType := "", ""
+
+		if len(cfg.Tasks) > 0 {
+			task := cfg.Tasks[0]
+			sourceName = task.Source
+			targetName = task.Target
+
+			for _, src := range cfg.Sources {
+				if src.Name == task.Source {
+					sourceType = src.Type
+					if src.Database != "" {
+						sourceDB = src.Database
+					} else if src.InfluxDB.Bucket != "" {
+						sourceDB = src.InfluxDB.Bucket
+					}
+				}
+			}
+
+			for _, tgt := range cfg.Targets {
+				if tgt.Name == task.Target {
+					targetType = tgt.Type
+					if tgt.Database != "" {
+						targetDB = tgt.Database
+					} else if tgt.InfluxDB.Bucket != "" {
+						targetDB = tgt.InfluxDB.Bucket
+					}
+					if tgt.InfluxDB.RetentionPolicy != "" {
+						targetRP = tgt.InfluxDB.RetentionPolicy
+					}
+				}
+			}
+		}
+
+		migrationReport, err := reportGen.GenerateWithDetails(ctx, cfg.Global.Name, cfg.Global.Name,
+			sourceName, targetName, sourceDB, targetDB, sourceRP, targetRP, sourceType, targetType)
 		if err != nil {
 			logger.Warn("failed to generate report", zap.Error(err))
 		} else {
