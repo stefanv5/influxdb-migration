@@ -245,6 +245,20 @@ func (a *TDengineTargetAdapter) buildFieldValues(record types.Record) (string, e
 			fieldParts = append(fieldParts, fmt.Sprintf("%di", v))
 		case int32:
 			fieldParts = append(fieldParts, fmt.Sprintf("%di", v))
+		case int16:
+			fieldParts = append(fieldParts, fmt.Sprintf("%di", v))
+		case int8:
+			fieldParts = append(fieldParts, fmt.Sprintf("%di", v))
+		case uint64:
+			fieldParts = append(fieldParts, fmt.Sprintf("%du", v))
+		case uint:
+			fieldParts = append(fieldParts, fmt.Sprintf("%du", v))
+		case uint32:
+			fieldParts = append(fieldParts, fmt.Sprintf("%du", v))
+		case uint16:
+			fieldParts = append(fieldParts, fmt.Sprintf("%du", v))
+		case uint8:
+			fieldParts = append(fieldParts, fmt.Sprintf("%du", v))
 		case string:
 			fieldParts = append(fieldParts, fmt.Sprintf("'%s'", escapeStringValue(v)))
 		case bool:
@@ -254,6 +268,8 @@ func (a *TDengineTargetAdapter) buildFieldValues(record types.Record) (string, e
 				fieldParts = append(fieldParts, "false")
 			}
 		default:
+			logger.Warn("unsupported field type in TDengine, converting to string",
+				zap.String("type", fmt.Sprintf("%T", v)))
 			fieldParts = append(fieldParts, fmt.Sprintf("'%v'", v))
 		}
 	}

@@ -20,6 +20,39 @@ func NewValidator(cfg *types.MigrationConfig) *ConfigValidator {
 	}
 }
 
+func ApplyDefaults(cfg *types.MigrationConfig) {
+	if cfg.Global.CheckpointDir == "" {
+		cfg.Global.CheckpointDir = "./checkpoints"
+	}
+	if cfg.Global.ReportDir == "" {
+		cfg.Global.ReportDir = "./reports"
+	}
+	if cfg.Migration.ChunkSize == 0 {
+		cfg.Migration.ChunkSize = 10000
+	}
+	if cfg.Migration.ParallelTasks == 0 {
+		cfg.Migration.ParallelTasks = 4
+	}
+	if cfg.Migration.ChunkInterval == 0 {
+		cfg.Migration.ChunkInterval = 100 * time.Millisecond
+	}
+	if cfg.Migration.MaxSeriesParallel == 0 {
+		cfg.Migration.MaxSeriesParallel = 2
+	}
+	if cfg.Retry.MaxAttempts == 0 {
+		cfg.Retry.MaxAttempts = 3
+	}
+	if cfg.Retry.InitialDelay == 0 {
+		cfg.Retry.InitialDelay = 1 * time.Second
+	}
+	if cfg.Retry.MaxDelay == 0 {
+		cfg.Retry.MaxDelay = 60 * time.Second
+	}
+	if cfg.Retry.BackoffMultiplier == 0 {
+		cfg.Retry.BackoffMultiplier = 2.0
+	}
+}
+
 func (v *ConfigValidator) Validate() error {
 	v.validateGlobal()
 	v.validateSources()
@@ -38,12 +71,6 @@ func (v *ConfigValidator) validateGlobal() {
 	if v.config.Global.Name == "" {
 		v.errors = append(v.errors, fmt.Errorf("global.name is required"))
 	}
-	if v.config.Global.CheckpointDir == "" {
-		v.config.Global.CheckpointDir = "./checkpoints"
-	}
-	if v.config.Global.ReportDir == "" {
-		v.config.Global.ReportDir = "./reports"
-	}
 }
 
 func (v *ConfigValidator) validateSources() {
@@ -59,11 +86,27 @@ func (v *ConfigValidator) validateSources() {
 		}
 		seen[src.Name] = true
 
-		if src.Host == "" {
-			v.errors = append(v.errors, fmt.Errorf("source %s: host is required", src.Name))
-		}
-		if src.Port == 0 {
-			v.errors = append(v.errors, fmt.Errorf("source %s: port is required", src.Name))
+		switch src.Type {
+		case "influxdb":
+			if src.InfluxDB.URL == "" {
+				v.errors = append(v.errors, fmt.Errorf("source %s: influxdb URL is required", src.Name))
+			}
+		case "mysql":
+			if src.Host == "" {
+				v.errors = append(v.errors, fmt.Errorf("source %s: mysql host is required", src.Name))
+			}
+			if src.Port == 0 {
+				v.errors = append(v.errors, fmt.Errorf("source %s: mysql port is required", src.Name))
+			}
+		case "tdengine":
+			if src.Host == "" {
+				v.errors = append(v.errors, fmt.Errorf("source %s: tdengine host is required", src.Name))
+			}
+			if src.Port == 0 {
+				v.errors = append(v.errors, fmt.Errorf("source %s: tdengine port is required", src.Name))
+			}
+		default:
+			v.errors = append(v.errors, fmt.Errorf("source %s: type must be influxdb, mysql, or tdengine", src.Name))
 		}
 
 		v.validateSourceSSL(src)
@@ -97,39 +140,33 @@ func (v *ConfigValidator) validateTargets() {
 
 		switch tgt.Type {
 		case "influxdb-v1", "influxdb-v2":
-			// valid InfluxDB target types
+			if tgt.InfluxDB.URL == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: influxdb URL is required", tgt.Name))
+			}
 		case "mysql":
-			v.validateMySQLTarget(tgt)
+			if tgt.Host == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: mysql host is required", tgt.Name))
+			}
+			if tgt.Port == 0 {
+				v.errors = append(v.errors, fmt.Errorf("target %s: mysql port is required", tgt.Name))
+			}
+			if tgt.Database == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: mysql database is required", tgt.Name))
+			}
 		case "tdengine":
-			v.validateTDengineTarget(tgt)
+			if tgt.Host == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: tdengine host is required", tgt.Name))
+			}
+			if tgt.Port == 0 {
+				v.errors = append(v.errors, fmt.Errorf("target %s: tdengine port is required", tgt.Name))
+			}
+			if tgt.Database == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: tdengine database is required", tgt.Name))
+			}
 		default:
 			v.errors = append(v.errors, fmt.Errorf(
 				"target %s: type must be influxdb-v1, influxdb-v2, mysql, or tdengine", tgt.Name))
 		}
-	}
-}
-
-func (v *ConfigValidator) validateMySQLTarget(tgt types.TargetConfig) {
-	if tgt.Host == "" {
-		v.errors = append(v.errors, fmt.Errorf("target %s: mysql host is required", tgt.Name))
-	}
-	if tgt.Port == 0 {
-		v.errors = append(v.errors, fmt.Errorf("target %s: mysql port is required", tgt.Name))
-	}
-	if tgt.Database == "" {
-		v.errors = append(v.errors, fmt.Errorf("target %s: mysql database is required", tgt.Name))
-	}
-}
-
-func (v *ConfigValidator) validateTDengineTarget(tgt types.TargetConfig) {
-	if tgt.Host == "" {
-		v.errors = append(v.errors, fmt.Errorf("target %s: tdengine host is required", tgt.Name))
-	}
-	if tgt.Port == 0 {
-		v.errors = append(v.errors, fmt.Errorf("target %s: tdengine port is required", tgt.Name))
-	}
-	if tgt.Database == "" {
-		v.errors = append(v.errors, fmt.Errorf("target %s: tdengine database is required", tgt.Name))
 	}
 }
 
@@ -172,39 +209,31 @@ func (v *ConfigValidator) validateTasks() {
 }
 
 func (v *ConfigValidator) validateMigrationSettings() {
-	if v.config.Migration.ChunkSize == 0 {
-		v.config.Migration.ChunkSize = 10000
+	if v.config.Migration.ChunkSize < 0 {
+		v.errors = append(v.errors, fmt.Errorf("migration.chunk_size must be non-negative"))
 	}
-	if v.config.Migration.ParallelTasks == 0 {
-		v.config.Migration.ParallelTasks = 4
+	if v.config.Migration.ParallelTasks < 0 {
+		v.errors = append(v.errors, fmt.Errorf("migration.parallel_tasks must be non-negative"))
 	}
-	if v.config.Migration.ChunkInterval == 0 {
-		v.config.Migration.ChunkInterval = 100 * time.Millisecond
+	if v.config.Migration.ChunkInterval < 0 {
+		v.errors = append(v.errors, fmt.Errorf("migration.chunk_interval must be non-negative"))
 	}
-	if v.config.Migration.MaxSeriesParallel == 0 {
-		v.config.Migration.MaxSeriesParallel = 2
+	if v.config.Migration.MaxSeriesParallel < 0 {
+		v.errors = append(v.errors, fmt.Errorf("migration.max_series_parallel must be non-negative"))
 	}
 }
 
 func (v *ConfigValidator) validateRetrySettings() {
-	if v.config.Retry.MaxAttempts == 0 {
-		v.config.Retry.MaxAttempts = 3
+	if v.config.Retry.MaxAttempts < 0 {
+		v.errors = append(v.errors, fmt.Errorf("retry.max_attempts must be non-negative"))
 	}
-	if v.config.Retry.InitialDelay == 0 {
-		v.config.Retry.InitialDelay = 1 * time.Second
+	if v.config.Retry.InitialDelay < 0 {
+		v.errors = append(v.errors, fmt.Errorf("retry.initial_delay must be non-negative"))
 	}
-	if v.config.Retry.MaxDelay == 0 {
-		v.config.Retry.MaxDelay = 60 * time.Second
+	if v.config.Retry.MaxDelay < 0 {
+		v.errors = append(v.errors, fmt.Errorf("retry.max_delay must be non-negative"))
 	}
-	if v.config.Retry.BackoffMultiplier == 0 {
-		v.config.Retry.BackoffMultiplier = 2.0
+	if v.config.Retry.BackoffMultiplier < 0 {
+		v.errors = append(v.errors, fmt.Errorf("retry.backoff_multiplier must be non-negative"))
 	}
-}
-
-func ApplyDefaults(cfg *types.MigrationConfig) error {
-	v := NewValidator(cfg)
-	v.validateGlobal()
-	v.validateMigrationSettings()
-	v.validateRetrySettings()
-	return nil
 }

@@ -290,6 +290,10 @@ func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}) 
 			if ts, ok := val.(string); ok {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil {
 					record.Time = t
+				} else {
+					logger.Warn("failed to parse InfluxDB timestamp",
+						zap.String("timestamp_string", ts),
+						zap.Error(err))
 				}
 			}
 		default:

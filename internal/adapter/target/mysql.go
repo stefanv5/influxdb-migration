@@ -135,7 +135,11 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 
 	colList, placeholders, updateColumns, err := a.buildInsertSQL(records[0])
 	if err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			logger.Warn("mysql rollback failed after buildInsertSQL error",
+				zap.String("table", table),
+				zap.Error(rbErr))
+		}
 		return err
 	}
 
@@ -145,7 +149,11 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 	for _, record := range records {
 		values, err := a.recordToValues(record, colList)
 		if err != nil {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil {
+				logger.Warn("mysql rollback failed after recordToValues error",
+					zap.String("table", table),
+					zap.Error(rbErr))
+			}
 			return err
 		}
 		valueStrings = append(valueStrings, "("+placeholders+")")
@@ -157,11 +165,19 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 
 	_, err = tx.ExecContext(ctx, query, valueArgs...)
 	if err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			logger.Warn("mysql rollback failed after ExecContext error",
+				zap.String("table", table),
+				zap.Error(rbErr))
+		}
 		return err
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mysql commit failed: %w", err)
+	}
+
+	return nil
 }
 
 func (a *MySQLTargetAdapter) buildInsertSQL(record types.Record) ([]string, string, string, error) {

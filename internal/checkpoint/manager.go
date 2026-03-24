@@ -3,6 +3,7 @@ package checkpoint
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/migration-tools/influx-migrator/internal/logger"
@@ -12,6 +13,7 @@ import (
 
 type Manager struct {
 	store *SQLiteStore
+	mu    sync.RWMutex
 }
 
 func NewManager(dir string) (*Manager, error) {
@@ -31,6 +33,9 @@ func (m *Manager) CreateCheckpoint(task *types.Checkpoint) error {
 }
 
 func (m *Manager) SaveCheckpoint(ctx context.Context, taskID, sourceTable string, lastID int64, lastTS time.Time, processedRows int64, status types.CheckpointStatus) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
 	if err != nil {
 		return err
@@ -68,6 +73,9 @@ func (m *Manager) GetInProgressTasks(ctx context.Context) ([]*types.Checkpoint, 
 }
 
 func (m *Manager) MarkTaskCompleted(ctx context.Context, taskID, sourceTable string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
 	if err != nil {
 		return err
@@ -84,6 +92,9 @@ func (m *Manager) MarkTaskCompleted(ctx context.Context, taskID, sourceTable str
 }
 
 func (m *Manager) MarkTaskFailed(ctx context.Context, taskID, sourceTable, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
 	if err != nil {
 		return err
@@ -102,6 +113,9 @@ func (m *Manager) MarkTaskFailed(ctx context.Context, taskID, sourceTable, errMs
 }
 
 func (m *Manager) MarkTaskInProgress(ctx context.Context, taskID, sourceTable string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
 	if err != nil {
 		return err
@@ -116,7 +130,6 @@ func (m *Manager) MarkTaskInProgress(ctx context.Context, taskID, sourceTable st
 		zap.String("source_table", sourceTable))
 	return m.store.SaveCheckpoint(cp)
 }
-
 
 func (m *Manager) ResetAll(ctx context.Context) error {
 	return m.store.ResetAll()

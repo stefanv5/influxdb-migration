@@ -357,10 +357,7 @@ func TestApplyDefaults(t *testing.T) {
 		Global: types.GlobalConfig{Name: "test"},
 	}
 
-	err := ApplyDefaults(cfg)
-	if err != nil {
-		t.Errorf("ApplyDefaults failed: %v", err)
-	}
+	ApplyDefaults(cfg)
 
 	if cfg.Global.CheckpointDir != "./checkpoints" {
 		t.Errorf("Expected default checkpoint dir, got %s", cfg.Global.CheckpointDir)

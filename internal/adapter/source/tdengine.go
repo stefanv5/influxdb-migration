@@ -185,6 +185,10 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 						if t.After(maxTS) {
 							maxTS = t
 						}
+					} else {
+						logger.Warn("failed to parse TDengine timestamp",
+							zap.String("timestamp_string", ts),
+							zap.Error(err))
 					}
 				}
 			} else if val != nil {
