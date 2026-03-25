@@ -154,7 +154,7 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 	return series, nil
 }
 
-func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
+func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var lastTS int64
 	var totalProcessed int64
 
@@ -173,6 +173,9 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
 
 	batchSize := 10000
+	if cfg != nil && cfg.BatchSize > 0 {
+		batchSize = cfg.BatchSize
+	}
 	totalRecords := 0
 
 	for {
@@ -520,7 +523,7 @@ schema.tagKeys(bucket: "%s", measurement: "%s")`, a.config.Bucket, measurement)
 	return series, nil
 }
 
-func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
+func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var startTime string
 	var totalProcessed int64
 	var lastTS int64
@@ -535,6 +538,9 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 	endTime := time.Now().Format(time.RFC3339Nano)
 
 	batchSize := 10000
+	if cfg != nil && cfg.BatchSize > 0 {
+		batchSize = cfg.BatchSize
+	}
 	totalRecords := 0
 
 	for {

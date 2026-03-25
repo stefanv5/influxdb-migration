@@ -36,7 +36,7 @@ func (m *MockSourceAdapter) DiscoverTables(ctx context.Context) ([]string, error
 func (m *MockSourceAdapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
 	return []string{"series1"}, nil
 }
-func (m *MockSourceAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
+func (m *MockSourceAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	return &types.Checkpoint{ProcessedRows: 100}, nil
 }
 

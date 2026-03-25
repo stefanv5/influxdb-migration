@@ -105,7 +105,7 @@ func TestMySQLTargetAdapter_WriteBatch_NotConnected(t *testing.T) {
 	ctx := context.Background()
 
 	record := types.NewRecord()
-	record.Time = time.Now()
+	record.Time = time.Now().UnixNano()
 	record.AddField("cpu", 85.5)
 
 	err := adapter.WriteBatch(ctx, "test_table", []types.Record{*record})

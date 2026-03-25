@@ -136,10 +136,13 @@ func (a *MySQLAdapter) DiscoverSeries(ctx context.Context, measurement string) (
 	return []string{measurement}, nil
 }
 
-func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
+func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var lastID int64
 	var lastTS int64
 	batchSize := 10000
+	if cfg != nil && cfg.BatchSize > 0 {
+		batchSize = cfg.BatchSize
+	}
 
 	if lastCheckpoint != nil {
 		lastID = lastCheckpoint.LastID

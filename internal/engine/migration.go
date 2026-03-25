@@ -322,6 +322,18 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 
 	sourceTable := getSourceTable(task.Mapping)
 
+	timeWindow := 168 * time.Hour
+	if task.Mapping.TimeWindow != "" {
+		if tw, err := time.ParseDuration(task.Mapping.TimeWindow); err == nil {
+			timeWindow = tw
+		}
+	}
+
+	queryCfg := &types.QueryConfig{
+		BatchSize:  e.config.Migration.ChunkSize,
+		TimeWindow: timeWindow,
+	}
+
 	switch task.Mapping.TimeRange.Start {
 	case "":
 		checkpoint, queryErr := sourceAdapter.QueryData(ctx, sourceTable, lastCheckpoint, func(records []types.Record) error {
@@ -337,7 +349,7 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 					0, lastTimestamp, totalProcessed, types.StatusInProgress)
 			}
 			return nil
-		})
+		}, queryCfg)
 		if queryErr != nil {
 			e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, queryErr.Error())
 			return queryErr
@@ -347,7 +359,7 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 			lastTimestamp = checkpoint.LastTimestamp
 		}
 	default:
-		checkpoint, queryErr := e.queryWithTimeRange(ctx, sourceAdapter, sourceTable, task.Mapping, lastCheckpoint, targetAdapter, task.ID)
+		checkpoint, queryErr := e.queryWithTimeRange(ctx, sourceAdapter, sourceTable, task.Mapping, lastCheckpoint, targetAdapter, task.ID, queryCfg)
 		if queryErr != nil {
 			e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, queryErr.Error())
 			return queryErr
@@ -367,7 +379,7 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	return nil
 }
 
-func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter adapter.SourceAdapter, table string, mapping *types.MappingConfig, lastCp *types.Checkpoint, targetAdapter adapter.TargetAdapter, taskID string) (*types.Checkpoint, error) {
+func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter adapter.SourceAdapter, table string, mapping *types.MappingConfig, lastCp *types.Checkpoint, targetAdapter adapter.TargetAdapter, taskID string, queryCfg *types.QueryConfig) (*types.Checkpoint, error) {
 	startTime, err := time.Parse(time.RFC3339, mapping.TimeRange.Start)
 	if err != nil {
 		logger.Error("invalid start time in time range",
@@ -424,7 +436,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 					0, lastTimestamp, totalProcessed, types.StatusInProgress)
 			}
 			return nil
-		})
+		}, queryCfg)
 
 		if err != nil {
 			return nil, err

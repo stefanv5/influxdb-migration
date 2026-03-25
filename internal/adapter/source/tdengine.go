@@ -145,20 +145,25 @@ func (a *TDengineAdapter) DiscoverSeries(ctx context.Context, measurement string
 	return a.DiscoverTablesFromStable(ctx, measurement)
 }
 
-func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error) {
+func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var lastTS int64
 	if lastCheckpoint != nil {
 		lastTS = lastCheckpoint.LastTimestamp
+	}
+
+	timeWindow := 7 * 24 * time.Hour
+	if cfg != nil && cfg.TimeWindow > 0 {
+		timeWindow = cfg.TimeWindow
 	}
 
 	var startTime string
 	var endTime string
 	if lastTS == 0 {
 		startTime = "1970-01-01 00:00:00.000"
-		endTime = "1970-01-08 00:00:00.000"
+		endTime = time.Unix(0, 0).Add(timeWindow).Format("2006-01-02 15:04:05.000")
 	} else {
 		startTime = time.Unix(0, lastTS).Format("2006-01-02 15:04:05.000")
-		endTime = time.Unix(0, lastTS).Add(7 * 24 * time.Hour).Format("2006-01-02 15:04:05.000")
+		endTime = time.Unix(0, lastTS).Add(timeWindow).Format("2006-01-02 15:04:05.000")
 	}
 
 	query := fmt.Sprintf(`SELECT *, tbname FROM %s WHERE ts >= '%s' AND ts < '%s' PARTITION BY TBNAME ORDER BY ts`,
@@ -228,7 +233,11 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 
 		records = append(records, *record)
 
-		if len(records) >= 1000 {
+		internalBatchSize := 1000
+		if cfg != nil && cfg.BatchSize > 0 {
+			internalBatchSize = cfg.BatchSize
+		}
+		if len(records) >= internalBatchSize {
 			if err := batchFunc(records); err != nil {
 				return nil, err
 			}

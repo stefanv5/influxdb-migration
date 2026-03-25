@@ -17,7 +17,7 @@ type SourceAdapter interface {
 	DiscoverTables(ctx context.Context) ([]string, error)
 	DiscoverSeries(ctx context.Context, measurement string) ([]string, error)
 
-	QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error) (*types.Checkpoint, error)
+	QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error)
 }
 
 type TargetAdapter interface {

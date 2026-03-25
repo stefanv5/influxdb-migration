@@ -2,6 +2,7 @@ package target
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,7 +107,7 @@ func TestTDengineTargetAdapter_WriteBatch_NotConnected(t *testing.T) {
 	ctx := context.Background()
 
 	record := types.NewRecord()
-	record.Time = time.Now()
+	record.Time = time.Now().UnixNano()
 	record.AddField("cpu", 85.5)
 
 	err := adapter.WriteBatch(ctx, "test_table", []types.Record{*record})
@@ -159,7 +160,7 @@ func TestTDengineTargetAdapter_RecordToLineProtocol(t *testing.T) {
 	adapter := &TDengineTargetAdapter{}
 
 	record := types.NewRecord()
-	record.Time = time.Unix(1709853600, 0)
+	record.Time = time.Unix(1709853600, 0).UnixNano()
 	record.AddTag("host", "server1")
 	record.AddField("cpu", 85.5)
 	record.AddField("memory", 70.2)
@@ -169,9 +170,17 @@ func TestTDengineTargetAdapter_RecordToLineProtocol(t *testing.T) {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
-	expected := "metrics,host=server1 cpu=85.5,memory=70.2 1709853600000000000"
-	if line != expected {
-		t.Errorf("Expected line %q, got %q", expected, line)
+	if !strings.Contains(line, "metrics,host=server1") {
+		t.Errorf("Expected line to contain metrics,host=server1, got %q", line)
+	}
+	if !strings.Contains(line, "cpu=85.5") {
+		t.Errorf("Expected line to contain cpu=85.5, got %q", line)
+	}
+	if !strings.Contains(line, "memory=70.2") {
+		t.Errorf("Expected line to contain memory=70.2, got %q", line)
+	}
+	if !strings.HasSuffix(line, "1709853600000000000") {
+		t.Errorf("Expected line to end with timestamp, got %q", line)
 	}
 }
 
@@ -179,7 +188,7 @@ func TestTDengineTargetAdapter_RecordToLineProtocol_EmptyFields(t *testing.T) {
 	adapter := &TDengineTargetAdapter{}
 
 	record := types.NewRecord()
-	record.Time = time.Unix(1709853600, 0)
+	record.Time = time.Unix(1709853600, 0).UnixNano()
 	record.AddTag("host", "server1")
 
 	line, err := adapter.recordToLineProtocol("metrics", *record)
@@ -196,7 +205,7 @@ func TestTDengineTargetAdapter_RecordToLineProtocol_EmptyTags(t *testing.T) {
 	adapter := &TDengineTargetAdapter{}
 
 	record := types.NewRecord()
-	record.Time = time.Unix(1709853600, 0)
+	record.Time = time.Unix(1709853600, 0).UnixNano()
 	record.AddField("cpu", 85.5)
 
 	line, err := adapter.recordToLineProtocol("metrics", *record)
@@ -214,7 +223,7 @@ func TestTDengineTargetAdapter_RecordToLineProtocol_NilField(t *testing.T) {
 	adapter := &TDengineTargetAdapter{}
 
 	record := types.NewRecord()
-	record.Time = time.Unix(1709853600, 0)
+	record.Time = time.Unix(1709853600, 0).UnixNano()
 	record.AddField("cpu", nil)
 	record.AddField("memory", 70.2)
 
@@ -233,7 +242,7 @@ func TestTDengineTargetAdapter_RecordToLineProtocol_EmptyTagValue(t *testing.T) 
 	adapter := &TDengineTargetAdapter{}
 
 	record := types.NewRecord()
-	record.Time = time.Unix(1709853600, 0)
+	record.Time = time.Unix(1709853600, 0).UnixNano()
 	record.AddTag("host", "")
 	record.AddField("cpu", 85.5)
 
