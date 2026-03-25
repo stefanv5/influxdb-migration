@@ -121,6 +121,7 @@ func TestQueryConfig_Validate(t *testing.T) {
 		{"Below min time window", 10000, 30 * time.Minute, true},
 		{"Above max time window", 10000, 31 * 24 * time.Hour, true},
 		{"Negative batch size", -1, 168 * time.Hour, true},
+		{"Negative time window", 10000, -1 * time.Hour, true},
 	}
 
 	for _, tt := range tests {
@@ -151,6 +152,8 @@ func TestQueryConfig_ApplyDefaults(t *testing.T) {
 	}{
 		{"Zero values", 0, 0, DefaultBatchSize, DefaultTimeWindow},
 		{"Non-zero values unchanged", 5000, 24 * time.Hour, 5000, 24 * time.Hour},
+		{"BatchSize zero only", 0, 24 * time.Hour, DefaultBatchSize, 24 * time.Hour},
+		{"TimeWindow zero only", 5000, 0, 5000, DefaultTimeWindow},
 	}
 
 	for _, tt := range tests {
@@ -170,5 +173,21 @@ func TestQueryConfig_ApplyDefaults(t *testing.T) {
 				t.Errorf("Expected TimeWindow %v, got %v", tt.expectedTimeWindow, cfg.TimeWindow)
 			}
 		})
+	}
+}
+
+func TestQueryConfig_ApplyDefaultsThenValidate(t *testing.T) {
+	cfg := &QueryConfig{BatchSize: 0, TimeWindow: 0}
+	cfg.ApplyDefaults()
+	err := cfg.Validate()
+	if err != nil {
+		t.Errorf("Expected valid config after ApplyDefaults, got error: %v", err)
+	}
+
+	cfg2 := &QueryConfig{BatchSize: 5000, TimeWindow: 24 * time.Hour}
+	cfg2.ApplyDefaults()
+	err = cfg2.Validate()
+	if err != nil {
+		t.Errorf("Expected valid config with non-zero values, got error: %v", err)
 	}
 }

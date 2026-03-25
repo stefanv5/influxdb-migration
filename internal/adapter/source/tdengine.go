@@ -151,7 +151,7 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 		lastTS = lastCheckpoint.LastTimestamp
 	}
 
-	timeWindow := 7 * 24 * time.Hour
+	timeWindow := types.DefaultTimeWindow
 	if cfg != nil && cfg.TimeWindow > 0 {
 		timeWindow = cfg.TimeWindow
 	}

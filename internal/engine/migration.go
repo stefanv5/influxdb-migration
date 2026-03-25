@@ -322,7 +322,7 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 
 	sourceTable := getSourceTable(task.Mapping)
 
-	timeWindow := 168 * time.Hour
+	timeWindow := types.DefaultTimeWindow
 	if task.Mapping.TimeWindow != "" {
 		if tw, err := time.ParseDuration(task.Mapping.TimeWindow); err == nil {
 			timeWindow = tw
@@ -332,6 +332,10 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	queryCfg := &types.QueryConfig{
 		BatchSize:  e.config.Migration.ChunkSize,
 		TimeWindow: timeWindow,
+	}
+	queryCfg.ApplyDefaults()
+	if err := queryCfg.Validate(); err != nil {
+		return fmt.Errorf("invalid query config: %w", err)
 	}
 
 	switch task.Mapping.TimeRange.Start {
