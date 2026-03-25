@@ -380,6 +380,11 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 }
 
 func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter adapter.SourceAdapter, table string, mapping *types.MappingConfig, lastCp *types.Checkpoint, targetAdapter adapter.TargetAdapter, taskID string, queryCfg *types.QueryConfig) (*types.Checkpoint, error) {
+	// queryWithTimeRange iterates over the overall time range in chunks of windowDuration.
+	// For each chunk, it calls sourceAdapter.QueryData() which may use queryCfg.TimeWindow
+	// for its internal query batching (e.g., TDengine uses TimeWindow to set query range).
+	// The outer windowDuration and inner TimeWindow are independent but typically set to the
+	// same value (168h = 7 days default) for consistent behavior.
 	startTime, err := time.Parse(time.RFC3339, mapping.TimeRange.Start)
 	if err != nil {
 		logger.Error("invalid start time in time range",
