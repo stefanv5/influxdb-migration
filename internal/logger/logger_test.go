@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"go.uber.org/zap/zapcore"
 )
 
 func TestLoggerConfig(t *testing.T) {
@@ -102,22 +104,21 @@ func TestRotatingWriterSync(t *testing.T) {
 func TestParseLevel(t *testing.T) {
 	tests := []struct {
 		input    string
-		expected string
+		expected zapcore.Level
 	}{
-		{"debug", "debug"},
-		{"info", "info"},
-		{"warn", "warn"},
-		{"error", "error"},
-		{"invalid", "info"}, // default
-		{"", "info"},        // default
+		{"debug", zapcore.DebugLevel},
+		{"info", zapcore.InfoLevel},
+		{"warn", zapcore.WarnLevel},
+		{"error", zapcore.ErrorLevel},
+		{"invalid", zapcore.InfoLevel}, // default
+		{"", zapcore.InfoLevel},        // default
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			// Just verify it doesn't panic
 			level := parseLevel(tt.input)
-			if level == 0 && tt.input != "" && tt.input != "invalid" {
-				// Only fail for non-default cases where we expect a valid level
+			if level != tt.expected {
+				t.Errorf("parseLevel(%q) = %v, want %v", tt.input, level, tt.expected)
 			}
 		})
 	}

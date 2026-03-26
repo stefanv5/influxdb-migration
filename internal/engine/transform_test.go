@@ -264,10 +264,16 @@ func TestTransformEngine_Transform(t *testing.T) {
 func TestTransformEngine_ConvertValue_StringToFloat(t *testing.T) {
 	engine := NewTransformEngine()
 
+	// String "85.5" should be successfully parsed to float64
 	result := engine.convertValue("85.5", "float")
+	if result != float64(85.5) {
+		t.Errorf("convertValue(\"85.5\", \"float\") = %v, want 85.5", result)
+	}
+
+	// Invalid string should return 0
+	result = engine.convertValue("not_a_number", "float")
 	if result != float64(0) {
-		// String to float conversion returns 0 when parsing fails
-		// This is expected behavior
+		t.Errorf("convertValue(\"not_a_number\", \"float\") = %v, want 0", result)
 	}
 }
 

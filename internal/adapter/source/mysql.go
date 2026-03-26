@@ -113,6 +113,9 @@ func (a *MySQLAdapter) Ping(ctx context.Context) error {
 }
 
 func (a *MySQLAdapter) DiscoverTables(ctx context.Context) ([]string, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("mysql adapter not connected, call Connect first")
+	}
 	query := "SHOW TABLES"
 	rows, err := a.db.QueryContext(ctx, query)
 	if err != nil {
@@ -136,7 +139,55 @@ func (a *MySQLAdapter) DiscoverSeries(ctx context.Context, measurement string) (
 	return []string{measurement}, nil
 }
 
+func (a *MySQLAdapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("mysql adapter not connected, call Connect first")
+	}
+	query := `
+		SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		ORDER BY ORDINAL_POSITION`
+
+	rows, err := a.db.QueryContext(ctx, query, a.config.Database, table)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover schema for table %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	schema := &types.TableSchema{
+		TableName: table,
+		Columns:   make([]types.Column, 0),
+	}
+
+	for rows.Next() {
+		var col types.Column
+		var nullableStr string
+		var key string
+		if err := rows.Scan(&col.Name, &col.Type, &nullableStr, &key); err != nil {
+			return nil, fmt.Errorf("failed to scan column: %w", err)
+		}
+		col.Nullable = (nullableStr == "YES")
+		if key == "PRI" {
+			schema.PrimaryKey = col.Name
+		}
+		if col.Type == "timestamp" || col.Type == "datetime" {
+			schema.TimestampColumn = col.Name
+		}
+		schema.Columns = append(schema.Columns, col)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating columns: %w", err)
+	}
+
+	return schema, nil
+}
+
 func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("mysql adapter not connected, call Connect first")
+	}
 	var lastID int64
 	var lastTS int64
 	batchSize := 10000

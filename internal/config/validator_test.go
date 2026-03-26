@@ -294,9 +294,13 @@ func TestValidate_MappingRequiresTargetMeasurement(t *testing.T) {
 
 func TestValidate_ValidConfig(t *testing.T) {
 	cfg := &types.MigrationConfig{
-		Global:  types.GlobalConfig{Name: "test"},
-		Sources: []types.SourceConfig{{Name: "src1", Host: "localhost", Port: 3306}},
-		Targets: []types.TargetConfig{{Name: "tgt1", Type: "influxdb"}},
+		Global: types.GlobalConfig{Name: "test"},
+		Sources: []types.SourceConfig{
+			{Name: "src1", Type: "mysql", Host: "localhost", Port: 3306},
+		},
+		Targets: []types.TargetConfig{
+			{Name: "tgt1", Type: "influxdb-v1", InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"}},
+		},
 		Tasks: []types.TaskConfig{
 			{Name: "task1", Source: "src1", Target: "tgt1", Mappings: []types.MappingConfig{
 				{SourceTable: "t1", TargetMeasurement: "m1"},
@@ -314,15 +318,22 @@ func TestValidate_ValidConfig(t *testing.T) {
 
 func TestValidate_DefaultValues(t *testing.T) {
 	cfg := &types.MigrationConfig{
-		Global:  types.GlobalConfig{Name: "test"},
-		Sources: []types.SourceConfig{{Name: "src1", Host: "localhost", Port: 3306}},
-		Targets: []types.TargetConfig{{Name: "tgt1", Type: "influxdb"}},
+		Global: types.GlobalConfig{Name: "test"},
+		Sources: []types.SourceConfig{
+			{Name: "src1", Type: "mysql", Host: "localhost", Port: 3306},
+		},
+		Targets: []types.TargetConfig{
+			{Name: "tgt1", Type: "influxdb-v1", InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"}},
+		},
 		Tasks: []types.TaskConfig{
 			{Name: "task1", Source: "src1", Target: "tgt1", Mappings: []types.MappingConfig{
 				{SourceTable: "t1", TargetMeasurement: "m1"},
 			}},
 		},
 	}
+
+	// ApplyDefaults must be called before Validate for default value tests
+	ApplyDefaults(cfg)
 
 	validator := NewValidator(cfg)
 	validator.Validate()
