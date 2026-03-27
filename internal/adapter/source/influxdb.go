@@ -154,6 +154,16 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 	return series, nil
 }
 
+func (a *InfluxDBV1Adapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
+	// InfluxDB is a time-series database with schemaless writes.
+	// Return a minimal schema with just the measurement name.
+	// Actual field/tag discovery is done through queries.
+	return &types.TableSchema{
+		TableName: table,
+		Columns:   []types.Column{},
+	}, nil
+}
+
 func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var lastTS int64
 	var totalProcessed int64
@@ -214,7 +224,7 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 
@@ -523,6 +533,16 @@ schema.tagKeys(bucket: "%s", measurement: "%s")`, a.config.Bucket, measurement)
 	return series, nil
 }
 
+func (a *InfluxDBV2Adapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
+	// InfluxDB 2.x uses Flux and has schemaless writes.
+	// Return a minimal schema with just the measurement name.
+	// Actual field/tag discovery is done through queries.
+	return &types.TableSchema{
+		TableName: table,
+		Columns:   []types.Column{},
+	}, nil
+}
+
 func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var startTime string
 	var totalProcessed int64
@@ -583,7 +603,7 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 

@@ -132,14 +132,18 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	defer func() {
+		if tx != nil {
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				logger.Error("mysql rollback failed",
+					zap.String("table", table),
+					zap.Error(rbErr))
+			}
+		}
+	}()
 
 	colList, placeholders, updateColumns, err := a.buildInsertSQL(records[0])
 	if err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			logger.Warn("mysql rollback failed after buildInsertSQL error",
-				zap.String("table", table),
-				zap.Error(rbErr))
-		}
 		return err
 	}
 
@@ -149,11 +153,6 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 	for _, record := range records {
 		values, err := a.recordToValues(record, colList)
 		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				logger.Warn("mysql rollback failed after recordToValues error",
-					zap.String("table", table),
-					zap.Error(rbErr))
-			}
 			return err
 		}
 		valueStrings = append(valueStrings, "("+placeholders+")")
@@ -165,18 +164,13 @@ func (a *MySQLTargetAdapter) writeRecords(ctx context.Context, table string, rec
 
 	_, err = tx.ExecContext(ctx, query, valueArgs...)
 	if err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			logger.Warn("mysql rollback failed after ExecContext error",
-				zap.String("table", table),
-				zap.Error(rbErr))
-		}
 		return err
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("mysql commit failed: %w", err)
 	}
-
+	tx = nil // Mark as committed to prevent deferred rollback
 	return nil
 }
 
@@ -319,7 +313,8 @@ func (a *MySQLTargetAdapter) buildCreateTableDDL(schema *types.Schema) (string, 
 }
 
 func (a *MySQLTargetAdapter) goTypeToMySQLType(dataType string) string {
-	switch strings.ToLower(dataType) {
+	lower := strings.ToLower(dataType)
+	switch lower {
 	case "float", "float64", "double":
 		return "DOUBLE"
 	case "float32":

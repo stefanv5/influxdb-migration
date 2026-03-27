@@ -244,7 +244,10 @@ func (a *InfluxDBV1TargetAdapter) writeLines(ctx context.Context, body string) e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("write failed with status %d, failed to read response: %w", resp.StatusCode, err)
+		}
 		bodyStr := string(respBody)
 		if len(bodyStr) > 200 {
 			bodyStr = bodyStr[:200] + "..."
@@ -518,7 +521,10 @@ func (a *InfluxDBV2TargetAdapter) writeLines(ctx context.Context, lines []string
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("write failed with status %d, failed to read response: %w", resp.StatusCode, err)
+		}
 		bodyStr := string(respBody)
 		if len(bodyStr) > 200 {
 			bodyStr = bodyStr[:200] + "..."

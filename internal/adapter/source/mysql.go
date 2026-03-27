@@ -188,6 +188,13 @@ func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoi
 	if a.db == nil {
 		return nil, fmt.Errorf("mysql adapter not connected, call Connect first")
 	}
+
+	// Discover schema to build dynamic query
+	schema, err := a.DiscoverSchema(ctx, table)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover schema for table %s: %w", table, err)
+	}
+
 	var lastID int64
 	var lastTS int64
 	batchSize := 10000
@@ -206,7 +213,7 @@ func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoi
 	}
 
 	for {
-		records, err := a.queryBatch(ctx, table, lastTS, lastID, batchSize)
+		records, err := a.queryBatch(ctx, table, schema, lastTS, lastID, batchSize)
 		if err != nil {
 			return nil, err
 		}
@@ -232,10 +239,8 @@ func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoi
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
+		case <-time.After(100 * time.Millisecond):
 		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 
 	return &types.Checkpoint{
@@ -245,27 +250,67 @@ func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoi
 	}, nil
 }
 
-type mysqlRecord struct {
-	ID     int64
-	Time   int64
-	Fields map[string]interface{}
-	Tags   map[string]string
-}
+func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, schema *types.TableSchema, lastTS int64, lastID int64, batchSize int) ([]types.Record, error) {
+	// Build dynamic query based on actual schema
+	var selectCols []string
+	idCol := ""
+	tsCol := ""
 
-func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, lastTS int64, lastID int64, batchSize int) ([]types.Record, error) {
-	query := fmt.Sprintf(`
-		SELECT id, timestamp, host_id, cpu_usage, memory_usage
-		FROM %s
-		WHERE timestamp > ? OR (timestamp = ? AND id > ?)
-		ORDER BY timestamp, id
-		LIMIT ?`, quoteIdentifier(table))
-
-	lastTSString := ""
-	if lastTS > 0 {
-		lastTSString = time.Unix(0, lastTS).Format("2006-01-02 15:04:05.000000000")
+	for _, col := range schema.Columns {
+		selectCols = append(selectCols, quoteIdentifier(col.Name))
+		// Identify primary key and timestamp columns
+		if col.Name == schema.PrimaryKey {
+			idCol = col.Name
+		}
+		if col.Name == schema.TimestampColumn {
+			tsCol = col.Name
+		}
 	}
 
-	rows, err := a.db.QueryContext(ctx, query, lastTSString, lastTSString, lastID, batchSize)
+	// Fallback: if no primary key found, use first column
+	if idCol == "" && len(schema.Columns) > 0 {
+		idCol = schema.Columns[0].Name
+	}
+	// Fallback: if no timestamp found, look for common timestamp column names
+	if tsCol == "" {
+		for _, col := range schema.Columns {
+			lowerName := strings.ToLower(col.Name)
+			if strings.Contains(lowerName, "timestamp") || strings.Contains(lowerName, "time") || strings.Contains(lowerName, "date") {
+				tsCol = col.Name
+				break
+			}
+		}
+	}
+
+	if len(selectCols) == 0 {
+		return nil, fmt.Errorf("no columns found in schema for table %s", table)
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectCols, ", "), quoteIdentifier(table))
+	var args []interface{}
+
+	if tsCol != "" && lastTS > 0 {
+		lastTSString := time.Unix(0, lastTS).Format("2006-01-02 15:04:05.000000000")
+		if idCol != "" && lastID > 0 {
+			query += fmt.Sprintf(" WHERE %s > ? OR (%s = ? AND %s > ?)", quoteIdentifier(tsCol), quoteIdentifier(tsCol), quoteIdentifier(idCol))
+			args = []interface{}{lastTSString, lastTSString, lastID}
+		} else {
+			query += fmt.Sprintf(" WHERE %s > ?", quoteIdentifier(tsCol))
+			args = []interface{}{lastTSString}
+		}
+	} else if idCol != "" && lastID > 0 {
+		query += fmt.Sprintf(" WHERE %s > ?", quoteIdentifier(idCol))
+		args = []interface{}{lastID}
+	}
+
+	query += fmt.Sprintf(" ORDER BY %s", quoteIdentifier(tsCol))
+	if idCol != "" && idCol != tsCol {
+		query += ", " + quoteIdentifier(idCol)
+	}
+	query += " LIMIT ?"
+	args = append(args, batchSize)
+
+	rows, err := a.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -273,33 +318,65 @@ func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, lastTS int6
 		defer rows.Close()
 	}
 
-	var records []types.Record
+	records := make([]types.Record, 0, batchSize)
 	for rows.Next() {
-		var id int64
-		var ts sql.NullString
-		var hostID sql.NullString
-		var cpuUsage, memoryUsage sql.NullFloat64
+		// Scan into interface slice
+		values := make([]interface{}, len(selectCols))
 
-		if err := rows.Scan(&id, &ts, &hostID, &cpuUsage, &memoryUsage); err != nil {
+		if err := rows.Scan(values...); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 
 		record := types.NewRecord()
-		record.ID = id
-		if ts.Valid {
-			if parsed, err := time.Parse("2006-01-02 15:04:05.000000000", ts.String); err == nil {
-				record.Time = parsed.UnixNano()
-			}
-		}
 
-		if hostID.Valid {
-			record.AddTag("host_id", hostID.String)
-		}
-		if cpuUsage.Valid {
-			record.AddField("cpu_usage", cpuUsage.Float64)
-		}
-		if memoryUsage.Valid {
-			record.AddField("memory_usage", memoryUsage.Float64)
+		for i, col := range schema.Columns {
+			val := values[i]
+			if val == nil {
+				continue
+			}
+
+			switch v := val.(type) {
+			case nil:
+				// Skip nulls
+			case int64:
+				if col.Name == idCol {
+					record.ID = v
+				}
+				if col.Name == tsCol {
+					record.Time = v
+				} else {
+					record.AddField(col.Name, v)
+				}
+			case int:
+				if col.Name == idCol {
+					record.ID = int64(v)
+				}
+				if col.Name == tsCol {
+					record.Time = int64(v)
+				} else {
+					record.AddField(col.Name, v)
+				}
+			case float64:
+				record.AddField(col.Name, v)
+			case string:
+				if col.Name == tsCol {
+					if parsed, err := time.Parse("2006-01-02 15:04:05.000000000", v); err == nil {
+						record.Time = parsed.UnixNano()
+					} else if parsed, err := time.Parse("2006-01-02 15:04:05", v); err == nil {
+						record.Time = parsed.UnixNano()
+					} else if parsed, err := time.Parse(time.RFC3339, v); err == nil {
+						record.Time = parsed.UnixNano()
+					}
+				} else {
+					record.AddField(col.Name, v)
+				}
+			case bool:
+				record.AddField(col.Name, v)
+			case []byte:
+				record.AddField(col.Name, string(v))
+			default:
+				record.AddField(col.Name, v)
+			}
 		}
 
 		records = append(records, *record)

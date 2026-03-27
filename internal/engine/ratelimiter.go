@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -25,19 +26,20 @@ func NewRateLimiter(rate float64, burst int) *RateLimiter {
 	}
 }
 
+func (r *RateLimiter) refill(now time.Time) {
+	elapsed := now.Sub(r.lastTime).Seconds()
+	r.tokens += elapsed * r.rate
+	if r.tokens > float64(r.burst) {
+		r.tokens = float64(r.burst)
+	}
+	r.lastTime = now
+}
+
 func (r *RateLimiter) Allow(points int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	now := time.Now()
-	elapsed := now.Sub(r.lastTime).Seconds()
-	r.tokens += elapsed * r.rate
-
-	if r.tokens > float64(r.burst) {
-		r.tokens = float64(r.burst)
-	}
-
-	r.lastTime = now
+	r.refill(time.Now())
 
 	if r.tokens >= float64(points) {
 		r.tokens -= float64(points)
@@ -54,11 +56,42 @@ func (r *RateLimiter) Wait(points int) {
 }
 
 func (r *RateLimiter) WaitWithDeadline(points int, deadline time.Time) error {
-	for !r.Allow(points) {
+	for {
+		if r.Allow(points) {
+			return nil
+		}
 		if time.Now().After(deadline) {
 			return ErrRateLimitExceeded
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return nil
+}
+
+func (r *RateLimiter) WaitContext(ctx context.Context, points int) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if r.Allow(points) {
+			return nil
+		}
+
+		// Wait with context cancellation support using a short sleep
+		// that can be interrupted by context cancellation
+		waitCh := make(chan struct{})
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			close(waitCh)
+		}()
+
+		select {
+		case <-waitCh:
+			// Continue loop
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }

@@ -17,6 +17,12 @@ type SourceAdapter interface {
 	DiscoverTables(ctx context.Context) ([]string, error)
 	DiscoverSeries(ctx context.Context, measurement string) ([]string, error)
 
+	// DiscoverSchema returns the schema for a given table.
+	// Returns a TableSchema with TableName and Columns populated.
+	// For adapters that don't support schema discovery (e.g., InfluxDB, TDengine),
+	// this returns a minimal schema with just the TableName set.
+	DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error)
+
 	QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error)
 }
 

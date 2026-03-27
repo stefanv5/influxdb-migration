@@ -40,7 +40,7 @@ This shows the source and target configurations and estimated data to be migrate
 		fmt.Printf("Chunk Interval: %s\n", cfg.Migration.ChunkInterval)
 		fmt.Printf("Rate Limited: %v\n", cfg.RateLimit.Enabled)
 		if cfg.RateLimit.Enabled {
-			fmt.Printf("Rate Limit: %d points/sec, burst %d\n",
+			fmt.Printf("Rate Limit: %.2f points/sec, burst %d\n",
 				cfg.RateLimit.PointsPerSecond, cfg.RateLimit.BurstSize)
 		}
 

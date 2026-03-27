@@ -8,18 +8,10 @@ import (
 )
 
 type TransformEngine struct {
-	mappings map[string]*types.MappingConfig
 }
 
 func NewTransformEngine() *TransformEngine {
-	return &TransformEngine{
-		mappings: make(map[string]*types.MappingConfig),
-	}
-}
-
-func (t *TransformEngine) RegisterMapping(sourceTable, targetMeasurement string, mapping *types.MappingConfig) {
-	key := sourceTable + ":" + targetMeasurement
-	t.mappings[key] = mapping
+	return &TransformEngine{}
 }
 
 func (t *TransformEngine) Transform(record *types.Record, mapping *types.MappingConfig) *types.Record {

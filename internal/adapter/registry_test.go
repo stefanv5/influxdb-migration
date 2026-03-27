@@ -36,6 +36,12 @@ func (m *MockSourceAdapter) DiscoverTables(ctx context.Context) ([]string, error
 func (m *MockSourceAdapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
 	return []string{"series1"}, nil
 }
+func (m *MockSourceAdapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
+	return &types.TableSchema{
+		TableName: table,
+		Columns:   []types.Column{},
+	}, nil
+}
 func (m *MockSourceAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	return &types.Checkpoint{ProcessedRows: 100}, nil
 }
@@ -185,14 +191,17 @@ func TestListTargetAdapters(t *testing.T) {
 }
 
 func TestRegisterSourceAdapter(t *testing.T) {
-	// Clear global registry for testing
-	globalRegistry = NewRegistry()
+	// Create a fresh local registry to avoid global state pollution
+	registry := NewRegistry()
+	originalGlobal := globalRegistry
+	defer func() { globalRegistry = originalGlobal }()
+	globalRegistry = registry
 
 	RegisterSourceAdapter("test-source", func() SourceAdapter {
 		return &MockSourceAdapter{name: "test-source", versions: []string{"1.0"}}
 	})
 
-	src, err := GetRegistry().GetSourceAdapter("test-source")
+	src, err := registry.GetSourceAdapter("test-source")
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -203,14 +212,17 @@ func TestRegisterSourceAdapter(t *testing.T) {
 }
 
 func TestRegisterTargetAdapter(t *testing.T) {
-	// Clear global registry for testing
-	globalRegistry = NewRegistry()
+	// Create a fresh local registry to avoid global state pollution
+	registry := NewRegistry()
+	originalGlobal := globalRegistry
+	defer func() { globalRegistry = originalGlobal }()
+	globalRegistry = registry
 
 	RegisterTargetAdapter("test-target", func() TargetAdapter {
 		return &MockTargetAdapter{name: "test-target", versions: []string{"1.0"}}
 	})
 
-	tgt, err := GetRegistry().GetTargetAdapter("test-target")
+	tgt, err := registry.GetTargetAdapter("test-target")
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}

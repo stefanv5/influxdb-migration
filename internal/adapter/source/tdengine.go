@@ -145,6 +145,16 @@ func (a *TDengineAdapter) DiscoverSeries(ctx context.Context, measurement string
 	return a.DiscoverTablesFromStable(ctx, measurement)
 }
 
+func (a *TDengineAdapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
+	// TDengine is a time-series database and does not have a direct equivalent
+	// to MySQL's INFORMATION_SCHEMA. TDengine's schema is defined by the STABLE,
+	// and columns are fixed for all sub-tables. For now, return a minimal schema.
+	return &types.TableSchema{
+		TableName: table,
+		Columns:   []types.Column{},
+	}, nil
+}
+
 func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var lastTS int64
 	if lastCheckpoint != nil {
@@ -272,7 +282,10 @@ func (a *TDengineAdapter) executeQuery(ctx context.Context, query string) ([][]a
 		"sql": query,
 		"db":  a.config.Database,
 	}
-	bodyBytes, _ := json.Marshal(reqBody)
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", a.baseURL+"/rest/sql", bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -284,14 +297,18 @@ func (a *TDengineAdapter) executeQuery(ctx context.Context, query string) ([][]a
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		logger.Error("TDengine query failed", zap.Error(err))
-		return nil, err
+		return nil, fmt.Errorf("TDengine query failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Check if context was cancelled during/after HTTP call
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	var result TDengineResponse
@@ -300,7 +317,6 @@ func (a *TDengineAdapter) executeQuery(ctx context.Context, query string) ([][]a
 	}
 
 	if result.Code != 0 {
-		logger.Error("TDengine error", zap.String("message", result.Message))
 		return nil, fmt.Errorf("TDengine error: %s", result.Message)
 	}
 

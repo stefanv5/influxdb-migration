@@ -81,8 +81,6 @@ func (s *SQLiteStore) initSchema() error {
 
 	_, err := s.db.Exec(schema)
 
-	_, _ = s.db.Exec(`ALTER TABLE checkpoints ADD COLUMN mapping_config TEXT`)
-
 	return err
 }
 

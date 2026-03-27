@@ -64,6 +64,21 @@ func (e *MigrationEngine) closeQueueOnce() {
 	}
 }
 
+func (e *MigrationEngine) isQueueClosed() bool {
+	e.queueMu.Lock()
+	defer e.queueMu.Unlock()
+	return e.queueClosed
+}
+
+func (e *MigrationEngine) resetQueue() {
+	e.queueMu.Lock()
+	defer e.queueMu.Unlock()
+	if e.queueClosed {
+		e.taskQueue = make(chan *MigrationTask, e.config.Migration.ParallelTasks*2)
+		e.queueClosed = false
+	}
+}
+
 func (e *MigrationEngine) Run(ctx context.Context) error {
 	taskCount := 0
 	for _, taskConfig := range e.config.Tasks {
@@ -474,8 +489,8 @@ func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.Mappi
 	}
 
 	transformed := make([]types.Record, 0, len(records))
-	for _, record := range records {
-		filtered := filterNilValues(&record)
+	for i := range records {
+		filtered := filterNilValues(&records[i])
 		transformed = append(transformed, *filtered)
 	}
 
@@ -670,6 +685,11 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 	inProgressTasks, err := e.checkpointMgr.GetInProgressTasks(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get in-progress tasks: %w", err)
+	}
+
+	// If queue was closed by a previous Run(), reset it for Resume
+	if e.isQueueClosed() {
+		e.resetQueue()
 	}
 
 	for _, cp := range failedTasks {

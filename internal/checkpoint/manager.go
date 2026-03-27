@@ -51,6 +51,26 @@ func (m *Manager) SaveCheckpoint(ctx context.Context, taskID, sourceTable string
 	return m.store.SaveCheckpoint(cp)
 }
 
+func (m *Manager) UpdateCheckpointStatus(ctx context.Context, taskID, sourceTable string, status types.CheckpointStatus, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
+	if err != nil {
+		return err
+	}
+	if cp == nil {
+		return fmt.Errorf("checkpoint not found")
+	}
+
+	cp.Status = status
+	if errMsg != "" {
+		cp.ErrorMessage = errMsg
+	}
+
+	return m.store.SaveCheckpoint(cp)
+}
+
 func (m *Manager) LoadCheckpoint(ctx context.Context, taskID, sourceTable string) (*types.Checkpoint, error) {
 	return m.store.LoadCheckpoint(taskID, sourceTable)
 }
@@ -72,62 +92,37 @@ func (m *Manager) GetInProgressTasks(ctx context.Context) ([]*types.Checkpoint, 
 }
 
 func (m *Manager) MarkTaskCompleted(ctx context.Context, taskID, sourceTable string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
+	err := m.UpdateCheckpointStatus(ctx, taskID, sourceTable, types.StatusCompleted, "")
 	if err != nil {
 		return err
 	}
-	if cp == nil {
-		return fmt.Errorf("checkpoint not found")
-	}
-
-	cp.Status = types.StatusCompleted
 	logger.Info("task marked as completed",
 		zap.String("task_id", taskID),
 		zap.String("source_table", sourceTable))
-	return m.store.SaveCheckpoint(cp)
+	return nil
 }
 
 func (m *Manager) MarkTaskFailed(ctx context.Context, taskID, sourceTable, errMsg string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
+	err := m.UpdateCheckpointStatus(ctx, taskID, sourceTable, types.StatusFailed, errMsg)
 	if err != nil {
 		return err
 	}
-	if cp == nil {
-		return fmt.Errorf("checkpoint not found")
-	}
-
-	cp.Status = types.StatusFailed
-	cp.ErrorMessage = errMsg
 	logger.Error("task marked as failed",
 		zap.String("task_id", taskID),
 		zap.String("source_table", sourceTable),
 		zap.String("error", errMsg))
-	return m.store.SaveCheckpoint(cp)
+	return nil
 }
 
 func (m *Manager) MarkTaskInProgress(ctx context.Context, taskID, sourceTable string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
+	err := m.UpdateCheckpointStatus(ctx, taskID, sourceTable, types.StatusInProgress, "")
 	if err != nil {
 		return err
 	}
-	if cp == nil {
-		return fmt.Errorf("checkpoint not found")
-	}
-
-	cp.Status = types.StatusInProgress
 	logger.Debug("task marked as in_progress",
 		zap.String("task_id", taskID),
 		zap.String("source_table", sourceTable))
-	return m.store.SaveCheckpoint(cp)
+	return nil
 }
 
 func (m *Manager) ResetAll(ctx context.Context) error {
