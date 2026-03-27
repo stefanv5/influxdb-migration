@@ -105,10 +105,10 @@ func TestGenerator_Generate_WithFailedTask(t *testing.T) {
 	}
 	mgr.CreateCheckpoint(cp1)
 
-	// Create failed checkpoint
+	// Create failed checkpoint (same taskID to test failed sub-task within migration)
 	cp2 := &types.Checkpoint{
-		TaskID:        "task2",
-		TaskName:      "Task 2",
+		TaskID:        "task1",
+		TaskName:      "Task 1 - sub",
 		SourceTable:   "table2",
 		TargetMeas:    "meas2",
 		ProcessedRows: 200,
