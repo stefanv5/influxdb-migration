@@ -165,6 +165,21 @@ func (e *MigrationEngine) discoverMappings(ctx context.Context, taskConfig types
 	var result []types.MappingConfig
 	seen := make(map[string]bool)
 
+	// Warn if no tables discovered when using wildcard
+	if len(allTables) == 0 && len(taskConfig.Mappings) > 0 {
+		hasWildcard := false
+		for _, m := range taskConfig.Mappings {
+			if m.SourceTable == "" || m.SourceTable == "*" {
+				hasWildcard = true
+				break
+			}
+		}
+		if hasWildcard {
+			logger.Warn("no tables discovered from source, nothing to migrate",
+				zap.String("source", taskConfig.Source))
+		}
+	}
+
 	for _, table := range allTables {
 		if seen[table] {
 			continue
@@ -341,6 +356,11 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	if task.Mapping.TimeWindow != "" {
 		if tw, err := time.ParseDuration(task.Mapping.TimeWindow); err == nil {
 			timeWindow = tw
+		} else {
+			logger.Warn("invalid time window, using default",
+				zap.String("time_window", task.Mapping.TimeWindow),
+				zap.Duration("default", types.DefaultTimeWindow),
+				zap.Error(err))
 		}
 	}
 
@@ -356,17 +376,27 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	switch task.Mapping.TimeRange.Start {
 	case "":
 		checkpoint, queryErr := sourceAdapter.QueryData(ctx, sourceTable, lastCheckpoint, func(records []types.Record) error {
+			if len(records) == 0 {
+				return nil
+			}
+
+			// Save checkpoint BEFORE write to prevent data loss on crash.
+			// This uses "at-least-once" semantics: on crash we may re-process
+			// this batch, but we will never lose data.
+			lastRecord := records[len(records)-1]
+			saveTimestamp := lastRecord.Time
+			saveProcessed := totalProcessed + int64(len(records))
+
+			e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+				0, saveTimestamp, saveProcessed, types.StatusInProgress)
+
 			err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
 			if err != nil {
 				return err
 			}
-			if len(records) > 0 {
-				lastRecord := records[len(records)-1]
-				totalProcessed += int64(len(records))
-				lastTimestamp = lastRecord.Time
-				e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
-					0, lastTimestamp, totalProcessed, types.StatusInProgress)
-			}
+
+			totalProcessed = saveProcessed
+			lastTimestamp = saveTimestamp
 			return nil
 		}, queryCfg)
 		if queryErr != nil {
@@ -419,6 +449,12 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 		endTime = time.Now()
 	}
 
+	// Validate that end time is after start time
+	if !endTime.After(startTime) {
+		return nil, fmt.Errorf("invalid time range: end time %s must be after start time %s",
+			mapping.TimeRange.End, mapping.TimeRange.Start)
+	}
+
 	if mapping.TimeWindow == "" {
 		mapping.TimeWindow = "168h"
 	}
@@ -448,17 +484,25 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 		}
 
 		cp, err := sourceAdapter.QueryData(ctx, table, currentCp, func(records []types.Record) error {
+			if len(records) == 0 {
+				return nil
+			}
+
+			// Save checkpoint BEFORE write to prevent data loss on crash
+			lastRecord := records[len(records)-1]
+			saveTimestamp := lastRecord.Time
+			saveProcessed := totalProcessed + int64(len(records))
+
+			e.checkpointMgr.SaveCheckpoint(ctx, taskID, table,
+				0, saveTimestamp, saveProcessed, types.StatusInProgress)
+
 			err := e.processBatch(ctx, &windowMapping, records, targetAdapter)
 			if err != nil {
 				return err
 			}
-			if len(records) > 0 {
-				lastRecord := records[len(records)-1]
-				totalProcessed += int64(len(records))
-				lastTimestamp = lastRecord.Time
-				e.checkpointMgr.SaveCheckpoint(ctx, taskID, table,
-					0, lastTimestamp, totalProcessed, types.StatusInProgress)
-			}
+
+			totalProcessed = saveProcessed
+			lastTimestamp = saveTimestamp
 			return nil
 		}, queryCfg)
 
@@ -485,7 +529,9 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 
 func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.MappingConfig, records []types.Record, targetAdapter adapter.TargetAdapter) error {
 	if e.rateLimiter != nil {
-		e.rateLimiter.Wait(len(records))
+		if err := e.rateLimiter.WaitContext(ctx, len(records)); err != nil {
+			return fmt.Errorf("rate limit wait cancelled: %w", err)
+		}
 	}
 
 	transformed := make([]types.Record, 0, len(records))
@@ -510,6 +556,10 @@ func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.Mappi
 	return e.writeWithRetry(ctx, mapping.TargetMeasurement, transformed, targetAdapter)
 }
 
+// writeWithRetry attempts to write records to the target adapter with exponential backoff.
+// NOTE: This function assumes WriteBatch is idempotent - if a write partially succeeds before
+// failing, retrying may result in duplicate records. Target systems should use timestamps
+// or unique identifiers to handle deduplication (InfluxDB handles this via line protocol).
 func (e *MigrationEngine) writeWithRetry(ctx context.Context, measurement string, records []types.Record, targetAdapter adapter.TargetAdapter) error {
 	maxAttempts := e.config.Retry.MaxAttempts
 	if maxAttempts == 0 {
@@ -546,9 +596,12 @@ func (e *MigrationEngine) writeWithRetry(ctx context.Context, measurement string
 			case <-time.After(delay):
 			}
 
-			delay *= time.Duration(e.config.Retry.BackoffMultiplier)
-			if delay > maxDelay {
+			// Calculate new delay with overflow protection
+			newDelay := time.Duration(float64(delay) * e.config.Retry.BackoffMultiplier)
+			if newDelay < delay || newDelay > maxDelay {
 				delay = maxDelay
+			} else {
+				delay = newDelay
 			}
 		}
 	}

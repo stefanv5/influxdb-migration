@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/migration-tools/influx-migrator/internal/adapter"
+	"github.com/migration-tools/influx-migrator/internal/logger"
 	"github.com/migration-tools/influx-migrator/pkg/types"
+	"go.uber.org/zap"
 )
 
 type InfluxDBV1TargetAdapter struct {
@@ -64,6 +66,8 @@ func (a *InfluxDBV1TargetAdapter) Connect(ctx context.Context, config map[string
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
+			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 	a.client = &http.Client{
@@ -144,7 +148,10 @@ func (a *InfluxDBV1TargetAdapter) formatInfluxLine(measurement string, r types.R
 		timestampStr = fmt.Sprintf(" %d", r.Time)
 	}
 
-	return fmt.Sprintf("%s,%s %s%s", measurement, tagsStr, fieldsStr, timestampStr)
+	if tagsStr != "" {
+		return fmt.Sprintf("%s,%s %s%s", measurement, tagsStr, fieldsStr, timestampStr)
+	}
+	return fmt.Sprintf("%s %s%s", measurement, fieldsStr, timestampStr)
 }
 
 func formatTags(tags map[string]string) string {
@@ -204,8 +211,9 @@ func escapeTagValue(s string) string {
 }
 
 func escapeStringValue(s string) string {
-	s = strings.ReplaceAll(s, "\"", "\\\"")
+	// Must escape backslashes first, then quotes
 	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
 	return s
 }
 
@@ -239,6 +247,10 @@ func (a *InfluxDBV1TargetAdapter) writeLines(ctx context.Context, body string) e
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -408,6 +420,8 @@ func (a *InfluxDBV2TargetAdapter) Connect(ctx context.Context, config map[string
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
+			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 	a.client = &http.Client{
@@ -468,19 +482,29 @@ func (a *InfluxDBV2TargetAdapter) formatFluxRecords(measurement string, records 
 	var lines []string
 
 	for _, r := range records {
+		if len(r.Fields) == 0 {
+			continue
+		}
+
+		// Build field part: field1=value1,field2=value2
+		var fieldParts []string
 		for field, value := range r.Fields {
 			if value == nil {
 				continue
 			}
+			fieldParts = append(fieldParts, fmt.Sprintf("%s=%s", escapeFieldKey(field), formatFieldValue(value)))
+		}
 
-			line := fmt.Sprintf("%s,%s %s=%v %d",
-				measurement,
-				formatTags(r.Tags),
-				field,
-				formatFieldValue(value),
-				r.Time)
+		if len(fieldParts) == 0 {
+			continue
+		}
 
-			lines = append(lines, line)
+		// InfluxDB v2 write line protocol: measurement,tag1=val1 field1=val1,field2=val2 timestamp
+		tagsStr := formatTags(r.Tags)
+		if tagsStr != "" {
+			lines = append(lines, fmt.Sprintf("%s,%s %s %d", measurement, tagsStr, strings.Join(fieldParts, ","), r.Time))
+		} else {
+			lines = append(lines, fmt.Sprintf("%s %s %d", measurement, strings.Join(fieldParts, ","), r.Time))
 		}
 	}
 
@@ -516,6 +540,10 @@ func (a *InfluxDBV2TargetAdapter) writeLines(ctx context.Context, lines []string
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return err
 	}
 	defer resp.Body.Close()

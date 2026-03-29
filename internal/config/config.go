@@ -31,6 +31,8 @@ func Load(configPath string) (*types.MigrationConfig, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	ApplyDefaults(&cfg)
+
 	return &cfg, nil
 }
 

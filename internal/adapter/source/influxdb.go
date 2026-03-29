@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -66,6 +67,8 @@ func (a *InfluxDBV1Adapter) Connect(ctx context.Context, config map[string]inter
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
+			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 	a.client = &http.Client{
@@ -101,6 +104,10 @@ func (a *InfluxDBV1Adapter) Ping(ctx context.Context) error {
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -186,7 +193,7 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 	if cfg != nil && cfg.BatchSize > 0 {
 		batchSize = cfg.BatchSize
 	}
-	totalRecords := 0
+	totalRecords := int(totalProcessed)
 
 	for {
 		query := fmt.Sprintf(`SELECT * FROM %s WHERE time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
@@ -210,7 +217,11 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 
 		maxTS := records[len(records)-1].Time
 		lastTS = maxTS
-		startTime = fmt.Sprintf("%d", maxTS+1)
+		if maxTS < math.MaxInt64 {
+			startTime = fmt.Sprintf("%d", maxTS+1)
+		} else {
+			startTime = fmt.Sprintf("%d", maxTS)
+		}
 
 		logger.Debug("fetched batch from InfluxDB V1",
 			zap.String("measurement", measurement),
@@ -320,8 +331,9 @@ func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}) 
 			case float64:
 				record.AddField(col, v)
 			case string:
+				// In InfluxDB V1, string values from query results are typically tags
+				// (InfluxDB stores strings as tags by default)
 				record.AddTag(col, v)
-				record.AddField(col, v)
 			case bool:
 				record.AddField(col, v)
 			}
@@ -444,6 +456,8 @@ func (a *InfluxDBV2Adapter) Connect(ctx context.Context, config map[string]inter
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
+			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 	a.client = &http.Client{
@@ -476,6 +490,10 @@ func (a *InfluxDBV2Adapter) Ping(ctx context.Context) error {
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -589,7 +607,11 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 
 		maxTS := records[len(records)-1].Time
 		lastTS = maxTS
-		startTime = fmt.Sprintf("%d", maxTS+1)
+		if maxTS < math.MaxInt64 {
+			startTime = fmt.Sprintf("%d", maxTS+1)
+		} else {
+			startTime = fmt.Sprintf("%d", maxTS)
+		}
 
 		logger.Debug("fetched batch from InfluxDB V2",
 			zap.String("measurement", measurement),

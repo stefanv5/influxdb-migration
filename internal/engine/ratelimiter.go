@@ -68,30 +68,19 @@ func (r *RateLimiter) WaitWithDeadline(points int, deadline time.Time) error {
 }
 
 func (r *RateLimiter) WaitContext(ctx context.Context, points int) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 
+	for {
 		if r.Allow(points) {
 			return nil
 		}
 
-		// Wait with context cancellation support using a short sleep
-		// that can be interrupted by context cancellation
-		waitCh := make(chan struct{})
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			close(waitCh)
-		}()
-
 		select {
-		case <-waitCh:
-			// Continue loop
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-ticker.C:
+			// Continue loop
 		}
 	}
 }
