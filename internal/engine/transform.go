@@ -250,7 +250,7 @@ func (t *TransformEngine) ValidateRecord(record *types.Record) []string {
 }
 
 // ValidateMapping checks the mapping configuration for issues.
-// Returns error if validation fails, or warnings if issues are found.
+// Returns error if validation fails.
 func (t *TransformEngine) ValidateMapping(mapping *types.MappingConfig) error {
 	if mapping == nil {
 		return nil
@@ -259,25 +259,27 @@ func (t *TransformEngine) ValidateMapping(mapping *types.MappingConfig) error {
 	// Check for duplicate names in field mappings
 	fieldNames := make(map[string]bool)
 	for _, fm := range mapping.Schema.Fields {
-		if fm.TargetName == "" {
-			fm.TargetName = fm.SourceName
+		targetName := fm.TargetName
+		if targetName == "" {
+			targetName = fm.SourceName
 		}
-		if fieldNames[fm.TargetName] {
-			return fmt.Errorf("duplicate field target name %q in mapping", fm.TargetName)
+		if fieldNames[targetName] {
+			return fmt.Errorf("duplicate field target name %q in mapping", targetName)
 		}
-		fieldNames[fm.TargetName] = true
+		fieldNames[targetName] = true
 	}
 
 	// Check for duplicate names in tag mappings
 	tagNames := make(map[string]bool)
 	for _, tm := range mapping.Schema.Tags {
-		if tm.TargetName == "" {
-			tm.TargetName = tm.SourceName
+		targetName := tm.TargetName
+		if targetName == "" {
+			targetName = tm.SourceName
 		}
-		if tagNames[tm.TargetName] {
-			return fmt.Errorf("duplicate tag target name %q in mapping", tm.TargetName)
+		if tagNames[targetName] {
+			return fmt.Errorf("duplicate tag target name %q in mapping", targetName)
 		}
-		tagNames[tm.TargetName] = true
+		tagNames[targetName] = true
 	}
 
 	// Check for field/tag name collisions in mapping targets

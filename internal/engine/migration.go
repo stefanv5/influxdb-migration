@@ -373,6 +373,11 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 		return fmt.Errorf("invalid query config: %w", err)
 	}
 
+	// Validate mapping configuration once per task (not per batch)
+	if err := e.transformer.ValidateMapping(task.Mapping); err != nil {
+		return fmt.Errorf("mapping validation failed: %w", err)
+	}
+
 	switch task.Mapping.TimeRange.Start {
 	case "":
 		checkpoint, queryErr := sourceAdapter.QueryData(ctx, sourceTable, lastCheckpoint, func(records []types.Record) error {
@@ -531,13 +536,6 @@ func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.Mappi
 	if e.rateLimiter != nil {
 		if err := e.rateLimiter.WaitContext(ctx, len(records)); err != nil {
 			return fmt.Errorf("rate limit wait cancelled: %w", err)
-		}
-	}
-
-	// Validate mapping configuration once per batch
-	if mapping != nil {
-		if err := e.transformer.ValidateMapping(mapping); err != nil {
-			return fmt.Errorf("mapping validation failed: %w", err)
 		}
 	}
 
