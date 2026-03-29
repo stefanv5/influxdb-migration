@@ -534,9 +534,25 @@ func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.Mappi
 		}
 	}
 
+	// Validate mapping configuration once per batch
+	if mapping != nil {
+		if err := e.transformer.ValidateMapping(mapping); err != nil {
+			return fmt.Errorf("mapping validation failed: %w", err)
+		}
+	}
+
 	transformed := make([]types.Record, 0, len(records))
 	for i := range records {
 		filtered := filterNilValues(&records[i])
+
+		// Check for tag/field name collisions (InfluxDB allows this but it causes query issues)
+		warnings := e.transformer.ValidateRecord(filtered)
+		for _, warning := range warnings {
+			logger.Warn("record has potential data ambiguity",
+				zap.String("warning", warning),
+				zap.String("measurement", mapping.TargetMeasurement))
+		}
+
 		transformed = append(transformed, *filtered)
 	}
 

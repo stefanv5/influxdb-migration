@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -225,4 +226,66 @@ func (t *TransformEngine) ApplySchemaMapping(record *types.Record, mapping *type
 	}
 
 	return transformed
+}
+
+// ValidateRecord checks for potential data issues in a record.
+// Returns a list of warnings found in the record.
+func (t *TransformEngine) ValidateRecord(record *types.Record) []string {
+	var warnings []string
+
+	// Check for tag/field name collisions
+	tagFields := make(map[string]struct{})
+	for k := range record.Tags {
+		tagFields[k] = struct{}{}
+	}
+
+	for fieldName := range record.Fields {
+		if _, hasTag := tagFields[fieldName]; hasTag {
+			warnings = append(warnings,
+				fmt.Sprintf("field and tag have same name %q: InfluxDB allows this but queries may return unexpected results", fieldName))
+		}
+	}
+
+	return warnings
+}
+
+// ValidateMapping checks the mapping configuration for issues.
+// Returns error if validation fails, or warnings if issues are found.
+func (t *TransformEngine) ValidateMapping(mapping *types.MappingConfig) error {
+	if mapping == nil {
+		return nil
+	}
+
+	// Check for duplicate names in field mappings
+	fieldNames := make(map[string]bool)
+	for _, fm := range mapping.Schema.Fields {
+		if fm.TargetName == "" {
+			fm.TargetName = fm.SourceName
+		}
+		if fieldNames[fm.TargetName] {
+			return fmt.Errorf("duplicate field target name %q in mapping", fm.TargetName)
+		}
+		fieldNames[fm.TargetName] = true
+	}
+
+	// Check for duplicate names in tag mappings
+	tagNames := make(map[string]bool)
+	for _, tm := range mapping.Schema.Tags {
+		if tm.TargetName == "" {
+			tm.TargetName = tm.SourceName
+		}
+		if tagNames[tm.TargetName] {
+			return fmt.Errorf("duplicate tag target name %q in mapping", tm.TargetName)
+		}
+		tagNames[tm.TargetName] = true
+	}
+
+	// Check for field/tag name collisions in mapping targets
+	for fieldName := range fieldNames {
+		if _, hasTag := tagNames[fieldName]; hasTag {
+			return fmt.Errorf("field %q and tag %q have the same target name in mapping", fieldName, fieldName)
+		}
+	}
+
+	return nil
 }
