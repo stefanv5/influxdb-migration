@@ -10,6 +10,10 @@ const (
 	MaxBatchSize     = 1000000
 	DefaultBatchSize = 10000
 
+	MinSeriesPerQuery     = 1
+	MaxSeriesPerQuery     = 1000
+	DefaultSeriesPerQuery = 100
+
 	MinTimeWindow     = 1 * time.Hour
 	MaxTimeWindow     = 30 * 24 * time.Hour
 	DefaultTimeWindow = 168 * time.Hour
@@ -18,6 +22,7 @@ const (
 type QueryConfig struct {
 	BatchSize  int
 	TimeWindow time.Duration
+	MaxSeriesPerQuery int  // 0 means use default (100)
 }
 
 func (c *QueryConfig) Validate() error {
@@ -29,6 +34,10 @@ func (c *QueryConfig) Validate() error {
 		return fmt.Errorf("time_window must be between %v and %v, got %v", MinTimeWindow, MaxTimeWindow, c.TimeWindow)
 	}
 
+	if c.MaxSeriesPerQuery != 0 && (c.MaxSeriesPerQuery < MinSeriesPerQuery || c.MaxSeriesPerQuery > MaxSeriesPerQuery) {
+		return fmt.Errorf("max_series_per_query must be between %d and %d, got %d", MinSeriesPerQuery, MaxSeriesPerQuery, c.MaxSeriesPerQuery)
+	}
+
 	return nil
 }
 
@@ -38,5 +47,8 @@ func (c *QueryConfig) ApplyDefaults() {
 	}
 	if c.TimeWindow == 0 {
 		c.TimeWindow = DefaultTimeWindow
+	}
+	if c.MaxSeriesPerQuery == 0 {
+		c.MaxSeriesPerQuery = DefaultSeriesPerQuery
 	}
 }
