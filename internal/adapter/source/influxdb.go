@@ -256,6 +256,63 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 	}, nil
 }
 
+func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement string,
+	series []string, lastCheckpoint *types.Checkpoint,
+	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
+
+	var lastTS int64
+	if lastCheckpoint != nil {
+		lastTS = lastCheckpoint.LastTimestamp
+	}
+
+	var startTime string
+	if lastTS == 0 {
+		startTime = "1970-01-01T00:00:00Z"
+	} else {
+		startTime = time.Unix(0, lastTS).Format(time.RFC3339Nano)
+	}
+
+	batchSize := getBatchSize(cfg)
+
+	whereClause := BuildWhereClause(series)
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE (%s) AND time >= '%s' LIMIT %d ORDER BY time`,
+		influxQuoteIdentifier(measurement), whereClause, startTime, batchSize)
+
+	logger.Debug("executing batch query for InfluxDB V1",
+		zap.String("measurement", measurement),
+		zap.Int("series_count", len(series)),
+		zap.String("query", query))
+
+	records, err := a.executeSelectQuery(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("batch query failed: %w", err)
+	}
+
+	if len(records) > 0 {
+		if err := batchFunc(records); err != nil {
+			return nil, fmt.Errorf("batch func failed: %w", err)
+		}
+	}
+
+	var maxTS int64
+	for _, record := range records {
+		if record.Time > maxTS {
+			maxTS = record.Time
+		}
+	}
+
+	logger.Info("completed batch query for InfluxDB V1",
+		zap.String("measurement", measurement),
+		zap.Int("series_count", len(series)),
+		zap.Int("records", len(records)),
+		zap.Int64("max_timestamp", maxTS))
+
+	return &types.Checkpoint{
+		LastTimestamp: maxTS,
+		ProcessedRows: int64(len(records)),
+	}, nil
+}
+
 func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string) ([]types.Record, error) {
 	params := url.Values{}
 	params.Set("q", query)
