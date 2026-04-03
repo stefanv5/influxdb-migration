@@ -2,6 +2,12 @@ package types
 
 import "time"
 
+type InfluxToInfluxConfig struct {
+	Enabled           bool   `mapstructure:"enabled"`
+	QueryMode         string `mapstructure:"query_mode"`   // "single" | "batch"
+	MaxSeriesPerQuery int    `mapstructure:"max_series_per_query"`
+}
+
 type MigrationConfig struct {
 	Global         GlobalConfig         `mapstructure:"global"`
 	Logging        LoggingConfig        `mapstructure:"logging"`
@@ -13,6 +19,7 @@ type MigrationConfig struct {
 	Sources        []SourceConfig       `mapstructure:"sources"`
 	Targets        []TargetConfig       `mapstructure:"targets"`
 	Tasks          []TaskConfig         `mapstructure:"tasks"`
+	InfluxToInflux InfluxToInfluxConfig `mapstructure:"influx_to_influx"`
 }
 
 type GlobalConfig struct {
