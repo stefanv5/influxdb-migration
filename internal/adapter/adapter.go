@@ -24,6 +24,9 @@ type SourceAdapter interface {
 	DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error)
 
 	QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error)
+
+	// QueryDataBatch queries multiple series in a single call for batch processing.
+	QueryDataBatch(ctx context.Context, measurement string, series []string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error)
 }
 
 type TargetAdapter interface {
