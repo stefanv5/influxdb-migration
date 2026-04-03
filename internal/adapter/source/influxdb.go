@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -67,6 +68,12 @@ func (a *InfluxDBV1Adapter) Connect(ctx context.Context, config map[string]inter
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		// Require explicit opt-in via environment variable for insecure TLS
+		if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
+			logger.Error("TLS certificate verification is disabled - set ALLOW_INSECURE_TLS=1 environment variable to allow",
+				zap.String("url", cfg.URL))
+			return fmt.Errorf("insecure TLS requires ALLOW_INSECURE_TLS=1 environment variable")
+		}
 		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
 			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
@@ -456,6 +463,12 @@ func (a *InfluxDBV2Adapter) Connect(ctx context.Context, config map[string]inter
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		// Require explicit opt-in via environment variable for insecure TLS
+		if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
+			logger.Error("TLS certificate verification is disabled - set ALLOW_INSECURE_TLS=1 environment variable to allow",
+				zap.String("url", cfg.URL))
+			return fmt.Errorf("insecure TLS requires ALLOW_INSECURE_TLS=1 environment variable")
+		}
 		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
 			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
@@ -746,4 +759,68 @@ func influxQuoteIdentifier(s string) string {
 		return `""`
 	}
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// ParseSeriesKey parses "measurement,tag1=value1,tag2=value2" into components
+func ParseSeriesKey(key string) (tags map[string]string) {
+	tags = make(map[string]string)
+	parts := strings.Split(key, ",")
+	// First part is measurement, skip it
+	for _, part := range parts[1:] {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			tags[kv[0]] = kv[1]
+		}
+	}
+	return
+}
+
+// BuildWhereClause builds "(tag1='v1' AND tag2='v2') OR (tag1='v3' AND tag2='v4')"
+func BuildWhereClause(series []string) string {
+	var conditions []string
+	for _, s := range series {
+		tags := ParseSeriesKey(s)
+		var tagConditions []string
+		for k, v := range tags {
+			tagConditions = append(tagConditions, fmt.Sprintf("%s='%s'", influxQuoteIdentifier(k), v))
+		}
+		if len(tagConditions) > 0 {
+			conditions = append(conditions, "("+strings.Join(tagConditions, " AND ")+")")
+		}
+	}
+	return strings.Join(conditions, " OR ")
+}
+
+// BuildFluxFilter builds Flux filter expression: (r.tag1 == "v1" and r.tag2 == "v2") or ...
+func BuildFluxFilter(series []string) string {
+	var conditions []string
+	for _, s := range series {
+		tags := ParseSeriesKey(s)
+		var tagConditions []string
+		for k, v := range tags {
+			tagConditions = append(tagConditions, fmt.Sprintf(`r.%s == "%s"`, influxQuoteIdentifier(k), v))
+		}
+		if len(tagConditions) > 0 {
+			conditions = append(conditions, "("+strings.Join(tagConditions, " and ")+")")
+		}
+	}
+	return strings.Join(conditions, " or ")
+}
+
+// getBatchSize returns batch size from config, defaulting to DefaultBatchSize
+func getBatchSize(cfg *types.QueryConfig) int {
+	batchSize := types.DefaultBatchSize
+	if cfg != nil && cfg.BatchSize > 0 {
+		batchSize = cfg.BatchSize
+	}
+	return batchSize
+}
+
+// getMaxSeriesPerQuery returns max series per query from config, defaulting to DefaultSeriesPerQuery
+func getMaxSeriesPerQuery(cfg *types.QueryConfig) int {
+	maxSeries := types.DefaultSeriesPerQuery
+	if cfg != nil && cfg.MaxSeriesPerQuery > 0 {
+		maxSeries = cfg.MaxSeriesPerQuery
+	}
+	return maxSeries
 }
