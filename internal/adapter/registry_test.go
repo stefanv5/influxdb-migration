@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/migration-tools/influx-migrator/pkg/types"
 )
@@ -44,6 +45,26 @@ func (m *MockSourceAdapter) DiscoverSchema(ctx context.Context, table string) (*
 }
 func (m *MockSourceAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	return &types.Checkpoint{ProcessedRows: 100}, nil
+}
+func (m *MockSourceAdapter) QueryDataBatch(ctx context.Context, measurement string,
+	series []string, lastCheckpoint *types.Checkpoint,
+	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
+	if batchFunc != nil && len(series) > 0 {
+		// Return mock records
+		mockRecords := make([]types.Record, 10)
+		for i := range mockRecords {
+			mockRecords[i] = *types.NewRecord()
+			mockRecords[i].Time = time.Now().UnixNano()
+			mockRecords[i].AddField("mock_field", float64(i))
+		}
+		if err := batchFunc(mockRecords); err != nil {
+			return nil, err
+		}
+	}
+	return &types.Checkpoint{
+		LastTimestamp: time.Now().UnixNano(),
+		ProcessedRows:  int64(len(series) * 10),
+	}, nil
 }
 
 // MockTargetAdapter for testing
