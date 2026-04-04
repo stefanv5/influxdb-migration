@@ -38,6 +38,12 @@ migration:
     queries_per_second: 10
     rows_per_second: 100000
 
+# InfluxDB to InfluxDB / OpenGemini batch query mode
+influx_to_influx:
+  enabled: true
+  query_mode: "batch"           # "single" or "batch"
+  max_series_per_query: 100    # default: 100, max: 1000
+
 retry:
   max_attempts: 3
   initial_delay: "1s"
