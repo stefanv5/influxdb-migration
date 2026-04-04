@@ -14,6 +14,22 @@ import (
 	"go.uber.org/zap"
 )
 
+// PartitionSeries splits a slice of series into batches of maxPerBatch size
+func PartitionSeries(series []string, maxPerBatch int) [][]string {
+	if maxPerBatch <= 0 {
+		maxPerBatch = 100
+	}
+	var batches [][]string
+	for i := 0; i < len(series); i += maxPerBatch {
+		end := i + maxPerBatch
+		if end > len(series) {
+			end = len(series)
+		}
+		batches = append(batches, series[i:end])
+	}
+	return batches
+}
+
 type MigrationEngine struct {
 	sourceRegistry *adapter.AdapterRegistry
 	targetRegistry *adapter.AdapterRegistry
@@ -300,6 +316,14 @@ func (e *MigrationEngine) worker(ctx context.Context, workerID int) {
 }
 
 func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) error {
+	// Check if batch mode is enabled for InfluxToInflux
+	if e.config.InfluxToInflux.Enabled && e.config.InfluxToInflux.QueryMode == "batch" {
+		return e.runTaskBatchMode(ctx, task)
+	}
+	return e.runTaskSingleMode(ctx, task)
+}
+
+func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *MigrationTask) error {
 	logger.Info("starting task",
 		zap.String("task_id", task.ID),
 		zap.String("source_table", task.Mapping.SourceTable),
@@ -429,6 +453,114 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 	e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable)
 	logger.Info("task completed successfully",
 		zap.String("task_id", task.ID))
+
+	return nil
+}
+
+func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationTask) error {
+	logger.Info("starting batch mode task",
+		zap.String("task_id", task.ID),
+		zap.String("source_table", task.Mapping.SourceTable),
+		zap.String("target_measurement", task.Mapping.TargetMeasurement))
+
+	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
+	if err != nil {
+		return fmt.Errorf("failed to get source adapter: %w", err)
+	}
+
+	sourceConfig := e.getSourceConfig(task.SourceAdapter)
+	if err := sourceAdapter.Connect(ctx, sourceConfig); err != nil {
+		return fmt.Errorf("failed to connect to source: %w", err)
+	}
+	defer sourceAdapter.Disconnect(ctx)
+
+	targetAdapter, err := e.targetRegistry.GetTargetAdapter(task.TargetAdapter)
+	if err != nil {
+		return fmt.Errorf("failed to get target adapter: %w", err)
+	}
+
+	targetConfig := e.getTargetConfig(task.TargetAdapter)
+	if err := targetAdapter.Connect(ctx, targetConfig); err != nil {
+		return fmt.Errorf("failed to connect to target: %w", err)
+	}
+	defer targetAdapter.Disconnect(ctx)
+
+	// Discover all series for the measurement
+	series, err := sourceAdapter.DiscoverSeries(ctx, task.Mapping.SourceTable)
+	if err != nil {
+		logger.Warn("DiscoverSeries not supported or failed, treating as single table",
+			zap.String("table", task.Mapping.SourceTable),
+			zap.Error(err))
+		series = []string{task.Mapping.SourceTable}
+	}
+
+	// Apply tag filters if any
+	if len(task.Mapping.TagFilters) > 0 {
+		filteredSeries := make([]string, 0)
+		for _, s := range series {
+			if e.matchTagFilters(s, task.Mapping.TagFilters) {
+				filteredSeries = append(filteredSeries, s)
+			}
+		}
+		series = filteredSeries
+	}
+
+	if len(series) == 0 {
+		logger.Info("no series to migrate in batch mode",
+			zap.String("task_id", task.ID))
+		return nil
+	}
+
+	// Partition into batches
+	batchSize := e.config.InfluxToInflux.MaxSeriesPerQuery
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	batches := PartitionSeries(series, batchSize)
+
+	logger.Info("batch mode: partitioned series into batches",
+		zap.String("task_id", task.ID),
+		zap.Int("total_series", len(series)),
+		zap.Int("batch_size", batchSize),
+		zap.Int("total_batches", len(batches)))
+
+	// Process each batch
+	queryCfg := &types.QueryConfig{
+		BatchSize:        e.config.Migration.ChunkSize,
+		MaxSeriesPerQuery: batchSize,
+	}
+
+	var lastCheckpoint *types.Checkpoint
+	for i, batch := range batches {
+		logger.Debug("processing batch",
+			zap.String("task_id", task.ID),
+			zap.Int("batch_index", i+1),
+			zap.Int("batch_size", len(batch)))
+
+		checkpoint, err := sourceAdapter.QueryDataBatch(
+			ctx,
+			task.Mapping.SourceTable,
+			batch,
+			lastCheckpoint,
+			func(records []types.Record) error {
+				if len(records) == 0 {
+					return nil
+				}
+				return e.processBatch(ctx, task.Mapping, records, targetAdapter)
+			},
+			queryCfg,
+		)
+
+		if err != nil {
+			return fmt.Errorf("batch %d/%d failed: %w", i+1, len(batches), err)
+		}
+
+		lastCheckpoint = checkpoint
+	}
+
+	logger.Info("completed batch mode task",
+		zap.String("task_id", task.ID),
+		zap.Int("total_batches", len(batches)))
 
 	return nil
 }
