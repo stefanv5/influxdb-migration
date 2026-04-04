@@ -60,6 +60,7 @@ func (v *ConfigValidator) Validate() error {
 	v.validateTasks()
 	v.validateMigrationSettings()
 	v.validateRetrySettings()
+	v.validateInfluxToInfluxSettings()
 
 	if len(v.errors) > 0 {
 		return fmt.Errorf("config validation failed: %v", v.errors)
@@ -235,5 +236,26 @@ func (v *ConfigValidator) validateRetrySettings() {
 	}
 	if v.config.Retry.BackoffMultiplier < 0 {
 		v.errors = append(v.errors, fmt.Errorf("retry.backoff_multiplier must be non-negative"))
+	}
+}
+
+func (v *ConfigValidator) validateInfluxToInfluxSettings() {
+	if !v.config.InfluxToInflux.Enabled {
+		return
+	}
+	if v.config.InfluxToInflux.QueryMode != "" &&
+		v.config.InfluxToInflux.QueryMode != "single" &&
+		v.config.InfluxToInflux.QueryMode != "batch" {
+		v.errors = append(v.errors, fmt.Errorf(
+			"influx_to_influx.query_mode must be 'single' or 'batch', got '%s'",
+			v.config.InfluxToInflux.QueryMode))
+	}
+	if v.config.InfluxToInflux.MaxSeriesPerQuery < 0 {
+		v.errors = append(v.errors, fmt.Errorf(
+			"influx_to_influx.max_series_per_query must be non-negative, got %d",
+			v.config.InfluxToInflux.MaxSeriesPerQuery))
+	}
+	if v.config.InfluxToInflux.MaxSeriesPerQuery > 1000 {
+		v.config.InfluxToInflux.MaxSeriesPerQuery = 1000
 	}
 }
