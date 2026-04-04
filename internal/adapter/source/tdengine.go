@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,6 +46,9 @@ func init() {
 	})
 }
 
+// timestampRegex validates the TDengine timestamp format used in queries
+var timestampRegex = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$`)
+
 func (a *TDengineAdapter) Name() string {
 	return "tdengine"
 }
@@ -74,6 +79,14 @@ func (a *TDengineAdapter) Connect(ctx context.Context, config map[string]interfa
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		// Require explicit opt-in via environment variable for insecure TLS
+		if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
+			logger.Error("TLS certificate verification is disabled - set ALLOW_INSECURE_TLS=1 environment variable to allow",
+				zap.String("url", a.baseURL))
+			return fmt.Errorf("insecure TLS requires ALLOW_INSECURE_TLS=1 environment variable")
+		}
+		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
+			zap.String("url", a.baseURL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 	a.client = &http.Client{
@@ -176,6 +189,11 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 		endTime = time.Unix(0, lastTS).Add(timeWindow).Format("2006-01-02 15:04:05.000")
 	}
 
+	// Validate timestamps match expected format before query interpolation
+	if !timestampRegex.MatchString(startTime) || !timestampRegex.MatchString(endTime) {
+		return nil, fmt.Errorf("invalid timestamp format: start=%s, end=%s", startTime, endTime)
+	}
+
 	query := fmt.Sprintf(`SELECT *, tbname FROM %s WHERE ts >= '%s' AND ts < '%s' PARTITION BY TBNAME ORDER BY ts`,
 		tdengineQuoteIdentifier(table), startTime, endTime)
 
@@ -267,6 +285,12 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 		LastTimestamp: maxTS,
 		ProcessedRows: totalProcessed,
 	}, nil
+}
+
+// QueryDataBatch is not supported for TDengine adapter.
+// Batch series query is only available for InfluxDB sources.
+func (a *TDengineAdapter) QueryDataBatch(ctx context.Context, table string, series []string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
+	return nil, fmt.Errorf("QueryDataBatch is not supported for TDengine adapter, use QueryData instead")
 }
 
 func (a *TDengineAdapter) executeQuery(ctx context.Context, query string) ([][]any, error) {

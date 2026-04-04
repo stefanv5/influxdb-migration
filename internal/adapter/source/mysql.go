@@ -250,6 +250,12 @@ func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoi
 	}, nil
 }
 
+// QueryDataBatch is not supported for MySQL adapter.
+// Batch series query is only available for InfluxDB sources.
+func (a *MySQLAdapter) QueryDataBatch(ctx context.Context, table string, series []string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
+	return nil, fmt.Errorf("QueryDataBatch is not supported for MySQL adapter, use QueryData instead")
+}
+
 func (a *MySQLAdapter) queryBatch(ctx context.Context, table string, schema *types.TableSchema, lastTS int64, lastID int64, batchSize int) ([]types.Record, error) {
 	// Build dynamic query based on actual schema
 	var selectCols []string
