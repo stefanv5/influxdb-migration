@@ -54,3 +54,18 @@ The batch query SHALL return a checkpoint based on batch-level max timestamp.
 - **WHEN** a batch query completes
 - **THEN** the checkpoint.LastTimestamp SHALL be the maximum timestamp across all records
 - **AND** the checkpoint.ProcessedRows SHALL be the count of records in this batch
+
+### Requirement: SSL/TLS Support
+
+The InfluxDB adapter SHALL support SSL/TLS connections with configurable certificate verification.
+
+#### Scenario: SSL enabled with skip_verify
+- **WHEN** `ssl.enabled` is true and `ssl.skip_verify` is true
+- **THEN** the adapter SHALL connect using HTTPS
+- **AND** SHALL skip TLS certificate verification
+- **AND** SHALL require `ALLOW_INSECURE_TLS=1` environment variable to be set
+
+#### Scenario: SSL enabled with certificate verification
+- **WHEN** `ssl.enabled` is true and `ssl.skip_verify` is false
+- **THEN** the adapter SHALL connect using HTTPS
+- **AND** SHALL verify TLS certificates (future: with custom CA cert support)
