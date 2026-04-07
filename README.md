@@ -12,6 +12,8 @@ A high-performance, multi-source migration tool for transferring data between In
 - **Parallel Processing**: Configurable parallel tasks for optimal performance
 - **Comprehensive Logging**: Structured logging with rotation support
 - **Retry Mechanism**: Automatic retry with exponential backoff
+- **Batch Series Query**: InfluxDB→InfluxDB migrations query multiple series per request for improved performance
+- **SSL/TLS Support**: Secure connections to InfluxDB with configurable certificate verification
 
 ## Architecture
 
@@ -116,6 +118,29 @@ tasks:
 | `chunk_size` | int | `10000` | Records per chunk |
 | `chunk_interval` | duration | `100ms` | Interval between chunks |
 
+### InfluxDB to InfluxDB Batch Query Mode
+
+For InfluxDB → InfluxDB migrations, batch series query mode can significantly improve performance by querying multiple series in a single request using OR拼接.
+
+```yaml
+influx_to_influx:
+  enabled: true
+  query_mode: "batch"           # "single" or "batch"
+  max_series_per_query: 100      # default: 100, max: 1000
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query_mode` | string | `"single"` | Query mode: `"single"` (one series per query) or `"batch"` (multiple series per query) |
+| `max_series_per_query` | int | `100` | Maximum series to query in a single request (only for batch mode) |
+
+**Batch mode benefits:**
+- Reduces query count from N (number of series) to N/max_series_per_query
+- Uses SQL `WHERE (tag1='v1' AND ...) OR (tag1='v2' AND ...)` for V1
+- Uses Flux `|> filter(fn: (r) => (r.tag == "v1") or (r.tag == "v2")` for V2
+- Supports pagination for large result sets
+- Persists checkpoint after each batch for crash recovery
+
 ## Source Adapters
 
 ### MySQL
@@ -144,11 +169,16 @@ sources:
     - name: "prod-influx"
       type: "influxdb"
       version: 1
-      url: "http://localhost:8086"
+      url: "https://localhost:8086"
       username: "admin"
       password: "${INFLUX_PASSWORD}"
       database: "metrics"
+      ssl:
+        enabled: true
+        skip_verify: false
 ```
+
+> **Note:** For InfluxDB v1, URL protocol (`http`/`https`) determines encryption. Use `ssl.skip_verify: true` with `ALLOW_INSECURE_TLS=1` environment variable to skip certificate verification.
 
 ### InfluxDB v2
 
@@ -158,11 +188,16 @@ sources:
     - name: "prod-influx"
       type: "influxdb"
       version: 2
-      url: "http://localhost:8086"
+      url: "https://localhost:8086"
       token: "${INFLUX_TOKEN}"
       org: "my-org"
       bucket: "metrics"
+      ssl:
+        enabled: true
+        skip_verify: false
 ```
+
+> **Note:** For InfluxDB v2, URL protocol (`http`/`https`) determines encryption. Use `ssl.skip_verify: true` with `ALLOW_INSECURE_TLS=1` environment variable to skip certificate verification.
 
 ### TDengine
 
@@ -231,24 +266,31 @@ targets:
       type: "influxdb-v2"
       influxdb:
         version: 2
-        url: "http://localhost:8087"
+        url: "https://localhost:8087"
         token: "${INFLUX_TOKEN}"
         org: "my-org"
         bucket: "metrics"
+      ssl:
+        enabled: true
+        skip_verify: false
 ```
+
+> **Note:** For InfluxDB target, URL protocol (`http`/`https`) determines encryption. Use `ssl.skip_verify: true` with `ALLOW_INSECURE_TLS=1` environment variable to skip certificate verification.
 
 ## Supported Migration Paths
 
-| Source | Target | Status |
-|--------|--------|--------|
-| MySQL | InfluxDB v1/v2 | ✅ Supported |
-| TDengine | InfluxDB v1/v2 | ✅ Supported |
-| InfluxDB v1 | MySQL | ✅ Supported |
-| InfluxDB v2 | MySQL | ✅ Supported |
-| InfluxDB v1 | TDengine | ✅ Supported |
-| InfluxDB v2 | TDengine | ✅ Supported |
-| MySQL | TDengine | Planned |
-| TDengine | MySQL | Planned |
+| Source | Target | Status | Notes |
+|--------|--------|--------|-------|
+| MySQL | InfluxDB v1/v2 | ✅ Supported | |
+| TDengine | InfluxDB v1/v2 | ✅ Supported | |
+| InfluxDB v1 | MySQL | ✅ Supported | |
+| InfluxDB v2 | MySQL | ✅ Supported | |
+| InfluxDB v1 | TDengine | ✅ Supported | |
+| InfluxDB v2 | TDengine | ✅ Supported | |
+| InfluxDB v1 | InfluxDB v1 | ✅ Supported | Batch series query mode |
+| InfluxDB v2 | InfluxDB v2 | ✅ Supported | Batch series query mode |
+| MySQL | TDengine | Planned | |
+| TDengine | MySQL | Planned | |
 
 ## Checkpoint System
 
