@@ -556,11 +556,21 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		}
 
 		lastCheckpoint = checkpoint
+
+		// Save checkpoint after each batch to prevent data loss on crash.
+		// This uses "at-least-once" semantics: on crash we may re-process
+		// this batch, but we will never lose data.
+		e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+			0, checkpoint.LastTimestamp, checkpoint.ProcessedRows, types.StatusInProgress)
 	}
 
 	logger.Info("completed batch mode task",
 		zap.String("task_id", task.ID),
 		zap.Int("total_batches", len(batches)))
+
+	e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+		0, lastCheckpoint.LastTimestamp, lastCheckpoint.ProcessedRows, types.StatusCompleted)
+	e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable)
 
 	return nil
 }

@@ -30,12 +30,23 @@ The engine SHALL respect `max_series_per_query` configuration.
 
 ### Requirement: Checkpoint for Batch Mode
 
-The engine SHALL handle batch-level checkpoint in batch mode.
+The engine SHALL handle batch-level checkpoint in batch mode with at-least-once semantics.
 
 #### Scenario: Update checkpoint after batch
 - **WHEN** a batch completes successfully
 - **THEN** the engine SHALL save checkpoint with batch's max timestamp
+- **AND** SHALL set checkpoint status to `StatusInProgress`
 - **AND** SHALL resume next batch from this checkpoint
+
+#### Scenario: Checkpoint persistence on crash
+- **WHEN** a batch completes but process crashes before next batch starts
+- **THEN** on restart the engine SHALL re-process completed batches
+- **AND** SHALL use at-least-once semantics (may re-write some data, but never lose data)
+
+#### Scenario: Final checkpoint on completion
+- **WHEN** all batches complete successfully
+- **THEN** the engine SHALL save checkpoint with final status `StatusCompleted`
+- **AND** SHALL call `MarkTaskCompleted`
 
 ### Requirement: Parallel Batch Processing
 

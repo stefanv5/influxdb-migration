@@ -12,13 +12,13 @@ The source adapter SHALL provide a `QueryDataBatch` method for querying multiple
 #### Scenario: InfluxDB V1 batch query
 - **WHEN** `QueryDataBatch` is called with V1 adapter
 - **THEN** the adapter SHALL build SQL with OR拼接 for all series
-- **AND** SHALL execute single HTTP query
+- **AND** SHALL paginate through results until all records are fetched
 - **AND** SHALL return batch checkpoint with max timestamp
 
 #### Scenario: InfluxDB V2 batch query
 - **WHEN** `QueryDataBatch` is called with V2 adapter
 - **THEN** the adapter SHALL build Flux query with OR filter
-- **AND** SHALL execute single HTTP query
+- **AND** SHALL paginate through results using `limit()` and timestamp progression
 - **AND** SHALL return batch checkpoint with max timestamp
 
 ### Requirement: Series Key Parsing
@@ -32,12 +32,19 @@ The adapter SHALL correctly parse series keys into measurement and tag component
 
 ### Requirement: WHERE Clause Building
 
-The adapter SHALL build a correct WHERE clause using AND/OR logic.
+The adapter SHALL build a correct WHERE clause using AND/OR logic with proper escaping.
 
 #### Scenario: Build WHERE clause
 - **WHEN** 3 series are provided
 - **THEN** the WHERE clause SHALL be `(tag1='v1' AND tag2='v2') OR (tag1='v3' AND tag2='v4') OR (tag1='v5' AND tag2='v6')`
+- **AND** SHALL escape single quotes in tag values (replace ' with '')
+- **AND** SHALL escape backslashes (replace \ with \\)
 - **AND** SHALL include time filter in outer clause
+
+#### Scenario: SQL injection prevention
+- **WHEN** tag values contain special characters (e.g., `host=server'; DROP TABLE users;--`)
+- **THEN** the adapter SHALL escape these characters
+- **AND** SHALL prevent SQL injection attacks
 
 ### Requirement: Batch Checkpoint
 

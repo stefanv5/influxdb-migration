@@ -402,12 +402,12 @@ go test ./internal/engine/... -v -run Batch
 
 | Task | Description | Files | Status |
 |------|-------------|-------|--------|
-| 1 | Batch Query Config Types | `pkg/types/config.go`, `query_config.go` | - [ ] |
-| 2 | Config Validator | `internal/config/validator.go` | - [ ] |
-| 3 | SourceAdapter Interface | `internal/adapter/adapter.go` | - [ ] |
-| 4 | InfluxDB V1 QueryDataBatch | `internal/adapter/source/influxdb.go` | - [ ] |
-| 5 | InfluxDB V2 QueryDataBatch | `internal/adapter/source/influxdb.go` | - [ ] |
-| 6 | Migration Engine Batch Mode | `internal/engine/migration.go` | - [ ] |
-| 7 | Mock Adapter for Tests | `internal/adapter/registry_test.go` | - [ ] |
-| 8 | Config Example | `config.yaml.example` | - [ ] |
+| 1 | Batch Query Config Types | `pkg/types/config.go`, `query_config.go` | ✅ Done |
+| 2 | Config Validator | `internal/config/validator.go` | ✅ Done |
+| 3 | SourceAdapter Interface | `internal/adapter/adapter.go` | ✅ Done |
+| 4 | InfluxDB V1 QueryDataBatch | `internal/adapter/source/influxdb.go` | ✅ Done |
+| 5 | InfluxDB V2 QueryDataBatch | `internal/adapter/source/influxdb.go` | ✅ Done |
+| 6 | Migration Engine Batch Mode | `internal/engine/migration.go` | ✅ Done |
+| 7 | Mock Adapter for Tests | `internal/adapter/registry_test.go` | ✅ Done |
+| 8 | Config Example | `config.yaml.example` | ✅ Done |
 | 9 | Integration Test | `internal/engine/migration_batch_test.go` | - [ ] |
