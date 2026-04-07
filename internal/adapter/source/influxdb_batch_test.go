@@ -1,6 +1,9 @@
 package source
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseSeriesKey(t *testing.T) {
 	tests := []struct {
@@ -61,18 +64,9 @@ func TestBuildWhereClause(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := BuildWhereClause(tt.series)
-			if tt.contains != "" && !containsString(result, tt.contains) {
+			if tt.contains != "" && !strings.Contains(result, tt.contains) {
 				t.Errorf("expected result to contain %q, got %q", tt.contains, result)
 			}
 		})
 	}
-}
-
-func containsString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

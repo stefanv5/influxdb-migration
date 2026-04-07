@@ -273,43 +273,75 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	}
 
 	batchSize := getBatchSize(cfg)
-
 	whereClause := BuildWhereClause(series)
-	query := fmt.Sprintf(`SELECT * FROM %s WHERE (%s) AND time >= '%s' LIMIT %d ORDER BY time`,
-		influxQuoteIdentifier(measurement), whereClause, startTime, batchSize)
 
-	logger.Debug("executing batch query for InfluxDB V1",
-		zap.String("measurement", measurement),
-		zap.Int("series_count", len(series)),
-		zap.String("query", query))
+	var totalRecords int
+	var maxTS int64
 
-	records, err := a.executeSelectQuery(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("batch query failed: %w", err)
-	}
+	for {
+		query := fmt.Sprintf(`SELECT * FROM %s WHERE (%s) AND time >= '%s' LIMIT %d ORDER BY time`,
+			influxQuoteIdentifier(measurement), whereClause, startTime, batchSize)
 
-	if len(records) > 0 {
+		logger.Debug("executing batch query for InfluxDB V1",
+			zap.String("measurement", measurement),
+			zap.Int("series_count", len(series)),
+			zap.String("query", query))
+
+		records, err := a.executeSelectQuery(ctx, query)
+		if err != nil {
+			return nil, fmt.Errorf("batch query failed: %w", err)
+		}
+
+		if len(records) == 0 {
+			break
+		}
+
 		if err := batchFunc(records); err != nil {
 			return nil, fmt.Errorf("batch func failed: %w", err)
 		}
-	}
 
-	var maxTS int64
-	for _, record := range records {
-		if record.Time > maxTS {
-			maxTS = record.Time
+		totalRecords += len(records)
+
+		// Update max timestamp from this batch
+		for _, record := range records {
+			if record.Time > maxTS {
+				maxTS = record.Time
+			}
+		}
+
+		logger.Debug("fetched batch from InfluxDB V1",
+			zap.String("measurement", measurement),
+			zap.Int("batch_size", len(records)),
+			zap.String("next_start", startTime))
+
+		// If we got fewer records than batch size, we're done
+		if len(records) < batchSize {
+			break
+		}
+
+		// Update startTime for next query using the last record's timestamp
+		if maxTS < math.MaxInt64 {
+			startTime = fmt.Sprintf("%d", maxTS+1)
+		} else {
+			startTime = fmt.Sprintf("%d", maxTS)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 
 	logger.Info("completed batch query for InfluxDB V1",
 		zap.String("measurement", measurement),
 		zap.Int("series_count", len(series)),
-		zap.Int("records", len(records)),
+		zap.Int("total_records", totalRecords),
 		zap.Int64("max_timestamp", maxTS))
 
 	return &types.Checkpoint{
 		LastTimestamp: maxTS,
-		ProcessedRows: int64(len(records)),
+		ProcessedRows: int64(totalRecords),
 	}, nil
 }
 
@@ -714,7 +746,6 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 
 	var startTime string
-
 	if lastCheckpoint != nil && lastCheckpoint.LastTimestamp != 0 {
 		startTime = fmt.Sprintf("%d", lastCheckpoint.LastTimestamp)
 	} else {
@@ -722,47 +753,79 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	}
 
 	batchSize := getBatchSize(cfg)
-
 	fluxFilter := BuildFluxFilter(series)
-	fluxQuery := fmt.Sprintf(`
-		from(bucket: "%s")
-		  |> range(start: %s)
-		  |> filter(fn: (r) => r._measurement == "%s" and (%s))
-		  |> limit(n: %d)
-	`, a.config.Bucket, startTime, measurement, fluxFilter, batchSize)
 
-	logger.Debug("executing batch query for InfluxDB V2",
-		zap.String("measurement", measurement),
-		zap.Int("series_count", len(series)),
-		zap.String("query", fluxQuery))
+	var totalRecords int
+	var maxTS int64
 
-	records, err := a.executeFluxSelect(ctx, fluxQuery)
-	if err != nil {
-		return nil, fmt.Errorf("batch query failed: %w", err)
-	}
+	for {
+		fluxQuery := fmt.Sprintf(`
+			from(bucket: "%s")
+			  |> range(start: %s)
+			  |> filter(fn: (r) => r._measurement == "%s" and (%s))
+			  |> limit(n: %d)
+		`, a.config.Bucket, startTime, measurement, fluxFilter, batchSize)
 
-	if len(records) > 0 {
+		logger.Debug("executing batch query for InfluxDB V2",
+			zap.String("measurement", measurement),
+			zap.Int("series_count", len(series)),
+			zap.String("query", fluxQuery))
+
+		records, err := a.executeFluxSelect(ctx, fluxQuery)
+		if err != nil {
+			return nil, fmt.Errorf("batch query failed: %w", err)
+		}
+
+		if len(records) == 0 {
+			break
+		}
+
 		if err := batchFunc(records); err != nil {
 			return nil, fmt.Errorf("batch func failed: %w", err)
 		}
-	}
 
-	var maxTS int64
-	for _, record := range records {
-		if record.Time > maxTS {
-			maxTS = record.Time
+		totalRecords += len(records)
+
+		// Update max timestamp from this batch
+		for _, record := range records {
+			if record.Time > maxTS {
+				maxTS = record.Time
+			}
+		}
+
+		logger.Debug("fetched batch from InfluxDB V2",
+			zap.String("measurement", measurement),
+			zap.Int("batch_size", len(records)),
+			zap.String("next_start", startTime))
+
+		// If we got fewer records than batch size, we're done
+		if len(records) < batchSize {
+			break
+		}
+
+		// Update startTime for next query using the last record's timestamp
+		if maxTS < math.MaxInt64 {
+			startTime = fmt.Sprintf("%d", maxTS+1)
+		} else {
+			startTime = fmt.Sprintf("%d", maxTS)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 
 	logger.Info("completed batch query for InfluxDB V2",
 		zap.String("measurement", measurement),
 		zap.Int("series_count", len(series)),
-		zap.Int("records", len(records)),
+		zap.Int("total_records", totalRecords),
 		zap.Int64("max_timestamp", maxTS))
 
 	return &types.Checkpoint{
 		LastTimestamp: maxTS,
-		ProcessedRows: int64(len(records)),
+		ProcessedRows: int64(totalRecords),
 	}, nil
 }
 
@@ -791,6 +854,12 @@ func (a *InfluxDBV2Adapter) executeFluxSelect(ctx context.Context, query string)
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// Check HTTP status code before decoding
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("flux query failed with status %d: %s", resp.StatusCode, string(body))
+	}
 
 	var result struct {
 		Records []fluxRecord `json:"records"`
@@ -896,7 +965,9 @@ func BuildWhereClause(series []string) string {
 		tags := ParseSeriesKey(s)
 		var tagConditions []string
 		for k, v := range tags {
-			tagConditions = append(tagConditions, fmt.Sprintf("%s='%s'", influxQuoteIdentifier(k), v))
+			// Escape single quotes in tag values for InfluxQL security
+			escapedValue := strings.ReplaceAll(v, "'", "''")
+			tagConditions = append(tagConditions, fmt.Sprintf("%s='%s'", influxQuoteIdentifier(k), escapedValue))
 		}
 		if len(tagConditions) > 0 {
 			conditions = append(conditions, "("+strings.Join(tagConditions, " AND ")+")")
@@ -912,7 +983,10 @@ func BuildFluxFilter(series []string) string {
 		tags := ParseSeriesKey(s)
 		var tagConditions []string
 		for k, v := range tags {
-			tagConditions = append(tagConditions, fmt.Sprintf(`r.%s == "%s"`, influxQuoteIdentifier(k), v))
+			// Escape backslashes and double quotes in tag values for Flux security
+			escaped := strings.ReplaceAll(v, "\\", "\\\\")
+			escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+			tagConditions = append(tagConditions, fmt.Sprintf(`r.%s == "%s"`, influxQuoteIdentifier(k), escaped))
 		}
 		if len(tagConditions) > 0 {
 			conditions = append(conditions, "("+strings.Join(tagConditions, " and ")+")")
@@ -928,13 +1002,4 @@ func getBatchSize(cfg *types.QueryConfig) int {
 		batchSize = cfg.BatchSize
 	}
 	return batchSize
-}
-
-// getMaxSeriesPerQuery returns max series per query from config, defaulting to DefaultSeriesPerQuery
-func getMaxSeriesPerQuery(cfg *types.QueryConfig) int {
-	maxSeries := types.DefaultSeriesPerQuery
-	if cfg != nil && cfg.MaxSeriesPerQuery > 0 {
-		maxSeries = cfg.MaxSeriesPerQuery
-	}
-	return maxSeries
 }
