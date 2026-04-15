@@ -1,223 +1,138 @@
-# Tasks: Batch Size Configuration via QueryData Config
+# Tasks: TDengine TimeWindow Configuration
 
 ## Overview
 
-Add `QueryConfig` parameter to `QueryData` interface to allow passing batch_size configuration.
+Update TDengine source to use configurable TimeWindow from QueryConfig instead of hardcoded 7 days.
 
 ---
 
-## Task 1: Add QueryConfig struct
+## Task 1: Update QueryConfig with TimeWindow
 
 **Files:**
-- Create: `pkg/types/query_config.go`
+- Modify: `pkg/types/query_config.go`
 
-- [ ] **Step 1: Create QueryConfig struct**
+- [x] **Step 1: Add TimeWindow field**
 
-Create `pkg/types/query_config.go`:
+Update `pkg/types/query_config.go`:
 
 ```go
 package types
 
+import "time"
+
 type QueryConfig struct {
-    BatchSize int
+    BatchSize  int
+    TimeWindow time.Duration
 }
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add pkg/types/query_config.go
-git commit -m "feat: add QueryConfig struct for batch size"
+git commit -m "feat: add TimeWindow to QueryConfig"
 ```
 
 ---
 
-## Task 2: Update InfluxDB V1 Source
-
-**Files:**
-- Modify: `internal/adapter/source/influxdb.go`
-
-- [ ] **Step 1: Update QueryData signature**
-
-Find `func (a *InfluxDBV1Adapter) QueryData` and add `cfg *types.QueryConfig` parameter.
-
-- [ ] **Step 2: Update batch size logic**
-
-Change:
-```go
-batchSize := 10000
-```
-
-To:
-```go
-batchSize := 10000
-if cfg != nil && cfg.BatchSize > 0 {
-    batchSize = cfg.BatchSize
-}
-```
-
-- [ ] **Step 3: Run build to verify**
-
-Run: `go build ./internal/adapter/source/...`
-Expected: Build succeeds
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add internal/adapter/source/influxdb.go
-git commit -m "feat: influxdb v1 source accepts QueryConfig for batch size"
-```
-
----
-
-## Task 3: Update InfluxDB V2 Source
-
-**Files:**
-- Modify: `internal/adapter/source/influxdb.go`
-
-- [ ] **Step 1: Update QueryData signature**
-
-Find `func (a *InfluxDBV2Adapter) QueryData` and add `cfg *types.QueryConfig` parameter.
-
-- [ ] **Step 2: Update batch size logic**
-
-Same change as V1 source.
-
-- [ ] **Step 3: Run build to verify**
-
-Run: `go build ./internal/adapter/source/...`
-Expected: Build succeeds
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add internal/adapter/source/influxdb.go
-git commit -m "feat: influxdb v2 source accepts QueryConfig for batch size"
-```
-
----
-
-## Task 4: Update MySQL Source
-
-**Files:**
-- Modify: `internal/adapter/source/mysql.go`
-
-- [ ] **Step 1: Update QueryData signature**
-
-Find `func (a *MySQLAdapter) QueryData` and add `cfg *types.QueryConfig` parameter.
-
-- [ ] **Step 2: Update batch size logic**
-
-```go
-batchSize := 10000
-if cfg != nil && cfg.BatchSize > 0 {
-    batchSize = cfg.BatchSize
-}
-```
-
-- [ ] **Step 3: Run build to verify**
-
-Run: `go build ./internal/adapter/source/...`
-Expected: Build succeeds
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add internal/adapter/source/mysql.go
-git commit -m "feat: mysql source accepts QueryConfig for batch size"
-```
-
----
-
-## Task 5: Update TDengine Source
+## Task 2: Update TDengine Source
 
 **Files:**
 - Modify: `internal/adapter/source/tdengine.go`
 
-- [ ] **Step 1: Update QueryData signature**
+- [x] **Step 1: Update TDengine QueryData signature**
 
-Find `func (a *TDengineAdapter) QueryData` and add `cfg *types.QueryConfig` parameter.
+The signature already accepts `cfg *types.QueryConfig` from batch size task.
 
-- [ ] **Step 2: Update batch size logic**
+- [x] **Step 2: Update time window logic**
 
-TDengine uses internal batching of 1000 for batchFunc calls:
+Change:
 ```go
-internalBatchSize := 1000
-if cfg != nil && cfg.BatchSize > 0 {
-    internalBatchSize = cfg.BatchSize
+startTime := lastTS.Format("2006-01-02 15:04:05.000")
+endTime := lastTS.Add(7 * 24 * time.Hour).Format("2006-01-02 15:04:05.000")
+```
+
+To:
+```go
+timeWindow := 7 * 24 * time.Hour  // Default 7 days
+if cfg != nil && cfg.TimeWindow > 0 {
+    timeWindow = cfg.TimeWindow
+}
+
+startTime := lastTS.Format("2006-01-02 15:04:05.000")
+endTime := lastTS.Add(timeWindow).Format("2006-01-02 15:04:05.000")
+```
+
+Note: `lastTS` is now `int64` (nanoseconds), so need to convert:
+```go
+timeWindow := 7 * 24 * time.Hour
+if cfg != nil && cfg.TimeWindow > 0 {
+    timeWindow = cfg.TimeWindow
+}
+
+var startTime, endTime string
+if lastTS == 0 {
+    startTime = "1970-01-01 00:00:00.000"
+    endTime = time.Unix(0, 0).Add(timeWindow).Format("2006-01-02 15:04:05.000")
+} else {
+    startTime = time.Unix(0, lastTS).Format("2006-01-02 15:04:05.000")
+    endTime = time.Unix(0, lastTS).Add(timeWindow).Format("2006-01-02 15:04:05.000")
 }
 ```
 
-And update the condition:
-```go
-if len(records) >= internalBatchSize {
-```
-
-- [ ] **Step 3: Run build to verify**
+- [x] **Step 3: Run build to verify**
 
 Run: `go build ./internal/adapter/source/...`
 Expected: Build succeeds
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/adapter/source/tdengine.go
-git commit -m "feat: tdengine source accepts QueryConfig for batch size"
+git commit -m "feat: tdengine source uses TimeWindow from config"
 ```
 
 ---
 
-## Task 6: Update Migration Engine
+## Task 3: Update Migration Engine
 
 **Files:**
 - Modify: `internal/engine/migration.go`
 
-- [ ] **Step 1: Add QueryConfig usage**
+- [x] **Step 1: Parse TimeWindow from mapping**
 
-Find all calls to `sourceAdapter.QueryData` and add `queryCfg`:
+In `runTask`, when creating QueryConfig:
 
 ```go
-queryCfg := &types.QueryConfig{
-    BatchSize: e.config.Migration.ChunkSize,
+timeWindow := 168 * time.Hour  // Default
+if task.Mapping.TimeWindow != "" {
+    if tw, err := time.ParseDuration(task.Mapping.TimeWindow); err == nil {
+        timeWindow = tw
+    }
 }
-checkpoint, err := sourceAdapter.QueryData(ctx, sourceTable, lastCheckpoint, func(records []types.Record) error {
-    return e.processBatch(ctx, task.Mapping, records, targetAdapter)
-}, queryCfg)
+
+queryCfg := &types.QueryConfig{
+    BatchSize:  e.config.Migration.ChunkSize,
+    TimeWindow: timeWindow,
+}
 ```
 
-- [ ] **Step 2: Run build to verify**
+- [x] **Step 2: Pass queryCfg to TDengine QueryData**
+
+Update the call site for `sourceAdapter.QueryData` to pass `queryCfg`.
+
+Note: For non-TDengine sources, `TimeWindow` will be ignored (they don't use it).
+
+- [x] **Step 3: Run build to verify**
 
 Run: `go build ./internal/engine/...`
 Expected: Build succeeds
 
-- [ ] **Step 3: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/engine/migration.go
-git commit -m "feat: engine passes QueryConfig to source adapters"
-```
-
----
-
-## Task 7: Update Mock Adapter for Tests
-
-**Files:**
-- Modify: `internal/adapter/registry_test.go`
-
-- [ ] **Step 1: Update mock QueryData signature**
-
-Find the `MockSourceAdapter` and update its `QueryData` method signature to include `cfg *types.QueryConfig`.
-
-- [ ] **Step 2: Run tests**
-
-Run: `go test ./internal/adapter/... -v`
-Expected: Tests pass
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add internal/adapter/registry_test.go
-git commit -m "test: update mock adapter for QueryConfig"
+git commit -m "feat: engine passes TimeWindow to source adapters"
 ```
 
 ---
@@ -226,10 +141,13 @@ git commit -m "test: update mock adapter for QueryConfig"
 
 | Task | Description | Files | Status |
 |------|-------------|-------|--------|
-| 1 | QueryConfig struct | `pkg/types/query_config.go` | - [ ] |
-| 2 | InfluxDB V1 | `internal/adapter/source/influxdb.go` | - [ ] |
-| 3 | InfluxDB V2 | `internal/adapter/source/influxdb.go` | - [ ] |
-| 4 | MySQL | `internal/adapter/source/mysql.go` | - [ ] |
-| 5 | TDengine | `internal/adapter/source/tdengine.go` | - [ ] |
-| 6 | Migration Engine | `internal/engine/migration.go` | - [ ] |
-| 7 | Mock Adapter Tests | `internal/adapter/registry_test.go` | - [ ] |
+| 1 | Add TimeWindow to QueryConfig | `pkg/types/query_config.go` | ✅ DONE |
+| 2 | TDengine Source | `internal/adapter/source/tdengine.go` | ✅ DONE |
+| 3 | Migration Engine | `internal/engine/migration.go` | ✅ DONE |
+
+## Verification
+
+```bash
+go build ./...     # Build succeeds
+go test ./...     # All tests pass
+```

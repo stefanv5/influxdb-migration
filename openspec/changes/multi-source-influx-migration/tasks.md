@@ -1,4 +1,12 @@
-## 1. Project Initialization
+# Tasks: Multi-Source InfluxDB Migration
+
+## Overview
+
+Implement migration tool supporting multiple source types: MySQL, TDengine, InfluxDB.
+
+## Task Checklist
+
+### 1. Project Initialization
 
 - [x] 1.1 Initialize Go module (go mod init github.com/migration-tools/influx-migrator)
 - [x] 1.2 Create directory structure (cmd/migrate, internal/{adapter,checkpoint,engine,report,config}, pkg/types)
@@ -6,7 +14,7 @@
 - [x] 1.4 Create config.yaml.example with full configuration schema
 - [x] 1.5 Create .gitignore
 
-## 2. Core Types (pkg/types)
+### 2. Core Types (pkg/types)
 
 - [x] 2.1 Define Record struct (Fields, Tags, Time)
 - [x] 2.2 Define TableMetadata struct (Name, Schema, Database)
@@ -14,7 +22,7 @@
 - [x] 2.4 Define MigrationConfig struct
 - [x] 2.5 Define SourceConfig and TargetConfig structs
 
-## 3. Config System (internal/config)
+### 3. Config System (internal/config)
 
 - [x] 3.1 Implement YAML config loading with viper
 - [x] 3.2 Implement environment variable substitution (${VAR} syntax)
@@ -23,14 +31,14 @@
 - [x] 3.5 Implement task mapping validation
 - [x] 3.6 Implement default value injection
 
-## 4. Plugin Registry (internal/adapter)
+### 4. Plugin Registry (internal/adapter)
 
 - [x] 4.1 Define SourceAdapter interface
 - [x] 4.2 Define TargetAdapter interface
 - [x] 4.3 Implement AdapterRegistry with RegisterSource/RegisterTarget
 - [x] 4.4 Implement GetSourceAdapter and GetTargetAdapter methods
 
-## 5. Checkpoint Manager (internal/checkpoint)
+### 5. Checkpoint Manager (internal/checkpoint)
 
 - [x] 5.1 Implement SQLite store initialization
 - [x] 5.2 Implement SaveCheckpoint method
@@ -39,14 +47,14 @@
 - [x] 5.5 Implement UpdateTaskStatus method
 - [x] 5.6 Implement GetTasksByStatus method
 
-## 6. Rate Limiter (internal/engine)
+### 6. Rate Limiter (internal/engine)
 
 - [x] 6.1 Implement TokenBucket rate limiter
 - [x] 6.2 Implement Allow(points int) method
 - [x] 6.3 Implement token refill logic with elapsed time
 - [x] 6.4 Add burst size handling
 
-## 7. MySQL Source Adapter (internal/adapter/source)
+### 7. MySQL Source Adapter (internal/adapter/source)
 
 - [x] 7.1 Implement MySQLAdapter struct with connection pool
 - [x] 7.2 Implement Connect/Disconnect/Ping
@@ -56,7 +64,7 @@
 - [x] 7.6 Implement SSL/TLS support with skip_verify
 - [x] 7.7 Implement Decimal to float conversion
 
-## 8. TDengine Source Adapter (internal/adapter/source)
+### 8. TDengine Source Adapter (internal/adapter/source)
 
 - [x] 8.1 Implement TDengineAdapter struct
 - [x] 8.2 Implement Connect/Disconnect/Ping
@@ -66,7 +74,7 @@
 - [x] 8.6 Implement 3.X WebSocket connection support
 - [x] 8.7 Implement PARTITION BY TBNAME optimization
 
-## 9. InfluxDB Source Adapter (internal/adapter/source)
+### 9. InfluxDB Source Adapter (internal/adapter/source)
 
 - [x] 9.1 Implement InfluxDBV1Adapter struct
 - [x] 9.2 Implement Connect/Disconnect with HTTP client
@@ -76,7 +84,7 @@
 - [x] 9.6 Implement InfluxDBV2Adapter with Flux queries
 - [x] 9.7 Implement schema.measurements() for discovery
 
-## 10. InfluxDB Target Adapter (internal/adapter/target)
+### 10. InfluxDB Target Adapter (internal/adapter/target)
 
 - [x] 10.1 Implement InfluxDBV1TargetAdapter struct
 - [x] 10.2 Implement Connect/Disconnect
@@ -86,7 +94,7 @@
 - [x] 10.6 Implement WriteBatch with organization/bucket
 - [x] 10.7 Implement SSL/TLS support
 
-## 11. Migration Engine (internal/engine)
+### 11. Migration Engine (internal/engine)
 
 - [x] 11.1 Implement MigrationEngine struct with adapters
 - [x] 11.2 Implement TaskQueue with channel-based queue
@@ -97,7 +105,7 @@
 - [x] 11.7 Implement rate limiting integration
 - [x] 11.8 Implement source_protection (query_interval, max_qps)
 
-## 12. Transform Engine (internal/engine)
+### 12. Transform Engine (internal/engine)
 
 - [x] 12.1 Implement Record transformation pipeline
 - [x] 12.2 Implement schema mapping (source_field -> target_field)
@@ -105,7 +113,7 @@
 - [x] 12.4 Implement NULL value filtering
 - [x] 12.5 Implement data type conversion (Decimal -> float)
 
-## 13. Report Generator (internal/report)
+### 13. Report Generator (internal/report)
 
 - [x] 13.1 Define Report struct with all required fields
 - [x] 13.2 Implement ReportGenerator
@@ -114,7 +122,7 @@
 - [x] 13.5 Implement Markdown formatter
 - [x] 13.6 Implement SaveReport to file
 
-## 14. CLI Commands (cmd/migrate)
+### 14. CLI Commands (cmd/migrate)
 
 - [x] 14.1 Implement main.go with cobra root command
 - [x] 14.2 Implement run command (load config, start migration)
@@ -123,14 +131,14 @@
 - [x] 14.5 Implement report command (generate/show reports)
 - [x] 14.6 Implement verify command (data integrity check)
 
-## 15. Incremental Sync
+### 15. Incremental Sync
 
 - [x] 15.1 Implement incremental sync detection
 - [x] 15.2 Implement timestamp-based query filtering
 - [x] 15.3 Implement interval_hours scheduling
 - [x] 15.4 Implement delta checkpoint update
 
-## 16. Integration Testing
+### 16. Integration Testing
 
 - [ ] 16.1 Write MySQL -> InfluxDB integration test
 - [ ] 16.2 Write TDengine -> InfluxDB integration test
@@ -138,3 +146,32 @@
 - [ ] 16.4 Test checkpoint recovery scenario
 - [ ] 16.5 Test rate limiting scenario
 - [ ] 16.6 Test SSL/TLS with skip_verify scenario
+
+## Progress Summary
+
+| Section | Tasks | Completed |
+|---------|-------|-----------|
+| 1. Project Init | 5 | 5 ✅ |
+| 2. Core Types | 5 | 5 ✅ |
+| 3. Config | 6 | 6 ✅ |
+| 4. Plugin Registry | 4 | 4 ✅ |
+| 5. Checkpoint Manager | 6 | 6 ✅ |
+| 6. Rate Limiter | 4 | 4 ✅ |
+| 7. MySQL Source | 7 | 7 ✅ |
+| 8. TDengine Source | 7 | 7 ✅ |
+| 9. InfluxDB Source | 7 | 7 ✅ |
+| 10. InfluxDB Target | 7 | 7 ✅ |
+| 11. Migration Engine | 8 | 8 ✅ |
+| 12. Transform Engine | 5 | 5 ✅ |
+| 13. Report Generator | 6 | 6 ✅ |
+| 14. CLI Commands | 6 | 6 ✅ |
+| 15. Incremental Sync | 4 | 4 ✅ |
+| 16. Integration Tests | 6 | 0 ❌ |
+| **Total** | **93** | **87 ✅ / 6 ❌** |
+
+## Verification
+
+```bash
+go build ./...     # Build succeeds
+go test ./...     # All tests pass
+```

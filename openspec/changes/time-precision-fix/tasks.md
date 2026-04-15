@@ -12,7 +12,7 @@ This document contains implementation tasks for changing `Record.Time` from `tim
 - Modify: `pkg/types/record.go`
 - Modify: `pkg/types/record_test.go`
 
-- [ ] **Step 1: Add helper functions for time conversion**
+- [x] **Step 1: Add helper functions for time conversion**
 
 Add to `pkg/types/record.go`:
 
@@ -38,7 +38,7 @@ func IsZeroTime(ns int64) bool {
 }
 ```
 
-- [ ] **Step 2: Change Record.Time from time.Time to int64**
+- [x] **Step 2: Change Record.Time from time.Time to int64**
 
 Modify `Record` struct in `pkg/types/record.go`:
 
@@ -50,12 +50,12 @@ type Record struct {
 }
 ```
 
-- [ ] **Step 3: Run build to check for compilation errors**
+- [x] **Step 3: Run build to check for compilation errors**
 
 Run: `go build ./pkg/types/...`
 Expected: Should fail with errors about Time being int64 now
 
-- [ ] **Step 4: Update record_test.go**
+- [x] **Step 4: Update record_test.go**
 
 Update all test cases that use `time.Time` to use `int64` nanoseconds:
 
@@ -68,12 +68,12 @@ func TestNewRecord(t *testing.T) {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify**
+- [x] **Step 5: Run tests to verify**
 
 Run: `go test ./pkg/types/... -v`
 Expected: All tests pass
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add pkg/types/record.go pkg/types/record_test.go
@@ -87,7 +87,7 @@ git commit -m "feat: change Record.Time to int64 nanoseconds"
 **Files:**
 - Modify: `pkg/types/checkpoint.go`
 
-- [ ] **Step 1: Change LastTimestamp from time.Time to int64**
+- [x] **Step 1: Change LastTimestamp from time.Time to int64**
 
 Modify `Checkpoint` struct in `pkg/types/checkpoint.go`:
 
@@ -99,12 +99,12 @@ type Checkpoint struct {
 }
 ```
 
-- [ ] **Step 2: Run build to check**
+- [x] **Step 2: Run build to check**
 
 Run: `go build ./pkg/types/...`
 Expected: Should fail in checkpoint package
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add pkg/types/checkpoint.go
@@ -118,7 +118,7 @@ git commit -m "feat: checkpoint LastTimestamp to int64"
 **Files:**
 - Modify: `internal/checkpoint/store.go`
 
-- [ ] **Step 1: Update LoadCheckpoint to handle int64 timestamps**
+- [x] **Step 1: Update LoadCheckpoint to handle int64 timestamps**
 
 Modify `LoadCheckpoint` in `internal/checkpoint/store.go`:
 
@@ -134,7 +134,7 @@ if lastTS.Valid {
 }
 ```
 
-- [ ] **Step 2: Update SaveCheckpoint to store RFC3339Nano**
+- [x] **Step 2: Update SaveCheckpoint to store RFC3339Nano**
 
 Modify `SaveCheckpoint`:
 
@@ -145,16 +145,16 @@ if cp.LastTimestamp != 0 {
 }
 ```
 
-- [ ] **Step 3: Update ListCheckpoints (same as LoadCheckpoint)**
+- [x] **Step 3: Update ListCheckpoints (same as LoadCheckpoint)**
 
-- [ ] **Step 4: Update GetTasksByStatus (same as LoadCheckpoint)**
+- [x] **Step 4: Update GetTasksByStatus (same as LoadCheckpoint)**
 
-- [ ] **Step 5: Run build to verify**
+- [x] **Step 5: Run build to verify**
 
 Run: `go build ./internal/checkpoint/...`
 Expected: Build succeeds
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/checkpoint/store.go
@@ -168,7 +168,7 @@ git commit -m "feat: checkpoint store handles int64 timestamps"
 **Files:**
 - Modify: `internal/adapter/source/influxdb.go`
 
-- [ ] **Step 1: Update parseValues timestamp parsing**
+- [x] **Step 1: Update parseValues timestamp parsing**
 
 Find and modify the timestamp parsing in `parseValues` method (around line 289):
 
@@ -191,7 +191,7 @@ case "time":
     }
 ```
 
-- [ ] **Step 2: Update QueryData callback timestamp tracking**
+- [x] **Step 2: Update QueryData callback timestamp tracking**
 
 Find where `lastRecord.Time` is used and ensure it's int64:
 
@@ -207,12 +207,12 @@ if len(records) > 0 {
 
 Note: `SaveCheckpoint` signature may need updating - see Task 6.
 
-- [ ] **Step 3: Run build to check**
+- [x] **Step 3: Run build to check**
 
 Run: `go build ./internal/adapter/source/...`
 Expected: May have errors due to SaveCheckpoint signature
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/adapter/source/influxdb.go
@@ -226,7 +226,7 @@ git commit -m "feat: influxdb source parses timestamps to int64"
 **Files:**
 - Modify: `internal/adapter/source/tdengine.go`
 
-- [ ] **Step 1: Update QueryData timestamp parsing**
+- [x] **Step 1: Update QueryData timestamp parsing**
 
 Find and modify the timestamp parsing (around line 182):
 
@@ -234,8 +234,8 @@ Find and modify the timestamp parsing (around line 182):
 if ts, ok := val.(string); ok {
     if t, err := time.Parse("2006-01-02 15:04:05.000", ts); err == nil {
         record.Time = t.UnixNano()
-        if t.After(maxTS) {
-            maxTS = t
+        if t.UnixNano() > maxTS {
+            maxTS = t.UnixNano()
         }
     } else {
         logger.Warn("failed to parse TDengine timestamp",
@@ -245,7 +245,7 @@ if ts, ok := val.(string); ok {
 }
 ```
 
-- [ ] **Step 2: Update maxTS tracking**
+- [x] **Step 2: Update maxTS tracking**
 
 Note that `maxTS` is still `time.Time` for comparison purposes, but when assigned to `record.Time`, convert to nanoseconds:
 
@@ -256,7 +256,7 @@ if t.After(maxTS) {
 }
 ```
 
-- [ ] **Step 3: Update return checkpoint**
+- [x] **Step 3: Update return checkpoint**
 
 ```go
 return &types.Checkpoint{
@@ -265,12 +265,12 @@ return &types.Checkpoint{
 }, nil
 ```
 
-- [ ] **Step 4: Run build to check**
+- [x] **Step 4: Run build to check**
 
 Run: `go build ./internal/adapter/source/...`
 Expected: Build succeeds
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/source/tdengine.go
@@ -284,7 +284,7 @@ git commit -m "feat: tdengine source parses timestamps to int64"
 **Files:**
 - Modify: `internal/checkpoint/manager.go`
 
-- [ ] **Step 1: Update SaveCheckpoint to accept int64 instead of time.Time**
+- [x] **Step 1: Update SaveCheckpoint to accept int64 instead of time.Time**
 
 Current signature:
 ```go
@@ -302,12 +302,12 @@ Update the implementation to not convert time:
 cp.LastTimestamp = lastTS  // Already int64
 ```
 
-- [ ] **Step 2: Run build to find all callers**
+- [x] **Step 2: Run build to find all callers**
 
 Run: `go build ./...`
 Expected: Errors in files calling SaveCheckpoint
 
-- [ ] **Step 3: Update all callers in migration.go**
+- [x] **Step 3: Update all callers in migration.go**
 
 Find all calls to SaveCheckpoint and update:
 
@@ -321,12 +321,12 @@ e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
     0, lastTimestamp, totalProcessed, types.StatusInProgress)
 ```
 
-- [ ] **Step 4: Run build to verify**
+- [x] **Step 4: Run build to verify**
 
 Run: `go build ./...`
 Expected: Build succeeds
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/checkpoint/manager.go internal/engine/migration.go
@@ -340,7 +340,7 @@ git commit -m "refactor: SaveCheckpoint uses int64 timestamp"
 **Files:**
 - Modify: `internal/adapter/source/mysql.go`
 
-- [ ] **Step 1: Find timestamp parsing code**
+- [x] **Step 1: Find timestamp parsing code**
 
 Look for code parsing timestamp columns (around line 179):
 
@@ -354,12 +354,12 @@ if col.Name == "timestamp" || col.Name == "time" {
 }
 ```
 
-- [ ] **Step 2: Run build**
+- [x] **Step 2: Run build**
 
 Run: `go build ./internal/adapter/source/...`
 Expected: Build succeeds
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add internal/adapter/source/mysql.go
@@ -377,7 +377,7 @@ git commit -m "feat: mysql source parses timestamps to int64"
 
 ### MySQL Target
 
-- [ ] **Step 1: Update recordToValues timestamp formatting**
+- [x] **Step 1: Update recordToValues timestamp formatting**
 
 Find where timestamp is formatted for MySQL:
 
@@ -392,7 +392,7 @@ if col == "timestamp" {
 
 ### TDengine Target
 
-- [ ] **Step 2: Update timestamp usage**
+- [x] **Step 2: Update timestamp usage**
 
 Find and update:
 
@@ -406,7 +406,7 @@ timestamp := record.Time
 
 ### InfluxDB Target
 
-- [ ] **Step 3: Update line protocol timestamp**
+- [x] **Step 3: Update line protocol timestamp**
 
 ```go
 // Before
@@ -416,12 +416,12 @@ timestamp := record.Time.UnixNano()
 timestamp := record.Time
 ```
 
-- [ ] **Step 4: Run build for all targets**
+- [x] **Step 4: Run build for all targets**
 
 Run: `go build ./internal/adapter/target/...`
 Expected: Build succeeds
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/target/mysql.go internal/adapter/target/tdengine.go internal/adapter/target/influxdb.go
@@ -435,7 +435,7 @@ git commit -m "feat: target adapters handle int64 timestamps"
 **Files:**
 - Modify: `internal/engine/transform.go`
 
-- [ ] **Step 1: Find and update time comparisons**
+- [x] **Step 1: Find and update time comparisons**
 
 Search for `record.Time.Before`, `record.Time.After`, `record.Time.IsZero`:
 
@@ -445,12 +445,12 @@ Replace patterns:
 - `record.Time.After(t)` → `record.Time > t.UnixNano()`
 - `record.Time.Equal(t)` → `record.Time == t.UnixNano()`
 
-- [ ] **Step 2: Run build**
+- [x] **Step 2: Run build**
 
 Run: `go build ./internal/engine/...`
 Expected: Build succeeds
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add internal/engine/transform.go
@@ -464,11 +464,11 @@ git commit -m "feat: transform engine handles int64 timestamps"
 **Files:**
 - Modify: All `*_test.go` files that use Record.Time
 
-- [ ] **Step 1: Find all test files using record.Time**
+- [x] **Step 1: Find all test files using record.Time**
 
 Run: `grep -r "record.Time\|Record{.*Time:" --include="*_test.go" .`
 
-- [ ] **Step 2: Update each test file**
+- [x] **Step 2: Update each test file**
 
 For each occurrence, update:
 ```go
@@ -479,12 +479,12 @@ record := types.Record{Time: time.Now()}
 record := types.Record{Time: time.Now().UnixNano()}
 ```
 
-- [ ] **Step 3: Run all tests**
+- [x] **Step 3: Run all tests**
 
 Run: `go test ./... -v 2>&1 | head -200`
 Expected: All tests pass (or fail with clear errors to fix)
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ./*_test.go
@@ -495,22 +495,22 @@ git commit -m "test: update tests for int64 timestamps"
 
 ## Task 11: Final Verification
 
-- [ ] **Step 1: Run full build**
+- [x] **Step 1: Run full build**
 
 Run: `go build ./...`
 Expected: Build succeeds
 
-- [ ] **Step 2: Run all tests**
+- [x] **Step 2: Run all tests**
 
 Run: `go test ./...`
 Expected: All tests pass
 
-- [ ] **Step 3: Run race detector**
+- [x] **Step 3: Run race detector**
 
 Run: `go test -race ./...`
 Expected: No race conditions detected
 
-- [ ] **Step 4: Final commit**
+- [x] **Step 4: Final commit**
 
 ```bash
 git add -A
@@ -523,16 +523,22 @@ git commit -m "feat: complete time precision fix - nanosecond support"
 
 | Task | Description | Files | Status |
 |------|-------------|-------|--------|
-| 1 | Record type + helpers | `pkg/types/record.go` | - [ ] |
-| 2 | Checkpoint type | `pkg/types/checkpoint.go` | - [ ] |
-| 3 | Checkpoint store | `internal/checkpoint/store.go` | - [ ] |
-| 4 | InfluxDB source | `internal/adapter/source/influxdb.go` | - [ ] |
-| 5 | TDengine source | `internal/adapter/source/tdengine.go` | - [ ] |
-| 6 | Manager signature | `internal/checkpoint/manager.go`, `migration.go` | - [ ] |
-| 7 | MySQL source | `internal/adapter/source/mysql.go` | - [ ] |
-| 8 | Target adapters | `internal/adapter/target/*.go` | - [ ] |
-| 9 | Transform engine | `internal/engine/transform.go` | - [ ] |
-| 10 | Update tests | All `*_test.go` | - [ ] |
-| 11 | Final verification | - | - [ ] |
+| 1 | Record type + helpers | `pkg/types/record.go` | ✅ DONE |
+| 2 | Checkpoint type | `pkg/types/checkpoint.go` | ✅ DONE |
+| 3 | Checkpoint store | `internal/checkpoint/store.go` | ✅ DONE |
+| 4 | InfluxDB source | `internal/adapter/source/influxdb.go` | ✅ DONE |
+| 5 | TDengine source | `internal/adapter/source/tdengine.go` | ✅ DONE |
+| 6 | Manager signature | `internal/checkpoint/manager.go`, `migration.go` | ✅ DONE |
+| 7 | MySQL source | `internal/adapter/source/mysql.go` | ✅ DONE |
+| 8 | Target adapters | `internal/adapter/target/*.go` | ✅ DONE |
+| 9 | Transform engine | `internal/engine/transform.go` | ✅ DONE |
+| 10 | Update tests | All `*_test.go` | ✅ DONE |
+| 11 | Final verification | - | ✅ DONE |
 
-**Total estimated time: 2-4 hours**
+## Verification
+
+```bash
+go build ./...      # Build succeeds
+go test ./...       # All tests pass
+go test -race ./... # No race conditions
+```

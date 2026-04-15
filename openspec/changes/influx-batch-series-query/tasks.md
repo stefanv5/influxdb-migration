@@ -12,7 +12,7 @@ Implement batch series query mode that queries multiple InfluxDB series in a sin
 - Modify: `pkg/types/config.go`
 - Modify: `pkg/types/query_config.go`
 
-- [ ] **Step 1: Add InfluxMigrationConfig to types**
+- [x] **Step 1: Add InfluxMigrationConfig to types**
 
 Add to `pkg/types/config.go`:
 
@@ -24,7 +24,7 @@ type InfluxMigrationConfig struct {
 }
 ```
 
-- [ ] **Step 2: Add MaxSeriesPerQuery to QueryConfig**
+- [x] **Step 2: Add MaxSeriesPerQuery to QueryConfig**
 
 Modify `pkg/types/query_config.go`:
 
@@ -35,7 +35,7 @@ type QueryConfig struct {
 }
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add pkg/types/config.go pkg/types/query_config.go
@@ -49,7 +49,7 @@ git commit -m "feat: add batch query configuration types"
 **Files:**
 - Modify: `internal/config/validator.go`
 
-- [ ] **Step 1: Add batch query validation**
+- [x] **Step 1: Add batch query validation**
 
 Add validation for `query_mode` and `max_series_per_query`:
 
@@ -70,13 +70,13 @@ if cfg.MaxSeriesPerQuery > 1000 {
 }
 ```
 
-- [ ] **Step 2: Run build to verify**
+- [x] **Step 2: Run build to verify**
 
 ```bash
 go build ./internal/config/...
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add internal/config/validator.go
@@ -90,7 +90,7 @@ git commit -m "feat: validate batch query configuration"
 **Files:**
 - Modify: `internal/adapter/adapter.go`
 
-- [ ] **Step 1: Add QueryDataBatch to interface**
+- [x] **Step 1: Add QueryDataBatch to interface**
 
 ```go
 type SourceAdapter interface {
@@ -103,13 +103,13 @@ type SourceAdapter interface {
 }
 ```
 
-- [ ] **Step 2: Run build to verify**
+- [x] **Step 2: Run build to verify**
 
 ```bash
 go build ./internal/adapter/...
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add internal/adapter/adapter.go
@@ -123,7 +123,7 @@ git commit -m "feat: add QueryDataBatch to SourceAdapter interface"
 **Files:**
 - Modify: `internal/adapter/source/influxdb.go`
 
-- [ ] **Step 1: Add helper functions**
+- [x] **Step 1: Add helper functions**
 
 Add series parsing and WHERE clause building:
 
@@ -135,7 +135,7 @@ func ParseSeriesKey(key string) (measurement string, tags map[string]string)
 func BuildWhereClause(series []string) string
 ```
 
-- [ ] **Step 2: Implement QueryDataBatch**
+- [x] **Step 2: Implement QueryDataBatch**
 
 ```go
 func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement string,
@@ -168,17 +168,17 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 }
 ```
 
-- [ ] **Step 3: Implement stub for V2 (NOT batch-capable yet)**
+- [x] **Step 3: Implement stub for V2 (NOT batch-capable yet)**
 
 Add stub for OpenGemini source if needed.
 
-- [ ] **Step 4: Run build to verify**
+- [x] **Step 4: Run build to verify**
 
 ```bash
 go build ./internal/adapter/source/...
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/adapter/source/influxdb.go
@@ -192,14 +192,14 @@ git commit -m "feat: implement QueryDataBatch for InfluxDB V1"
 **Files:**
 - Modify: `internal/adapter/source/influxdb.go`
 
-- [ ] **Step 1: Add BuildFluxFilter helper**
+- [x] **Step 1: Add BuildFluxFilter helper**
 
 ```go
 // BuildFluxFilter builds Flux filter expression: (r.tag1 == "v1" and r.tag2 == "v2") or ...
 func BuildFluxFilter(series []string) string
 ```
 
-- [ ] **Step 2: Implement QueryDataBatch for V2**
+- [x] **Step 2: Implement QueryDataBatch for V2**
 
 ```go
 func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement string,
@@ -236,13 +236,13 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 }
 ```
 
-- [ ] **Step 3: Run build to verify**
+- [x] **Step 3: Run build to verify**
 
 ```bash
 go build ./internal/adapter/source/...
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/adapter/source/influxdb.go
@@ -256,7 +256,7 @@ git commit -m "feat: implement QueryDataBatch for InfluxDB V2"
 **Files:**
 - Modify: `internal/engine/migration.go`
 
-- [ ] **Step 1: Add series partitioning helper**
+- [x] **Step 1: Add series partitioning helper**
 
 ```go
 func PartitionSeries(series []string, maxPerBatch int) [][]string {
@@ -272,7 +272,7 @@ func PartitionSeries(series []string, maxPerBatch int) [][]string {
 }
 ```
 
-- [ ] **Step 2: Add batch mode execution path**
+- [x] **Step 2: Add batch mode execution path**
 
 ```go
 func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationTask) error {
@@ -302,7 +302,7 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 }
 ```
 
-- [ ] **Step 3: Modify runTask to dispatch based on mode**
+- [x] **Step 3: Modify runTask to dispatch based on mode**
 
 ```go
 func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) error {
@@ -313,13 +313,13 @@ func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) erro
 }
 ```
 
-- [ ] **Step 4: Run build to verify**
+- [x] **Step 4: Run build to verify**
 
 ```bash
 go build ./internal/engine/...
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/engine/migration.go
@@ -333,7 +333,7 @@ git commit -m "feat: add batch mode execution path to migration engine"
 **Files:**
 - Modify: `internal/adapter/registry_test.go`
 
-- [ ] **Step 1: Add QueryDataBatch mock**
+- [x] **Step 1: Add QueryDataBatch mock**
 
 ```go
 func (m *MockSourceAdapter) QueryDataBatch(ctx context.Context, measurement string,
@@ -343,13 +343,13 @@ func (m *MockSourceAdapter) QueryDataBatch(ctx context.Context, measurement stri
 }
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 ```bash
 go test ./internal/adapter/... -v
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add internal/adapter/registry_test.go
@@ -363,7 +363,7 @@ git commit -m "test: add QueryDataBatch mock for tests"
 **Files:**
 - Modify: `config.yaml.example`
 
-- [ ] **Step 1: Add batch query config example**
+- [x] **Step 1: Add batch query config example**
 
 ```yaml
 influx_to_influx:
@@ -372,7 +372,7 @@ influx_to_influx:
   max_series_per_query: 100    # default: 100, max: 1000
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add config.yaml.example
@@ -402,12 +402,19 @@ go test ./internal/engine/... -v -run Batch
 
 | Task | Description | Files | Status |
 |------|-------------|-------|--------|
-| 1 | Batch Query Config Types | `pkg/types/config.go`, `query_config.go` | ✅ Done |
-| 2 | Config Validator | `internal/config/validator.go` | ✅ Done |
-| 3 | SourceAdapter Interface | `internal/adapter/adapter.go` | ✅ Done |
-| 4 | InfluxDB V1 QueryDataBatch | `internal/adapter/source/influxdb.go` | ✅ Done |
-| 5 | InfluxDB V2 QueryDataBatch | `internal/adapter/source/influxdb.go` | ✅ Done |
-| 6 | Migration Engine Batch Mode | `internal/engine/migration.go` | ✅ Done |
-| 7 | Mock Adapter for Tests | `internal/adapter/registry_test.go` | ✅ Done |
-| 8 | Config Example | `config.yaml.example` | ✅ Done |
-| 9 | Integration Test | `internal/engine/migration_batch_test.go` | - [ ] |
+| 1 | Batch Query Config Types | `pkg/types/config.go`, `query_config.go` | ✅ DONE |
+| 2 | Config Validator | `internal/config/validator.go` | ✅ DONE |
+| 3 | SourceAdapter Interface | `internal/adapter/adapter.go` | ✅ DONE |
+| 4 | InfluxDB V1 QueryDataBatch | `internal/adapter/source/influxdb.go` | ✅ DONE |
+| 5 | InfluxDB V2 QueryDataBatch | `internal/adapter/source/influxdb.go` | ✅ DONE |
+| 6 | Migration Engine Batch Mode | `internal/engine/migration.go` | ✅ DONE |
+| 7 | Mock Adapter for Tests | `internal/adapter/registry_test.go` | ✅ DONE |
+| 8 | Config Example | `config.yaml.example` | ✅ DONE |
+| 9 | Integration Test | `internal/engine/migration_batch_test.go` | ❌ NOT DONE |
+
+## Verification
+
+```bash
+go build ./...     # Build succeeds
+go test ./...     # All tests pass
+```
