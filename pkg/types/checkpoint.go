@@ -13,6 +13,13 @@ const (
 	StatusFailed     CheckpointStatus = "failed"
 )
 
+type CheckpointType string
+
+const (
+	CheckpointTypeTask       CheckpointType = "task"
+	CheckpointTypeShardGroup CheckpointType = "shard_group"
+)
+
 type Checkpoint struct {
 	ID            int64
 	TaskID        string
@@ -27,6 +34,17 @@ type Checkpoint struct {
 	UpdatedAt     time.Time
 	ErrorMessage  string
 	MappingConfig MappingConfig
+}
+
+// ShardGroupCheckpoint tracks migration progress per shard group and time window
+type ShardGroupCheckpoint struct {
+	ShardGroupID        string           `json:"shard_group_id"`
+	WindowStart         int64            `json:"window_start"`          // Unix nano - start of time window
+	WindowEnd           int64            `json:"window_end"`            // Unix nano - end of time window
+	LastCompletedBatch  int              `json:"last_completed_batch"`  // 0-indexed batch within window
+	LastTimestamp       int64            `json:"last_timestamp"`        // max timestamp of last batch
+	TotalProcessedRows  int64            `json:"total_processed_rows"`
+	Status              CheckpointStatus `json:"status"`
 }
 
 type MigrationTask struct {

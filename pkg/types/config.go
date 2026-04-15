@@ -3,9 +3,17 @@ package types
 import "time"
 
 type InfluxToInfluxConfig struct {
-	Enabled           bool   `mapstructure:"enabled"`
-	QueryMode         string `mapstructure:"query_mode"`   // "single" | "batch"
-	MaxSeriesPerQuery int    `mapstructure:"max_series_per_query"`
+	Enabled           bool               `mapstructure:"enabled"`
+	QueryMode         string             `mapstructure:"query_mode"`   // "single" | "batch" | "shard-group"
+	MaxSeriesPerQuery int                `mapstructure:"max_series_per_query"`
+	ShardGroupConfig  *ShardGroupConfig  `mapstructure:"shard_group_config"`
+}
+
+type ShardGroupConfig struct {
+	Enabled          bool          `mapstructure:"enabled"`
+	SeriesBatchSize  int           `mapstructure:"series_batch_size"`   // default: 50
+	ShardParallelism int           `mapstructure:"shard_parallelism"`   // default: 1
+	TimeWindow       time.Duration `mapstructure:"time_window"`         // default: 0 (use shard group length)
 }
 
 type MigrationConfig struct {
