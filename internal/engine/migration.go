@@ -303,14 +303,22 @@ func (e *MigrationEngine) worker(ctx context.Context, workerID int) {
 		}
 	}()
 
-	for task := range e.taskQueue {
-		if err := e.runTask(ctx, task); err != nil {
-			logger.Error("worker task failed",
-				zap.Int("worker_id", workerID),
-				zap.String("task_id", task.ID),
-				zap.String("source_table", task.Mapping.SourceTable),
-				zap.Error(err))
-			e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, err.Error())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-e.taskQueue:
+			if !ok {
+				return // Queue closed
+			}
+			if err := e.runTask(ctx, task); err != nil {
+				logger.Error("worker task failed",
+					zap.Int("worker_id", workerID),
+					zap.String("task_id", task.ID),
+					zap.String("source_table", task.Mapping.SourceTable),
+					zap.Error(err))
+				e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, err.Error())
+			}
 		}
 	}
 }
@@ -340,7 +348,9 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 		return nil
 	}
 
-	e.checkpointMgr.MarkTaskInProgress(ctx, task.ID, task.Mapping.SourceTable)
+	if err := e.checkpointMgr.MarkTaskInProgress(ctx, task.ID, task.Mapping.SourceTable); err != nil {
+		return fmt.Errorf("failed to mark task in progress: %w", err)
+	}
 
 	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
 	if err != nil {
@@ -392,7 +402,7 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 		BatchSize:  e.config.Migration.ChunkSize,
 		TimeWindow: timeWindow,
 	}
-	queryCfg.ApplyDefaults()
+	queryCfg = queryCfg.WithDefaults()
 	if err := queryCfg.Validate(); err != nil {
 		return fmt.Errorf("invalid query config: %w", err)
 	}
@@ -416,8 +426,10 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 			saveTimestamp := lastRecord.Time
 			saveProcessed := totalProcessed + int64(len(records))
 
-			e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
-				0, saveTimestamp, saveProcessed, types.StatusInProgress)
+			if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+				0, saveTimestamp, saveProcessed, types.StatusInProgress); err != nil {
+				logger.Warn("failed to save checkpoint", zap.Error(err))
+			}
 
 			err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
 			if err != nil {
@@ -448,9 +460,13 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 		}
 	}
 
-	e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
-		0, lastTimestamp, totalProcessed, types.StatusCompleted)
-	e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable)
+	if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+		0, lastTimestamp, totalProcessed, types.StatusCompleted); err != nil {
+		logger.Warn("failed to save final checkpoint", zap.Error(err))
+	}
+	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
+		logger.Warn("failed to mark task completed", zap.Error(err))
+	}
 	logger.Info("task completed successfully",
 		zap.String("task_id", task.ID))
 
@@ -555,22 +571,32 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 			return fmt.Errorf("batch %d/%d failed: %w", i+1, len(batches), err)
 		}
 
-		lastCheckpoint = checkpoint
+		if checkpoint != nil {
+			lastCheckpoint = checkpoint
 
-		// Save checkpoint after each batch to prevent data loss on crash.
-		// This uses "at-least-once" semantics: on crash we may re-process
-		// this batch, but we will never lose data.
-		e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
-			0, checkpoint.LastTimestamp, checkpoint.ProcessedRows, types.StatusInProgress)
+			// Save checkpoint after each batch to prevent data loss on crash.
+			// This uses "at-least-once" semantics: on crash we may re-process
+			// this batch, but we will never lose data.
+			if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+				0, checkpoint.LastTimestamp, checkpoint.ProcessedRows, types.StatusInProgress); err != nil {
+				logger.Warn("failed to save checkpoint", zap.Error(err))
+			}
+		}
 	}
 
 	logger.Info("completed batch mode task",
 		zap.String("task_id", task.ID),
 		zap.Int("total_batches", len(batches)))
 
-	e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
-		0, lastCheckpoint.LastTimestamp, lastCheckpoint.ProcessedRows, types.StatusCompleted)
-	e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable)
+	if lastCheckpoint != nil {
+		if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+			0, lastCheckpoint.LastTimestamp, lastCheckpoint.ProcessedRows, types.StatusCompleted); err != nil {
+			logger.Warn("failed to save final checkpoint", zap.Error(err))
+		}
+	}
+	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
+		logger.Warn("failed to mark task completed", zap.Error(err))
+	}
 
 	return nil
 }
@@ -640,8 +666,10 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 			saveTimestamp := lastRecord.Time
 			saveProcessed := totalProcessed + int64(len(records))
 
-			e.checkpointMgr.SaveCheckpoint(ctx, taskID, table,
-				0, saveTimestamp, saveProcessed, types.StatusInProgress)
+			if err := e.checkpointMgr.SaveCheckpoint(ctx, taskID, table,
+				0, saveTimestamp, saveProcessed, types.StatusInProgress); err != nil {
+				logger.Warn("failed to save checkpoint", zap.Error(err))
+			}
 
 			err := e.processBatch(ctx, &windowMapping, records, targetAdapter)
 			if err != nil {
@@ -665,7 +693,14 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 			currentCp = cp
 		}
 
-		time.Sleep(e.config.Migration.ChunkInterval)
+		// Check context before sleeping to allow graceful shutdown
+		timer := time.NewTimer(e.config.Migration.ChunkInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 
 	return &types.Checkpoint{
@@ -746,11 +781,15 @@ func (e *MigrationEngine) writeWithRetry(ctx context.Context, measurement string
 			zap.Error(err))
 
 		if attempt < maxAttempts {
+			// Use timer to allow early cancellation
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(delay):
+			case <-timer.C:
 			}
+			// Timer fired normally, proceed with retry
 
 			// Calculate new delay with overflow protection
 			newDelay := time.Duration(float64(delay) * e.config.Retry.BackoffMultiplier)

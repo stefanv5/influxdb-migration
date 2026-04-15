@@ -20,7 +20,10 @@ var resumeCmd = &cobra.Command{
 This will pick up both failed tasks and tasks that were in-progress when the migration was interrupted.`,
 	Args: cobra.ExactArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		configPath, _ := cmd.Flags().GetString("config")
+		configPath, err := cmd.Flags().GetString("config")
+		if err != nil {
+			return fmt.Errorf("failed to get config flag: %w", err)
+		}
 		if configPath == "" {
 			return fmt.Errorf("config file is required (use --config)")
 		}

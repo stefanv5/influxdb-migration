@@ -41,6 +41,22 @@ func (c *QueryConfig) Validate() error {
 	return nil
 }
 
+func (c *QueryConfig) WithDefaults() *QueryConfig {
+	cfg := *c // shallow copy
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = DefaultBatchSize
+	}
+	if cfg.TimeWindow == 0 {
+		cfg.TimeWindow = DefaultTimeWindow
+	}
+	if cfg.MaxSeriesPerQuery == 0 {
+		cfg.MaxSeriesPerQuery = DefaultSeriesPerQuery
+	}
+	return &cfg
+}
+
+// ApplyDefaults applies defaults to the receiver (mutating) for backwards compatibility.
+// Prefer WithDefaults() for immutable patterns.
 func (c *QueryConfig) ApplyDefaults() {
 	if c.BatchSize == 0 {
 		c.BatchSize = DefaultBatchSize

@@ -16,12 +16,18 @@ This will delete all checkpoint data, allowing you to start migration from the b
 Use with caution - this cannot be undone.`,
 	Args: cobra.ExactArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		configPath, _ := cmd.Flags().GetString("config")
+		configPath, err := cmd.Flags().GetString("config")
+		if err != nil {
+			return fmt.Errorf("failed to get config flag: %w", err)
+		}
 		if configPath == "" {
 			return fmt.Errorf("config file is required (use --config)")
 		}
 
-		force, _ := cmd.Flags().GetBool("force")
+		force, err := cmd.Flags().GetBool("force")
+		if err != nil {
+			return fmt.Errorf("failed to get force flag: %w", err)
+		}
 		if !force {
 			fmt.Println("WARNING: This will delete all checkpoint data and start migration from scratch.")
 			fmt.Println("Use --force to confirm.")

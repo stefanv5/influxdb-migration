@@ -14,7 +14,10 @@ var dryrunCmd = &cobra.Command{
 This shows the source and target configurations and estimated data to be migrated.`,
 	Args: cobra.ExactArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		configPath, _ := cmd.Flags().GetString("config")
+		configPath, err := cmd.Flags().GetString("config")
+		if err != nil {
+			return fmt.Errorf("failed to get config flag: %w", err)
+		}
 		if configPath == "" {
 			return fmt.Errorf("config file is required (use --config)")
 		}

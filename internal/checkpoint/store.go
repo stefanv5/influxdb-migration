@@ -123,7 +123,10 @@ func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 		cp.ErrorMessage, string(mappingConfigJSON),
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to save checkpoint: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpoint, error) {

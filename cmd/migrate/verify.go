@@ -12,12 +12,18 @@ var verifyCmd = &cobra.Command{
 	Long:  `Verify the integrity of migrated data by comparing source and target.`,
 	Args:  cobra.ExactArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		taskID, _ := cmd.Flags().GetString("task-id")
+		taskID, err := cmd.Flags().GetString("task-id")
+		if err != nil {
+			return fmt.Errorf("failed to get task-id flag: %w", err)
+		}
 		if taskID == "" {
 			return fmt.Errorf("task-id is required (use --task-id)")
 		}
 
-		sampleSize, _ := cmd.Flags().GetInt("sample-size")
+		sampleSize, err := cmd.Flags().GetInt("sample-size")
+		if err != nil {
+			return fmt.Errorf("failed to get sample-size flag: %w", err)
+		}
 		if sampleSize == 0 {
 			sampleSize = 100
 		}

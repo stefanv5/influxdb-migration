@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -66,6 +67,12 @@ func (a *InfluxDBV1TargetAdapter) Connect(ctx context.Context, config map[string
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		// Require explicit opt-in via environment variable for insecure TLS
+		if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
+			logger.Error("TLS certificate verification is disabled - set ALLOW_INSECURE_TLS=1 environment variable to allow",
+				zap.String("url", cfg.URL))
+			return fmt.Errorf("insecure TLS requires ALLOW_INSECURE_TLS=1 environment variable")
+		}
 		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
 			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true
@@ -420,6 +427,12 @@ func (a *InfluxDBV2TargetAdapter) Connect(ctx context.Context, config map[string
 
 	transport := &http.Transport{}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
+		// Require explicit opt-in via environment variable for insecure TLS
+		if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
+			logger.Error("TLS certificate verification is disabled - set ALLOW_INSECURE_TLS=1 environment variable to allow",
+				zap.String("url", cfg.URL))
+			return fmt.Errorf("insecure TLS requires ALLOW_INSECURE_TLS=1 environment variable")
+		}
 		logger.Warn("TLS certificate verification is disabled - this is insecure and not recommended for production use",
 			zap.String("url", cfg.URL))
 		transport.TLSClientConfig.InsecureSkipVerify = true

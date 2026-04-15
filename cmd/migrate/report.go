@@ -12,9 +12,18 @@ var reportCmd = &cobra.Command{
 	Long:  `Generate a migration report in JSON, HTML, or Markdown format.`,
 	Args:  cobra.ExactArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		format, _ := cmd.Flags().GetString("format")
-		output, _ := cmd.Flags().GetString("output")
-		taskID, _ := cmd.Flags().GetString("task-id")
+		format, err := cmd.Flags().GetString("format")
+		if err != nil {
+			return fmt.Errorf("failed to get format flag: %w", err)
+		}
+		output, err := cmd.Flags().GetString("output")
+		if err != nil {
+			return fmt.Errorf("failed to get output flag: %w", err)
+		}
+		taskID, err := cmd.Flags().GetString("task-id")
+		if err != nil {
+			return fmt.Errorf("failed to get task-id flag: %w", err)
+		}
 
 		if taskID == "" {
 			return fmt.Errorf("task-id is required (use --task-id)")
