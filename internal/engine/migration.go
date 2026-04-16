@@ -678,6 +678,12 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 		}
 	}
 
+	// Validate time range
+	if !queryEnd.After(queryStart) {
+		return fmt.Errorf("invalid time range: end time %s must be after start time %s",
+			task.Mapping.TimeRange.End, task.Mapping.TimeRange.Start)
+	}
+
 	// Filter shard groups that overlap with query time range
 	var relevantGroups []*adapter.ShardGroup
 	for _, sg := range shardGroups {

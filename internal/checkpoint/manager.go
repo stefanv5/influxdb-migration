@@ -72,10 +72,14 @@ func (m *Manager) UpdateCheckpointStatus(ctx context.Context, taskID, sourceTabl
 }
 
 func (m *Manager) LoadCheckpoint(ctx context.Context, taskID, sourceTable string) (*types.Checkpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.store.LoadCheckpoint(taskID, sourceTable)
 }
 
 func (m *Manager) ListCheckpoints(ctx context.Context, taskID string) ([]*types.Checkpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.store.ListCheckpoints(taskID)
 }
 
@@ -131,4 +135,34 @@ func (m *Manager) ResetAll(ctx context.Context) error {
 
 func (m *Manager) DeleteCheckpoint(ctx context.Context, taskID, sourceTable string) error {
 	return m.store.DeleteCheckpoint(taskID, sourceTable)
+}
+
+func (m *Manager) SaveShardGroupCheckpoint(ctx context.Context, sgCP *types.ShardGroupCheckpoint) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.SaveShardGroupCheckpoint(sgCP)
+}
+
+func (m *Manager) LoadShardGroupCheckpoint(ctx context.Context, taskID, shardGroupID string) (*types.ShardGroupCheckpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.LoadShardGroupCheckpoint(taskID, shardGroupID)
+}
+
+func (m *Manager) LoadShardGroupCheckpointForWindow(ctx context.Context, taskID, shardGroupID string, windowStart, windowEnd int64) (*types.ShardGroupCheckpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.LoadShardGroupCheckpointForWindow(taskID, shardGroupID, windowStart, windowEnd)
+}
+
+func (m *Manager) MarkShardGroupCompleted(ctx context.Context, taskID, shardGroupID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.UpdateShardGroupStatus(taskID, shardGroupID, types.StatusCompleted)
+}
+
+func (m *Manager) ListShardGroupCheckpoints(ctx context.Context, taskID string) ([]*types.ShardGroupCheckpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.ListShardGroupCheckpoints(taskID)
 }
