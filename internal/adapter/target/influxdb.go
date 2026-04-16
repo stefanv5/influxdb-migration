@@ -25,11 +25,12 @@ type InfluxDBV1TargetAdapter struct {
 }
 
 type InfluxDBV1TargetConfig struct {
-	URL      string
-	Username string
-	Password string
-	Database string
-	SSL      types.SSLConfig
+	URL             string
+	Username        string
+	Password        string
+	Database        string
+	RetentionPolicy string
+	SSL             types.SSLConfig
 }
 
 type influxV1WriteResult struct {
@@ -237,9 +238,11 @@ func (a *InfluxDBV1TargetAdapter) writeLines(ctx context.Context, body string) e
 		return fmt.Errorf("invalid base URL: %w", err)
 	}
 	u.Path = "/write"
-	u.RawQuery = url.Values{
-		"db": []string{a.config.Database},
-	}.Encode()
+	queryParams := url.Values{"db": []string{a.config.Database}}
+	if a.config.RetentionPolicy != "" {
+		queryParams["rp"] = []string{a.config.RetentionPolicy}
+	}
+	u.RawQuery = queryParams.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewBufferString(body))
 	if err != nil {
@@ -370,6 +373,9 @@ func decodeInfluxV1TargetConfig(config map[string]interface{}, cfg interface{}) 
 	}
 	if v, ok := cfgMap["database"].(string); ok {
 		cfg.(*InfluxDBV1TargetConfig).Database = v
+	}
+	if v, ok := cfgMap["retention_policy"].(string); ok {
+		cfg.(*InfluxDBV1TargetConfig).RetentionPolicy = v
 	}
 	if basicAuth, ok := cfgMap["basic_auth"].(map[string]interface{}); ok {
 		if u, ok := basicAuth["username"].(string); ok {

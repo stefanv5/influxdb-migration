@@ -53,6 +53,15 @@ func ApplyDefaults(cfg *types.MigrationConfig) *types.MigrationConfig {
 	if newCfg.Retry.BackoffMultiplier == 0 {
 		newCfg.Retry.BackoffMultiplier = 2.0
 	}
+	if newCfg.InfluxToInflux.ShardGroupConfig != nil {
+		sgCfg := newCfg.InfluxToInflux.ShardGroupConfig
+		if sgCfg.SeriesBatchSize == 0 {
+			sgCfg.SeriesBatchSize = 50
+		}
+		if sgCfg.ShardParallelism == 0 {
+			sgCfg.ShardParallelism = 1
+		}
+	}
 	return &newCfg
 }
 
