@@ -20,9 +20,10 @@ const (
 )
 
 type QueryConfig struct {
-	BatchSize  int
-	TimeWindow time.Duration
-	MaxSeriesPerQuery int  // 0 means use default (100)
+	BatchSize         int
+	TimeWindow        time.Duration
+	MaxSeriesPerQuery int
+	TagKeys           []string // 用于区分 tag 和 field
 }
 
 func (c *QueryConfig) Validate() error {

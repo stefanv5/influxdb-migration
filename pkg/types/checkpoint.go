@@ -38,6 +38,7 @@ type Checkpoint struct {
 
 // ShardGroupCheckpoint tracks migration progress per shard group and time window
 type ShardGroupCheckpoint struct {
+	TaskID              string           `json:"task_id"`
 	ShardGroupID        string           `json:"shard_group_id"`
 	WindowStart         int64            `json:"window_start"`          // Unix nano - start of time window
 	WindowEnd           int64            `json:"window_end"`            // Unix nano - end of time window

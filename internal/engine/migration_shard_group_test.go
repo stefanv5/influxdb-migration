@@ -42,6 +42,10 @@ func (m *MockSourceAdapterForShardGroup) DiscoverSeriesInTimeWindow(ctx context.
 	return series, nil
 }
 
+func (m *MockSourceAdapterForShardGroup) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
+	return nil, nil
+}
+
 func (m *MockSourceAdapterForShardGroup) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
 	return []string{}, nil
 }

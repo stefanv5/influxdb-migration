@@ -2,9 +2,17 @@ package adapter
 
 import (
 	"context"
+	"time"
 
 	"github.com/migration-tools/influx-migrator/pkg/types"
 )
+
+// ShardGroup represents a time-bounded shard group in InfluxDB
+type ShardGroup struct {
+	ID        int
+	StartTime time.Time
+	EndTime   time.Time
+}
 
 type SourceAdapter interface {
 	Name() string
@@ -23,10 +31,26 @@ type SourceAdapter interface {
 	// this returns a minimal schema with just the TableName set.
 	DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error)
 
+	// DiscoverShardGroups returns all shard groups from the source
+	DiscoverShardGroups(ctx context.Context) ([]*ShardGroup, error)
+
+	// DiscoverSeriesInTimeWindow returns all series that have data within the given time window
+	// No LIMIT/OFFSET is used - relies on time window to bound the result set
+	DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error)
+
+	// DiscoverTagKeys returns all tag key names for a measurement.
+	// Used by executeFluxSelect to distinguish tags from fields in V2 sources.
+	// V1 sources return nil/empty slice as they don't need tag/field distinction.
+	DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error)
+
 	QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error)
 
-	// QueryDataBatch queries multiple series in a single call for batch processing.
-	QueryDataBatch(ctx context.Context, measurement string, series []string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error)
+	// QueryDataBatch queries multiple series within a time range for batch processing.
+	// startTime: inclusive lower bound
+	// endTime: exclusive upper bound (time < endTime)
+	QueryDataBatch(ctx context.Context, measurement string, series []string,
+		startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
+		batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error)
 }
 
 type TargetAdapter interface {

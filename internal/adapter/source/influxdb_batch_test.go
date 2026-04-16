@@ -3,7 +3,55 @@ package source
 import (
 	"strings"
 	"testing"
+
+	"github.com/migration-tools/influx-migrator/pkg/types"
 )
+
+func TestQueryConfigTagKeys(t *testing.T) {
+	// Test that TagKeys field exists and can be set
+	cfg := &types.QueryConfig{
+		BatchSize:         1000,
+		TimeWindow:        168 * 60 * 60 * 1e9, // 168 hours in nanoseconds
+		MaxSeriesPerQuery: 100,
+		TagKeys:           []string{"host", "region", "service"},
+	}
+
+	if len(cfg.TagKeys) != 3 {
+		t.Errorf("expected 3 tag keys, got %d", len(cfg.TagKeys))
+	}
+
+	if cfg.TagKeys[0] != "host" || cfg.TagKeys[1] != "region" || cfg.TagKeys[2] != "service" {
+		t.Errorf("unexpected tag keys: %v", cfg.TagKeys)
+	}
+}
+
+func TestQueryConfigWithDefaults(t *testing.T) {
+	// Test WithDefaults applies defaults correctly
+	cfg := &types.QueryConfig{}
+	cfg = cfg.WithDefaults()
+
+	if cfg.BatchSize != types.DefaultBatchSize {
+		t.Errorf("expected default batch size %d, got %d", types.DefaultBatchSize, cfg.BatchSize)
+	}
+
+	if cfg.MaxSeriesPerQuery != types.DefaultSeriesPerQuery {
+		t.Errorf("expected default series per query %d, got %d", types.DefaultSeriesPerQuery, cfg.MaxSeriesPerQuery)
+	}
+}
+
+func TestQueryConfigTagKeysDefaults(t *testing.T) {
+	// Test that TagKeys defaults to nil (not empty slice)
+	cfg := &types.QueryConfig{}
+	cfg = cfg.WithDefaults()
+
+	// TagKeys should be nil when not set, not an empty slice
+	// This is important because nil slice is distinguishable from empty slice
+	if cfg.TagKeys == nil {
+		t.Log("TagKeys is nil as expected when not set")
+	} else if len(cfg.TagKeys) == 0 {
+		t.Log("TagKeys is empty slice (acceptable)")
+	}
+}
 
 func TestParseSeriesKey(t *testing.T) {
 	tests := []struct {

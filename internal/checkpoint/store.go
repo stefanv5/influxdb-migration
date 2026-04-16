@@ -77,6 +77,21 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE TABLE IF NOT EXISTS schema_version (
 		version INTEGER PRIMARY KEY
 	);
+
+	CREATE TABLE IF NOT EXISTS shard_group_checkpoints (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id TEXT NOT NULL,
+		shard_group_id TEXT NOT NULL,
+		window_start INTEGER NOT NULL,
+		window_end INTEGER NOT NULL,
+		last_completed_batch INTEGER NOT NULL DEFAULT 0,
+		last_timestamp INTEGER NOT NULL DEFAULT 0,
+		total_processed_rows INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(task_id, shard_group_id, window_start)
+	);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -263,4 +278,111 @@ func (s *SQLiteStore) DeleteCheckpoint(taskID, sourceTable string) error {
 	query := `DELETE FROM checkpoints WHERE task_id = ? AND source_table = ?`
 	_, err := s.db.Exec(query, taskID, sourceTable)
 	return err
+}
+
+func (s *SQLiteStore) SaveShardGroupCheckpoint(cp *types.ShardGroupCheckpoint) error {
+	query := `
+	INSERT INTO shard_group_checkpoints
+		(task_id, shard_group_id, window_start, window_end, last_completed_batch,
+		 last_timestamp, total_processed_rows, status, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(task_id, shard_group_id, window_start) DO UPDATE SET
+		last_completed_batch = excluded.last_completed_batch,
+		last_timestamp = excluded.last_timestamp,
+		total_processed_rows = excluded.total_processed_rows,
+		status = excluded.status,
+		updated_at = excluded.updated_at
+	`
+
+	now := time.Now().UTC()
+	_, err := s.db.Exec(query,
+		cp.TaskID, cp.ShardGroupID, cp.WindowStart, cp.WindowEnd, cp.LastCompletedBatch,
+		cp.LastTimestamp, cp.TotalProcessedRows, cp.Status,
+		now.Format(time.RFC3339), now.Format(time.RFC3339),
+	)
+	return err
+}
+
+func (s *SQLiteStore) LoadShardGroupCheckpoint(taskID, shardGroupID string) (*types.ShardGroupCheckpoint, error) {
+	query := `
+	SELECT task_id, shard_group_id, window_start, window_end, last_completed_batch,
+	       last_timestamp, total_processed_rows, status
+	FROM shard_group_checkpoints
+	WHERE task_id = ? AND shard_group_id = ?
+	ORDER BY window_start DESC
+	LIMIT 1
+	`
+
+	var cp types.ShardGroupCheckpoint
+	err := s.db.QueryRow(query, taskID, shardGroupID).Scan(
+		&cp.TaskID, &cp.ShardGroupID, &cp.WindowStart, &cp.WindowEnd, &cp.LastCompletedBatch,
+		&cp.LastTimestamp, &cp.TotalProcessedRows, &cp.Status,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
+func (s *SQLiteStore) LoadShardGroupCheckpointForWindow(taskID, shardGroupID string, windowStart, windowEnd int64) (*types.ShardGroupCheckpoint, error) {
+	query := `
+	SELECT task_id, shard_group_id, window_start, window_end, last_completed_batch,
+	       last_timestamp, total_processed_rows, status
+	FROM shard_group_checkpoints
+	WHERE task_id = ? AND shard_group_id = ? AND window_start = ? AND window_end = ?
+	`
+
+	var cp types.ShardGroupCheckpoint
+	err := s.db.QueryRow(query, taskID, shardGroupID, windowStart, windowEnd).Scan(
+		&cp.TaskID, &cp.ShardGroupID, &cp.WindowStart, &cp.WindowEnd, &cp.LastCompletedBatch,
+		&cp.LastTimestamp, &cp.TotalProcessedRows, &cp.Status,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
+func (s *SQLiteStore) UpdateShardGroupStatus(taskID, shardGroupID string, status types.CheckpointStatus) error {
+	query := `UPDATE shard_group_checkpoints SET status = ?, updated_at = ? WHERE task_id = ? AND shard_group_id = ?`
+	now := time.Now().UTC()
+	_, err := s.db.Exec(query, status, now.Format(time.RFC3339), taskID, shardGroupID)
+	return err
+}
+
+func (s *SQLiteStore) ListShardGroupCheckpoints(taskID string) ([]*types.ShardGroupCheckpoint, error) {
+	query := `
+	SELECT task_id, shard_group_id, window_start, window_end, last_completed_batch,
+	       last_timestamp, total_processed_rows, status
+	FROM shard_group_checkpoints
+	WHERE task_id = ?
+	ORDER BY shard_group_id, window_start
+	`
+
+	rows, err := s.db.Query(query, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var checkpoints []*types.ShardGroupCheckpoint
+	for rows.Next() {
+		var cp types.ShardGroupCheckpoint
+		err := rows.Scan(
+			&cp.TaskID, &cp.ShardGroupID, &cp.WindowStart, &cp.WindowEnd, &cp.LastCompletedBatch,
+			&cp.LastTimestamp, &cp.TotalProcessedRows, &cp.Status,
+		)
+		if err != nil {
+			return nil, err
+		}
+		checkpoints = append(checkpoints, &cp)
+	}
+
+	return checkpoints, rows.Err()
 }

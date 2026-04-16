@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -168,6 +169,131 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 	return series, nil
 }
 
+func (a *InfluxDBV1Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
+	query := "SHOW SHARDS"
+	results, err := a.executeQuery(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group by shard_group ID, extract time range
+	shardGroups := make(map[int]*adapter.ShardGroup)
+	for _, result := range results {
+		for _, values := range result.Values {
+			if len(values) < 6 {
+				continue
+			}
+			// Parse: id, database, retention_policy, shard_group, start_time, end_time
+			shardGroupID := parseInt(values[3])
+			startTime := parseTime(values[4])
+			endTime := parseTime(values[5])
+
+			if _, exists := shardGroups[shardGroupID]; !exists {
+				shardGroups[shardGroupID] = &adapter.ShardGroup{
+					ID:        shardGroupID,
+					StartTime: startTime,
+					EndTime:   endTime,
+				}
+			}
+		}
+	}
+
+	var result []*adapter.ShardGroup
+	for _, sg := range shardGroups {
+		result = append(result, sg)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].StartTime.Before(result[j].StartTime)
+	})
+	return result, nil
+}
+
+func (a *InfluxDBV1Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
+	query := fmt.Sprintf(`
+		SHOW SERIES FROM %s
+		WHERE time >= '%s' AND time < '%s'`,
+		influxQuoteIdentifier(measurement),
+		startTime.Format(time.RFC3339Nano),
+		endTime.Format(time.RFC3339Nano))
+
+	series, err := a.executeShowSeries(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	return series, nil
+}
+
+// DiscoverTagKeys returns nil for V1 adapter.
+// V1 uses column headers from SELECT results to distinguish tags from fields,
+// so no prior tag key discovery is needed.
+func (a *InfluxDBV1Adapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
+	return nil, nil
+}
+
+func (a *InfluxDBV1Adapter) executeShowSeries(ctx context.Context, query string) ([]string, error) {
+	results, err := a.executeQuery(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	var series []string
+	for _, result := range results {
+		for _, values := range result.Values {
+			if len(values) > 0 {
+				if key, ok := values[0].(string); ok {
+					series = append(series, key)
+				}
+			}
+		}
+	}
+
+	return series, nil
+}
+
+// parseInt parses an interface{} to int
+func parseInt(v interface{}) int {
+	switch val := v.(type) {
+	case float64:
+		return int(val)
+	case int64:
+		return int(val)
+	case int:
+		return val
+	case string:
+		var i int
+		fmt.Sscanf(val, "%d", &i)
+		return i
+	}
+	return 0
+}
+
+// parseTime parses an interface{} to time.Time
+func parseTime(v interface{}) time.Time {
+	switch val := v.(type) {
+	case string:
+		// Try RFC3339Nano first
+		if t, err := time.Parse(time.RFC3339Nano, val); err == nil {
+			return t
+		}
+		// Try RFC3339
+		if t, err := time.Parse(time.RFC3339, val); err == nil {
+			return t
+		}
+	case float64:
+		// Unix timestamp in seconds or nanoseconds
+		if val > 1e12 {
+			// Likely nanoseconds
+			return time.Unix(0, int64(val))
+		}
+		// Likely seconds
+		return time.Unix(int64(val), 0)
+	case int64:
+		return time.Unix(val, 0)
+	}
+	return time.Time{}
+}
+
 func (a *InfluxDBV1Adapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
 	// InfluxDB is a time-series database with schemaless writes.
 	// Return a minimal schema with just the measurement name.
@@ -257,7 +383,7 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 }
 
 func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement string,
-	series []string, lastCheckpoint *types.Checkpoint,
+	series []string, startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
 	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 
 	var lastTS int64
@@ -265,11 +391,10 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		lastTS = lastCheckpoint.LastTimestamp
 	}
 
-	var startTime string
-	if lastTS == 0 {
-		startTime = "1970-01-01T00:00:00Z"
-	} else {
-		startTime = time.Unix(0, lastTS).Format(time.RFC3339Nano)
+	// Determine effective start time
+	queryStart := startTime
+	if lastTS > 0 && lastTS > startTime.UnixNano() {
+		queryStart = time.Unix(0, lastTS)
 	}
 
 	batchSize := getBatchSize(cfg)
@@ -279,8 +404,16 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	var maxTS int64
 
 	for {
-		query := fmt.Sprintf(`SELECT * FROM %s WHERE (%s) AND time >= '%s' LIMIT %d ORDER BY time`,
-			influxQuoteIdentifier(measurement), whereClause, startTime, batchSize)
+		// Query with time bounds: startTime (or resume point) AND endTime
+		query := fmt.Sprintf(`
+			SELECT * FROM %s
+			WHERE (%s) AND time >= '%s' AND time < '%s'
+			LIMIT %d ORDER BY time`,
+			influxQuoteIdentifier(measurement),
+			whereClause,
+			queryStart.Format(time.RFC3339Nano),
+			endTime.Format(time.RFC3339Nano),
+			batchSize)
 
 		logger.Debug("executing batch query for InfluxDB V1",
 			zap.String("measurement", measurement),
@@ -312,18 +445,23 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		logger.Debug("fetched batch from InfluxDB V1",
 			zap.String("measurement", measurement),
 			zap.Int("batch_size", len(records)),
-			zap.String("next_start", startTime))
+			zap.String("next_start", queryStart.Format(time.RFC3339Nano)))
 
 		// If we got fewer records than batch size, we're done
 		if len(records) < batchSize {
 			break
 		}
 
-		// Update startTime for next query using the last record's timestamp
+		// Update queryStart for next query using the last record's timestamp
 		if maxTS < math.MaxInt64 {
-			startTime = fmt.Sprintf("%d", maxTS+1)
+			queryStart = time.Unix(0, maxTS+1)
 		} else {
-			startTime = fmt.Sprintf("%d", maxTS)
+			queryStart = time.Unix(0, maxTS)
+		}
+
+		// Don't query beyond window end
+		if queryStart.UnixNano() >= endTime.UnixNano() {
+			break
 		}
 
 		select {
@@ -630,7 +768,9 @@ schema.measurements(bucket: "%s")`, a.config.Bucket)
 	return measurements, nil
 }
 
-func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
+// DiscoverTagKeys returns all tag key names for a measurement.
+// Used to distinguish tags from fields in Flux query results.
+func (a *InfluxDBV2Adapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
 	fluxQuery := fmt.Sprintf(`import "influxdata/influxdb/schema"
 schema.tagKeys(bucket: "%s", measurement: "%s")`, a.config.Bucket, measurement)
 
@@ -639,18 +779,122 @@ schema.tagKeys(bucket: "%s", measurement: "%s")`, a.config.Bucket, measurement)
 		return nil, err
 	}
 
-	var series []string
+	var tagKeys []string
 	for _, r := range results {
 		for _, v := range r {
 			if arr, ok := v.([]interface{}); ok && len(arr) > 0 {
 				if key, ok := arr[0].(string); ok {
-					series = append(series, key)
+					tagKeys = append(tagKeys, key)
 				}
 			}
 		}
 	}
 
-	return series, nil
+	return tagKeys, nil
+}
+
+func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
+	// Step 1: Get all tag keys
+	tagKeys, err := a.DiscoverTagKeys(ctx, measurement)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tag keys: %w", err)
+	}
+
+	if len(tagKeys) == 0 {
+		// No tags, just return measurement itself
+		return []string{measurement}, nil
+	}
+
+	// Step 2: Get values for each tag key
+	tagValues := make(map[string][]string)
+	for _, key := range tagKeys {
+		valuesQuery := fmt.Sprintf(`import "influxdata/influxdb/schema"
+schema.tagValues(bucket: "%s", tag: "%s", measurement: "%s")`,
+			a.config.Bucket, key, measurement)
+
+		results, err := a.executeFluxQuery(ctx, valuesQuery)
+		if err != nil {
+			logger.Warn("failed to get tag values, skipping", zap.String("tag", key), zap.Error(err))
+			continue
+		}
+
+		for _, r := range results {
+			for _, v := range r {
+				if arr, ok := v.([]interface{}); ok && len(arr) > 0 {
+					if val, ok := arr[0].(string); ok {
+						tagValues[key] = append(tagValues[key], val)
+					}
+				}
+			}
+		}
+	}
+
+	// Step 3: Cartesian product to generate series keys
+	var seriesKeys []string
+	var generate func(idx int, parts []string)
+	generate = func(idx int, parts []string) {
+		if idx == len(tagKeys) {
+			seriesKeys = append(seriesKeys, measurement+","+strings.Join(parts, ","))
+			return
+		}
+		key := tagKeys[idx]
+		values := tagValues[key]
+		if len(values) == 0 {
+			// No values for this tag, skip it
+			generate(idx+1, parts)
+			return
+		}
+		for _, v := range values {
+			newParts := append(parts, fmt.Sprintf("%s=%s", key, v))
+			generate(idx+1, newParts)
+		}
+	}
+	generate(0, []string{})
+
+	return seriesKeys, nil
+}
+
+func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
+	// Use the shards API endpoint
+	req, err := http.NewRequestWithContext(ctx, "GET", a.config.URL+"/api/v2/shards", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Token "+a.config.Token)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Shards []struct {
+			ID        int   `json:"id"`
+			StartTime int64 `json:"startTime"`
+			EndTime   int64 `json:"endTime"`
+		} `json:"shards"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	var shardGroups []*adapter.ShardGroup
+	for _, s := range result.Shards {
+		shardGroups = append(shardGroups, &adapter.ShardGroup{
+			ID:        s.ID,
+			StartTime: time.Unix(0, s.StartTime),
+			EndTime:   time.Unix(0, s.EndTime),
+		})
+	}
+	return shardGroups, nil
+}
+
+func (a *InfluxDBV2Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
+	// V2's SHOW SERIES does not support time filtering directly.
+	// Time window filtering is handled by QueryDataBatch using Flux range().
+	// This method returns all series keys, and the query layer applies time filtering.
+	return a.DiscoverSeries(ctx, measurement)
 }
 
 func (a *InfluxDBV2Adapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
@@ -691,7 +935,11 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 			  |> limit(n: %d)
 		`, a.config.Bucket, startTime, endTime, measurement, batchSize)
 
-		records, err := a.executeFluxSelect(ctx, fluxQuery)
+		var tagKeys []string
+		if cfg != nil {
+			tagKeys = cfg.TagKeys
+		}
+		records, err := a.executeFluxSelect(ctx, fluxQuery, tagKeys)
 		if err != nil {
 			return nil, err
 		}
@@ -742,14 +990,18 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 }
 
 func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement string,
-	series []string, lastCheckpoint *types.Checkpoint,
+	series []string, startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
 	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 
-	var startTime string
+	var lastTS int64
 	if lastCheckpoint != nil && lastCheckpoint.LastTimestamp != 0 {
-		startTime = fmt.Sprintf("%d", lastCheckpoint.LastTimestamp)
-	} else {
-		startTime = "1970-01-01T00:00:00Z"
+		lastTS = lastCheckpoint.LastTimestamp
+	}
+
+	// Determine effective start time
+	queryStart := startTime
+	if lastTS > 0 && lastTS > startTime.UnixNano() {
+		queryStart = time.Unix(0, lastTS)
 	}
 
 	batchSize := getBatchSize(cfg)
@@ -761,17 +1013,24 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	for {
 		fluxQuery := fmt.Sprintf(`
 			from(bucket: "%s")
-			  |> range(start: %s)
+			  |> range(start: %s, stop: %s)
 			  |> filter(fn: (r) => r._measurement == "%s" and (%s))
 			  |> limit(n: %d)
-		`, a.config.Bucket, startTime, measurement, fluxFilter, batchSize)
+		`, a.config.Bucket,
+			queryStart.Format(time.RFC3339Nano),
+			endTime.Format(time.RFC3339Nano),
+			measurement, fluxFilter, batchSize)
 
 		logger.Debug("executing batch query for InfluxDB V2",
 			zap.String("measurement", measurement),
 			zap.Int("series_count", len(series)),
 			zap.String("query", fluxQuery))
 
-		records, err := a.executeFluxSelect(ctx, fluxQuery)
+		var tagKeys []string
+		if cfg != nil {
+			tagKeys = cfg.TagKeys
+		}
+		records, err := a.executeFluxSelect(ctx, fluxQuery, tagKeys)
 		if err != nil {
 			return nil, fmt.Errorf("batch query failed: %w", err)
 		}
@@ -796,18 +1055,23 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		logger.Debug("fetched batch from InfluxDB V2",
 			zap.String("measurement", measurement),
 			zap.Int("batch_size", len(records)),
-			zap.String("next_start", startTime))
+			zap.String("next_start", queryStart.Format(time.RFC3339Nano)))
 
 		// If we got fewer records than batch size, we're done
 		if len(records) < batchSize {
 			break
 		}
 
-		// Update startTime for next query using the last record's timestamp
+		// Update queryStart for next query using the last record's timestamp
 		if maxTS < math.MaxInt64 {
-			startTime = fmt.Sprintf("%d", maxTS+1)
+			queryStart = time.Unix(0, maxTS+1)
 		} else {
-			startTime = fmt.Sprintf("%d", maxTS)
+			queryStart = time.Unix(0, maxTS)
+		}
+
+		// Don't query beyond window end
+		if queryStart.UnixNano() >= endTime.UnixNano() {
+			break
 		}
 
 		select {
@@ -829,7 +1093,7 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	}, nil
 }
 
-func (a *InfluxDBV2Adapter) executeFluxSelect(ctx context.Context, query string) ([]types.Record, error) {
+func (a *InfluxDBV2Adapter) executeFluxSelect(ctx context.Context, query string, tagKeys []string) ([]types.Record, error) {
 	params, err := json.Marshal(map[string]string{"query": query})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal query: %w", err)
@@ -861,20 +1125,59 @@ func (a *InfluxDBV2Adapter) executeFluxSelect(ctx context.Context, query string)
 		return nil, fmt.Errorf("flux query failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result struct {
-		Records []fluxRecord `json:"records"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	// Decode into generic map to capture all fields including tags
+	var rawResults []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&rawResults); err != nil {
 		return nil, fmt.Errorf("failed to decode flux result: %w", err)
 	}
 
+	// Build tagKeys set for O(1) lookup
+	tagKeySet := make(map[string]bool)
+	for _, k := range tagKeys {
+		tagKeySet[k] = true
+	}
+
 	var records []types.Record
-	for _, r := range result.Records {
+	for _, r := range rawResults {
 		record := types.NewRecord()
-		record.Time = r.Time.UnixNano()
-		record.AddField(r.Field, r.Value)
-		record.AddTag("_measurement", r.Measurement)
+
+		// Extract _time
+		if t, ok := r["_time"].(string); ok {
+			if tm, err := time.Parse(time.RFC3339Nano, t); err == nil {
+				record.Time = tm.UnixNano()
+			}
+		}
+
+		// Extract _measurement as tag
+		if m, ok := r["_measurement"].(string); ok {
+			record.AddTag("_measurement", m)
+		}
+
+		// Extract _field and _value as field
+		if f, ok := r["_field"].(string); ok {
+			if v, ok := r["_value"]; ok {
+				record.AddField(f, v)
+			}
+		}
+
+		// Distinguish tags from fields
+		// System fields: _time, _measurement, _field, _value
+		// Tag fields: any field whose name is in tagKeys
+		// Other fields: regular fields (float, int, bool)
+		for k, v := range r {
+			switch k {
+			case "_time", "_measurement", "_field", "_value":
+				continue
+			}
+			if tagKeySet[k] {
+				// This is a tag - convert value to string
+				record.AddTag(k, fmt.Sprintf("%v", v))
+			} else if k != "_field" && k != "_value" {
+				// This is a regular field
+				record.AddField(k, v)
+			}
+		}
+
 		records = append(records, *record)
 	}
 

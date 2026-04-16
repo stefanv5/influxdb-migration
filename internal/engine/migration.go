@@ -728,6 +728,20 @@ func (e *MigrationEngine) migrateShardGroup(ctx context.Context, task *Migration
 		zap.String("start", start.Format(time.RFC3339)),
 		zap.String("end", end.Format(time.RFC3339)))
 
+	// Get tag keys at shard group level (once per shard group, not per window)
+	// Tag keys are used by executeFluxSelect to distinguish tags from fields
+	tagKeys, err := sourceAdapter.DiscoverTagKeys(ctx, task.Mapping.SourceTable)
+	if err != nil {
+		logger.Warn("failed to discover tag keys, treating all as fields",
+			zap.Int("shard_id", sg.ID),
+			zap.Error(err))
+		tagKeys = nil // ensure nil not empty slice on error
+	} else {
+		logger.Info("discovered tag keys for shard group",
+			zap.Int("shard_id", sg.ID),
+			zap.Int("tag_key_count", len(tagKeys)))
+	}
+
 	// Determine time window duration
 	timeWindow := time.Duration(0)
 	if e.config.InfluxToInflux.ShardGroupConfig != nil {
@@ -746,9 +760,9 @@ func (e *MigrationEngine) migrateShardGroup(ctx context.Context, task *Migration
 		zap.Int("window_count", len(windows)),
 		zap.Duration("window_duration", timeWindow))
 
-	// Process each time window
+	// Process each time window - pass tagKeys to all windows
 	for _, window := range windows {
-		if err := e.migrateTimeWindow(ctx, task, sg, window, sourceAdapter, targetAdapter); err != nil {
+		if err := e.migrateTimeWindow(ctx, task, sg, window, sourceAdapter, targetAdapter, tagKeys); err != nil {
 			return fmt.Errorf("time window [%s, %s) migration failed: %w",
 				window.Start.Format(time.RFC3339), window.End.Format(time.RFC3339), err)
 		}
@@ -764,7 +778,7 @@ func (e *MigrationEngine) migrateShardGroup(ctx context.Context, task *Migration
 	return nil
 }
 
-func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *MigrationTask, sg *adapter.ShardGroup, window TimeWindow, sourceAdapter adapter.SourceAdapter, targetAdapter adapter.TargetAdapter) error {
+func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *MigrationTask, sg *adapter.ShardGroup, window TimeWindow, sourceAdapter adapter.SourceAdapter, targetAdapter adapter.TargetAdapter, tagKeys []string) error {
 	// Load existing checkpoint for this window
 	cp, err := e.checkpointMgr.LoadShardGroupCheckpointForWindow(ctx,
 		task.ID, fmt.Sprintf("%d", sg.ID), window.Start.UnixNano(), window.End.UnixNano())
@@ -855,7 +869,7 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 			func(records []types.Record) error {
 				return e.processBatch(ctx, task.Mapping, records, targetAdapter)
 			},
-			&types.QueryConfig{BatchSize: e.config.Migration.ChunkSize},
+			&types.QueryConfig{BatchSize: e.config.Migration.ChunkSize, TagKeys: tagKeys},
 		)
 		if err != nil {
 			return fmt.Errorf("batch %d failed: %w", batchIdx, err)

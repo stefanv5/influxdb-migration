@@ -158,6 +158,23 @@ func (a *TDengineAdapter) DiscoverSeries(ctx context.Context, measurement string
 	return a.DiscoverTablesFromStable(ctx, measurement)
 }
 
+// DiscoverShardGroups returns an error since TDengine's sharding is handled internally
+func (a *TDengineAdapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
+	return nil, fmt.Errorf("DiscoverShardGroups is not directly supported for TDengine source")
+}
+
+// DiscoverSeriesInTimeWindow returns series for the given time window
+func (a *TDengineAdapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
+	// For TDengine, we use the regular discovery since it handles time-based queries differently
+	return a.DiscoverTablesFromStable(ctx, measurement)
+}
+
+// DiscoverTagKeys returns nil for TDengine adapter.
+// TDengine uses a different data model and doesn't need tag/field distinction.
+func (a *TDengineAdapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
+	return nil, nil
+}
+
 func (a *TDengineAdapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
 	// TDengine is a time-series database and does not have a direct equivalent
 	// to MySQL's INFORMATION_SCHEMA. TDengine's schema is defined by the STABLE,
@@ -289,7 +306,9 @@ func (a *TDengineAdapter) QueryData(ctx context.Context, table string, lastCheck
 
 // QueryDataBatch is not supported for TDengine adapter.
 // Batch series query is only available for InfluxDB sources.
-func (a *TDengineAdapter) QueryDataBatch(ctx context.Context, table string, series []string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
+func (a *TDengineAdapter) QueryDataBatch(ctx context.Context, table string, series []string,
+	startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
+	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	return nil, fmt.Errorf("QueryDataBatch is not supported for TDengine adapter, use QueryData instead")
 }
 

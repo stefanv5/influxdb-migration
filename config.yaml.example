@@ -41,8 +41,13 @@ migration:
 # InfluxDB to InfluxDB / OpenGemini batch query mode
 influx_to_influx:
   enabled: true
-  query_mode: "batch"           # "single" or "batch"
+  query_mode: "shard-group"    # "single", "batch", or "shard-group"
   max_series_per_query: 100    # default: 100, max: 1000
+  # shard_group_config:
+  #   enabled: true
+  #   series_batch_size: 50     # series per batch within time window
+  #   shard_parallelism: 1      # process shard groups sequentially
+  #   time_window: 168h         # 0 = use shard group length
 
 retry:
   max_attempts: 3

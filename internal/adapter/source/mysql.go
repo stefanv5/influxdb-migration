@@ -160,6 +160,12 @@ func (a *MySQLAdapter) DiscoverSeriesInTimeWindow(ctx context.Context, measureme
 	return []string{measurement}, nil
 }
 
+// DiscoverTagKeys returns nil for MySQL adapter.
+// MySQL is a relational database and doesn't have the concept of tags.
+func (a *MySQLAdapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
+	return nil, nil
+}
+
 func (a *MySQLAdapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
 	if a.db == nil {
 		return nil, fmt.Errorf("mysql adapter not connected, call Connect first")

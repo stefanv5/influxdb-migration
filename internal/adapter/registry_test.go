@@ -43,11 +43,20 @@ func (m *MockSourceAdapter) DiscoverSchema(ctx context.Context, table string) (*
 		Columns:   []types.Column{},
 	}, nil
 }
+func (m *MockSourceAdapter) DiscoverShardGroups(ctx context.Context) ([]*ShardGroup, error) {
+	return nil, nil
+}
+func (m *MockSourceAdapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
+	return []string{measurement}, nil
+}
+func (m *MockSourceAdapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
+	return nil, nil
+}
 func (m *MockSourceAdapter) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	return &types.Checkpoint{ProcessedRows: 100}, nil
 }
 func (m *MockSourceAdapter) QueryDataBatch(ctx context.Context, measurement string,
-	series []string, lastCheckpoint *types.Checkpoint,
+	series []string, startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
 	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	if batchFunc != nil && len(series) > 0 {
 		// Return mock records
