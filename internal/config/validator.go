@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,37 +21,39 @@ func NewValidator(cfg *types.MigrationConfig) *ConfigValidator {
 	}
 }
 
-func ApplyDefaults(cfg *types.MigrationConfig) {
-	if cfg.Global.CheckpointDir == "" {
-		cfg.Global.CheckpointDir = "./checkpoints"
+func ApplyDefaults(cfg *types.MigrationConfig) *types.MigrationConfig {
+	newCfg := *cfg
+	if newCfg.Global.CheckpointDir == "" {
+		newCfg.Global.CheckpointDir = "./checkpoints"
 	}
-	if cfg.Global.ReportDir == "" {
-		cfg.Global.ReportDir = "./reports"
+	if newCfg.Global.ReportDir == "" {
+		newCfg.Global.ReportDir = "./reports"
 	}
-	if cfg.Migration.ChunkSize == 0 {
-		cfg.Migration.ChunkSize = 10000
+	if newCfg.Migration.ChunkSize == 0 {
+		newCfg.Migration.ChunkSize = 10000
 	}
-	if cfg.Migration.ParallelTasks == 0 {
-		cfg.Migration.ParallelTasks = 4
+	if newCfg.Migration.ParallelTasks == 0 {
+		newCfg.Migration.ParallelTasks = 4
 	}
-	if cfg.Migration.ChunkInterval == 0 {
-		cfg.Migration.ChunkInterval = 100 * time.Millisecond
+	if newCfg.Migration.ChunkInterval == 0 {
+		newCfg.Migration.ChunkInterval = 100 * time.Millisecond
 	}
-	if cfg.Migration.MaxSeriesParallel == 0 {
-		cfg.Migration.MaxSeriesParallel = 2
+	if newCfg.Migration.MaxSeriesParallel == 0 {
+		newCfg.Migration.MaxSeriesParallel = 2
 	}
-	if cfg.Retry.MaxAttempts == 0 {
-		cfg.Retry.MaxAttempts = 3
+	if newCfg.Retry.MaxAttempts == 0 {
+		newCfg.Retry.MaxAttempts = 3
 	}
-	if cfg.Retry.InitialDelay == 0 {
-		cfg.Retry.InitialDelay = 1 * time.Second
+	if newCfg.Retry.InitialDelay == 0 {
+		newCfg.Retry.InitialDelay = 1 * time.Second
 	}
-	if cfg.Retry.MaxDelay == 0 {
-		cfg.Retry.MaxDelay = 60 * time.Second
+	if newCfg.Retry.MaxDelay == 0 {
+		newCfg.Retry.MaxDelay = 60 * time.Second
 	}
-	if cfg.Retry.BackoffMultiplier == 0 {
-		cfg.Retry.BackoffMultiplier = 2.0
+	if newCfg.Retry.BackoffMultiplier == 0 {
+		newCfg.Retry.BackoffMultiplier = 2.0
 	}
+	return &newCfg
 }
 
 func (v *ConfigValidator) Validate() error {
@@ -63,7 +66,7 @@ func (v *ConfigValidator) Validate() error {
 	v.validateInfluxToInfluxSettings()
 
 	if len(v.errors) > 0 {
-		return fmt.Errorf("config validation failed: %v", v.errors)
+		return fmt.Errorf("config validation failed: %w", errors.Join(v.errors...))
 	}
 	return nil
 }
@@ -245,9 +248,10 @@ func (v *ConfigValidator) validateInfluxToInfluxSettings() {
 	}
 	if v.config.InfluxToInflux.QueryMode != "" &&
 		v.config.InfluxToInflux.QueryMode != "single" &&
-		v.config.InfluxToInflux.QueryMode != "batch" {
+		v.config.InfluxToInflux.QueryMode != "batch" &&
+		v.config.InfluxToInflux.QueryMode != "shard-group" {
 		v.errors = append(v.errors, fmt.Errorf(
-			"influx_to_influx.query_mode must be 'single' or 'batch', got '%s'",
+			"influx_to_influx.query_mode must be 'single', 'batch', or 'shard-group', got '%s'",
 			v.config.InfluxToInflux.QueryMode))
 	}
 	if v.config.InfluxToInflux.MaxSeriesPerQuery < 0 {
@@ -256,6 +260,34 @@ func (v *ConfigValidator) validateInfluxToInfluxSettings() {
 			v.config.InfluxToInflux.MaxSeriesPerQuery))
 	}
 	if v.config.InfluxToInflux.MaxSeriesPerQuery > 1000 {
-		v.config.InfluxToInflux.MaxSeriesPerQuery = 1000
+		v.errors = append(v.errors, fmt.Errorf(
+			"influx_to_influx.max_series_per_query exceeds maximum of 1000, got %d",
+			v.config.InfluxToInflux.MaxSeriesPerQuery))
+	}
+
+	// Validate shard_group_config
+	if v.config.InfluxToInflux.ShardGroupConfig != nil {
+		cfg := v.config.InfluxToInflux.ShardGroupConfig
+		if cfg.SeriesBatchSize < 1 {
+			v.errors = append(v.errors, fmt.Errorf(
+				"influx_to_influx.shard_group_config.series_batch_size must be positive, got %d",
+				cfg.SeriesBatchSize))
+		}
+		if cfg.SeriesBatchSize > 1000 {
+			v.errors = append(v.errors, fmt.Errorf(
+				"influx_to_influx.shard_group_config.series_batch_size exceeds maximum of 1000, got %d",
+				cfg.SeriesBatchSize))
+		}
+		if cfg.ShardParallelism < 1 {
+			v.errors = append(v.errors, fmt.Errorf(
+				"influx_to_influx.shard_group_config.shard_parallelism must be at least 1, got %d",
+				cfg.ShardParallelism))
+		}
+		if cfg.ShardParallelism > 10 {
+			v.errors = append(v.errors, fmt.Errorf(
+				"influx_to_influx.shard_group_config.shard_parallelism exceeds maximum of 10, got %d",
+				cfg.ShardParallelism))
+		}
+		// TimeWindow: 0 means use shard group length (valid)
 	}
 }

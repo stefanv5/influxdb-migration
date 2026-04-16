@@ -333,7 +333,7 @@ func TestValidate_DefaultValues(t *testing.T) {
 	}
 
 	// ApplyDefaults must be called before Validate for default value tests
-	ApplyDefaults(cfg)
+	cfg = ApplyDefaults(cfg)
 
 	validator := NewValidator(cfg)
 	validator.Validate()
@@ -368,7 +368,7 @@ func TestApplyDefaults(t *testing.T) {
 		Global: types.GlobalConfig{Name: "test"},
 	}
 
-	ApplyDefaults(cfg)
+	cfg = ApplyDefaults(cfg)
 
 	if cfg.Global.CheckpointDir != "./checkpoints" {
 		t.Errorf("Expected default checkpoint dir, got %s", cfg.Global.CheckpointDir)

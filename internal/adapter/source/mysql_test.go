@@ -373,7 +373,15 @@ func TestBuildMySQLDSN(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildMySQLDSN(&tt.config)
+			// For SSL tests, set the environment variable
+			if tt.config.SSL.Enabled && tt.config.SSL.SkipVerify {
+				t.Setenv("ALLOW_INSECURE_TLS", "1")
+			}
+			result, err := buildMySQLDSN(&tt.config)
+			if err != nil {
+				t.Errorf("buildMySQLDSN() error = %v", err)
+				return
+			}
 			if result != tt.expected {
 				t.Errorf("buildMySQLDSN() = %q, want %q", result, tt.expected)
 			}

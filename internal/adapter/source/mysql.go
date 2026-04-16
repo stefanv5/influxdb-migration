@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -56,7 +58,11 @@ func (a *MySQLAdapter) Connect(ctx context.Context, config map[string]interface{
 		zap.Int("port", cfg.Port),
 		zap.String("database", cfg.Database))
 
-	dsn := buildMySQLDSN(cfg)
+	dsn, err := buildMySQLDSN(cfg)
+	if err != nil {
+		logger.Error("failed to build mysql dsn", zap.Error(err))
+		return err
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		logger.Error("failed to open mysql", zap.Error(err))
@@ -77,9 +83,11 @@ func (a *MySQLAdapter) Connect(ctx context.Context, config map[string]interface{
 	return nil
 }
 
-func buildMySQLDSN(cfg *MySQLConfig) string {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s",
-		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database)
+func buildMySQLDSN(cfg *MySQLConfig) (string, error) {
+	// Use url.UserPassword to properly escape user and password
+	user := url.UserPassword(cfg.User, cfg.Password)
+	host := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	dsn := fmt.Sprintf("%s@tcp(%s)/%s", user, host, cfg.Database)
 
 	if cfg.Charset != "" {
 		dsn += "?charset=" + cfg.Charset
@@ -89,11 +97,14 @@ func buildMySQLDSN(cfg *MySQLConfig) string {
 
 	if cfg.SSL.Enabled {
 		if cfg.SSL.SkipVerify {
+			if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
+				return "", fmt.Errorf("insecure TLS requires ALLOW_INSECURE_TLS=1 environment variable")
+			}
 			dsn += "&tls=skip-verify"
 		}
 	}
 
-	return dsn
+	return dsn, nil
 }
 
 func (a *MySQLAdapter) Disconnect(ctx context.Context) error {
@@ -136,6 +147,16 @@ func (a *MySQLAdapter) DiscoverTables(ctx context.Context) ([]string, error) {
 }
 
 func (a *MySQLAdapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
+	return []string{measurement}, nil
+}
+
+// DiscoverShardGroups returns an error since MySQL is not a sharded time-series database
+func (a *MySQLAdapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
+	return nil, fmt.Errorf("DiscoverShardGroups is not supported for MySQL source")
+}
+
+// DiscoverSeriesInTimeWindow returns the measurement itself as a single series
+func (a *MySQLAdapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
 	return []string{measurement}, nil
 }
 
@@ -252,7 +273,9 @@ func (a *MySQLAdapter) QueryData(ctx context.Context, table string, lastCheckpoi
 
 // QueryDataBatch is not supported for MySQL adapter.
 // Batch series query is only available for InfluxDB sources.
-func (a *MySQLAdapter) QueryDataBatch(ctx context.Context, table string, series []string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
+func (a *MySQLAdapter) QueryDataBatch(ctx context.Context, table string, series []string,
+	startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
+	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	return nil, fmt.Errorf("QueryDataBatch is not supported for MySQL adapter, use QueryData instead")
 }
 
