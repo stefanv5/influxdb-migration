@@ -13,6 +13,8 @@ A high-performance, multi-source migration tool for transferring data between In
 - **Comprehensive Logging**: Structured logging with rotation support
 - **Retry Mechanism**: Automatic retry with exponential backoff
 - **Batch Series Query**: InfluxDB→InfluxDB migrations query multiple series per request for improved performance
+- **Shard-Group Aware Migration**: Memory-efficient migration using InfluxDB shard boundaries to avoid OOM
+- **V2 Tag Preservation**: Correctly preserves tags when migrating from InfluxDB v2 sources
 - **SSL/TLS Support**: Secure connections to InfluxDB with configurable certificate verification
 
 ## Architecture
@@ -118,9 +120,15 @@ tasks:
 | `chunk_size` | int | `10000` | Records per chunk |
 | `chunk_interval` | duration | `100ms` | Interval between chunks |
 
-### InfluxDB to InfluxDB Batch Query Mode
+### InfluxDB to InfluxDB Migration Modes
 
-For InfluxDB → InfluxDB migrations, batch series query mode can significantly improve performance by querying multiple series in a single request using OR拼接.
+For InfluxDB → InfluxDB migrations, the tool supports three query modes:
+
+### Single Mode (default)
+Queries one series at a time with timestamp-based pagination.
+
+### Batch Mode
+Queries multiple series in a single request using OR拼接 for improved performance.
 
 ```yaml
 influx_to_influx:
@@ -129,10 +137,28 @@ influx_to_influx:
   max_series_per_query: 100      # default: 100, max: 1000
 ```
 
+### Shard-Group Mode (recommended for large datasets)
+Queries InfluxDB for shard group metadata to discover series **per shard group per time window**, avoiding OOM issues without LIMIT/OFFSET. Provides precise crash recovery at shard group + time window + batch level.
+
+```yaml
+influx_to_influx:
+  enabled: true
+  query_mode: "shard-group"     # "single" | "batch" | "shard-group"
+  max_series_per_query: 100
+  shard_group_config:
+    enabled: true
+    series_batch_size: 50         # series per batch within time window
+    shard_parallelism: 1         # process shard groups sequentially
+    time_window: 0              # 0 = use shard group length; e.g., 168h for weekly
+```
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `query_mode` | string | `"single"` | Query mode: `"single"` (one series per query) or `"batch"` (multiple series per query) |
-| `max_series_per_query` | int | `100` | Maximum series to query in a single request (only for batch mode) |
+| `query_mode` | string | `"single"` | Query mode: `"single"`, `"batch"`, or `"shard-group"` |
+| `max_series_per_query` | int | `100` | Maximum series to query in a single request |
+| `series_batch_size` | int | `50` | Series per batch within time window (shard-group mode) |
+| `shard_parallelism` | int | `1` | Number of shard groups to process in parallel |
+| `time_window` | duration | `0` | Time window duration (0 = use shard group length) |
 
 **Batch mode benefits:**
 - Reduces query count from N (number of series) to N/max_series_per_query
@@ -140,6 +166,11 @@ influx_to_influx:
 - Uses Flux `|> filter(fn: (r) => (r.tag == "v1") or (r.tag == "v2")` for V2
 - Supports pagination for large result sets
 - Persists checkpoint after each batch for crash recovery
+
+**Shard-group mode benefits:**
+- Memory bounded by series_batch_size, not total series count
+- Precise recovery at shard group + time window + batch granularity
+- Automatically aligns with InfluxDB's shard boundaries
 
 ## Source Adapters
 
@@ -259,6 +290,32 @@ Features:
 
 ### InfluxDB Target
 
+#### InfluxDB v1 Target
+
+```yaml
+targets:
+  influxdb:
+    - name: "target-influx"
+      type: "influxdb-v1"
+      influxdb:
+        version: 1
+        url: "https://localhost:8086"
+        database: "metrics"
+        retention_policy: "autogen"    # optional: specify retention policy
+        basic_auth:
+          username: "admin"
+          password: "${INFLUX_PASSWORD}"
+      ssl:
+        enabled: true
+        skip_verify: false
+```
+
+Features:
+- Supports `retention_policy` configuration
+- Line Protocol for efficient writes
+
+#### InfluxDB v2 Target
+
 ```yaml
 targets:
   influxdb:
@@ -287,10 +344,12 @@ targets:
 | InfluxDB v2 | MySQL | ✅ Supported | |
 | InfluxDB v1 | TDengine | ✅ Supported | |
 | InfluxDB v2 | TDengine | ✅ Supported | |
-| InfluxDB v1 | InfluxDB v1 | ✅ Supported | Batch series query mode |
-| InfluxDB v2 | InfluxDB v2 | ✅ Supported | Batch series query mode |
-| MySQL | TDengine | Planned | |
-| TDengine | MySQL | Planned | |
+| InfluxDB v1 | InfluxDB v1 | ✅ Supported | Single/Batch/Shard-group modes |
+| InfluxDB v2 | InfluxDB v2 | ✅ Supported | Single/Batch/Shard-group modes |
+| MySQL | TDengine | ✅ Supported | |
+| TDengine | MySQL | ✅ Supported | |
+| MySQL | MySQL | ✅ Supported | |
+| TDengine | TDengine | ✅ Supported | |
 
 ## Checkpoint System
 
