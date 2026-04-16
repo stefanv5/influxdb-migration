@@ -325,6 +325,9 @@ func (e *MigrationEngine) worker(ctx context.Context, workerID int) {
 
 func (e *MigrationEngine) runTask(ctx context.Context, task *MigrationTask) error {
 	// Check if batch mode is enabled for InfluxToInflux
+	if e.config.InfluxToInflux.Enabled && e.config.InfluxToInflux.QueryMode == "shard-group" {
+		return e.runTaskShardGroupMode(ctx, task)
+	}
 	if e.config.InfluxToInflux.Enabled && e.config.InfluxToInflux.QueryMode == "batch" {
 		return e.runTaskBatchMode(ctx, task)
 	}
@@ -540,6 +543,20 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		zap.Int("batch_size", batchSize),
 		zap.Int("total_batches", len(batches)))
 
+	// Parse time range from mapping config, with defaults
+	startTime := time.Now().Add(-24 * time.Hour)
+	endTime := time.Now()
+	if task.Mapping.TimeRange.Start != "" {
+		if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.Start); err == nil {
+			startTime = parsed
+		}
+	}
+	if task.Mapping.TimeRange.End != "" {
+		if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.End); err == nil {
+			endTime = parsed
+		}
+	}
+
 	// Process each batch
 	queryCfg := &types.QueryConfig{
 		BatchSize:        e.config.Migration.ChunkSize,
@@ -557,6 +574,8 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 			ctx,
 			task.Mapping.SourceTable,
 			batch,
+			startTime,
+			endTime,
 			lastCheckpoint,
 			func(records []types.Record) error {
 				if len(records) == 0 {
@@ -596,6 +615,279 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 	}
 	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
 		logger.Warn("failed to mark task completed", zap.Error(err))
+	}
+
+	return nil
+}
+
+func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *MigrationTask) error {
+	logger.Info("starting shard-group mode task",
+		zap.String("task_id", task.ID),
+		zap.String("source_table", task.Mapping.SourceTable),
+		zap.String("target_measurement", task.Mapping.TargetMeasurement))
+
+	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
+	if err != nil {
+		return fmt.Errorf("failed to get source adapter: %w", err)
+	}
+
+	sourceConfig := e.getSourceConfig(task.SourceAdapter)
+	if err := sourceAdapter.Connect(ctx, sourceConfig); err != nil {
+		return fmt.Errorf("failed to connect to source: %w", err)
+	}
+	defer sourceAdapter.Disconnect(ctx)
+
+	targetAdapter, err := e.targetRegistry.GetTargetAdapter(task.TargetAdapter)
+	if err != nil {
+		return fmt.Errorf("failed to get target adapter: %w", err)
+	}
+
+	targetConfig := e.getTargetConfig(task.TargetAdapter)
+	if err := targetAdapter.Connect(ctx, targetConfig); err != nil {
+		return fmt.Errorf("failed to connect to target: %w", err)
+	}
+	defer targetAdapter.Disconnect(ctx)
+
+	// Discover shard groups
+	shardGroups, err := sourceAdapter.DiscoverShardGroups(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to discover shard groups: %w", err)
+	}
+
+	if len(shardGroups) == 0 {
+		logger.Info("no shard groups found",
+			zap.String("task_id", task.ID))
+		return nil
+	}
+
+	logger.Info("discovered shard groups",
+		zap.String("task_id", task.ID),
+		zap.Int("count", len(shardGroups)))
+
+	// Determine query time range
+	queryStart := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	queryEnd := time.Now()
+	if task.Mapping.TimeRange.Start != "" {
+		if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.Start); err == nil {
+			queryStart = parsed
+		}
+	}
+	if task.Mapping.TimeRange.End != "" {
+		if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.End); err == nil {
+			queryEnd = parsed
+		}
+	}
+
+	// Filter shard groups that overlap with query time range
+	var relevantGroups []*adapter.ShardGroup
+	for _, sg := range shardGroups {
+		if ShardGroupOverlaps(sg, queryStart, queryEnd) {
+			relevantGroups = append(relevantGroups, sg)
+		}
+	}
+
+	if len(relevantGroups) == 0 {
+		logger.Info("no relevant shard groups in time range",
+			zap.String("task_id", task.ID))
+		return nil
+	}
+
+	logger.Info("relevant shard groups in time range",
+		zap.String("task_id", task.ID),
+		zap.Int("count", len(relevantGroups)))
+
+	// Process each shard group
+	for _, sg := range relevantGroups {
+		if err := e.migrateShardGroup(ctx, task, sg, sourceAdapter, targetAdapter, queryStart, queryEnd); err != nil {
+			return fmt.Errorf("shard group %d migration failed: %w", sg.ID, err)
+		}
+	}
+
+	logger.Info("shard-group mode task completed",
+		zap.String("task_id", task.ID),
+		zap.Int("shard_groups_processed", len(relevantGroups)))
+
+	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
+		logger.Warn("failed to mark task completed", zap.Error(err))
+	}
+
+	return nil
+}
+
+func (e *MigrationEngine) migrateShardGroup(ctx context.Context, task *MigrationTask, sg *adapter.ShardGroup, sourceAdapter adapter.SourceAdapter, targetAdapter adapter.TargetAdapter, queryStart, queryEnd time.Time) error {
+	start, end := ShardGroupEffectiveTimeRange(sg, queryStart, queryEnd)
+
+	logger.Info("migrating shard group",
+		zap.Int("shard_id", sg.ID),
+		zap.String("start", start.Format(time.RFC3339)),
+		zap.String("end", end.Format(time.RFC3339)))
+
+	// Determine time window duration
+	timeWindow := time.Duration(0)
+	if e.config.InfluxToInflux.ShardGroupConfig != nil {
+		timeWindow = e.config.InfluxToInflux.ShardGroupConfig.TimeWindow
+	}
+	if timeWindow == 0 {
+		// Use shard group length as default
+		timeWindow = end.Sub(start)
+	}
+
+	// Split into time windows
+	windows := SplitTimeWindows(start, end, timeWindow)
+
+	logger.Info("time windows for shard group",
+		zap.Int("shard_id", sg.ID),
+		zap.Int("window_count", len(windows)),
+		zap.Duration("window_duration", timeWindow))
+
+	// Process each time window
+	for _, window := range windows {
+		if err := e.migrateTimeWindow(ctx, task, sg, window, sourceAdapter, targetAdapter); err != nil {
+			return fmt.Errorf("time window [%s, %s) migration failed: %w",
+				window.Start.Format(time.RFC3339), window.End.Format(time.RFC3339), err)
+		}
+	}
+
+	if err := e.checkpointMgr.MarkShardGroupCompleted(ctx, task.ID, fmt.Sprintf("%d", sg.ID)); err != nil {
+		logger.Warn("failed to mark shard group completed", zap.Error(err))
+	}
+
+	logger.Info("shard group migration completed",
+		zap.Int("shard_id", sg.ID))
+
+	return nil
+}
+
+func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *MigrationTask, sg *adapter.ShardGroup, window TimeWindow, sourceAdapter adapter.SourceAdapter, targetAdapter adapter.TargetAdapter) error {
+	// Load existing checkpoint for this window
+	cp, err := e.checkpointMgr.LoadShardGroupCheckpointForWindow(ctx,
+		task.ID, fmt.Sprintf("%d", sg.ID), window.Start.UnixNano(), window.End.UnixNano())
+	if err != nil {
+		return fmt.Errorf("failed to load shard group checkpoint: %w", err)
+	}
+
+	// Skip windows that are already completed
+	if cp != nil && cp.Status == types.StatusCompleted {
+		logger.Debug("window already completed, skipping",
+			zap.Int("shard_id", sg.ID),
+			zap.String("window_start", window.Start.Format(time.RFC3339)))
+		return nil
+	}
+
+	// Initialize to -1 so batch 0 is not skipped when no checkpoint exists
+	lastBatchIdx := -1
+	var lastTimestamp int64
+	var totalProcessed int64
+	if cp != nil && cp.Status == types.StatusInProgress {
+		lastBatchIdx = cp.LastCompletedBatch
+		lastTimestamp = cp.LastTimestamp
+		totalProcessed = cp.TotalProcessedRows
+	}
+
+	// Discover series in this time window
+	series, err := sourceAdapter.DiscoverSeriesInTimeWindow(ctx,
+		task.Mapping.SourceTable, window.Start, window.End)
+	if err != nil {
+		return fmt.Errorf("failed to discover series: %w", err)
+	}
+
+	// Apply tag filters if specified
+	if len(task.Mapping.TagFilters) > 0 {
+		filteredSeries := make([]string, 0, len(series))
+		for _, s := range series {
+			if e.matchTagFilters(s, task.Mapping.TagFilters) {
+				filteredSeries = append(filteredSeries, s)
+			}
+		}
+		series = filteredSeries
+	}
+
+	if len(series) == 0 {
+		logger.Debug("no series found in time window",
+			zap.Int("shard_id", sg.ID),
+			zap.String("window_start", window.Start.Format(time.RFC3339)))
+		return nil
+	}
+
+	// Partition into batches
+	batchSize := e.config.InfluxToInflux.MaxSeriesPerQuery
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	batches := PartitionSeries(series, batchSize)
+
+	logger.Info("processing time window",
+		zap.Int("shard_id", sg.ID),
+		zap.String("window_start", window.Start.Format(time.RFC3339)),
+		zap.String("window_end", window.End.Format(time.RFC3339)),
+		zap.Int("total_series", len(series)),
+		zap.Int("total_batches", len(batches)),
+		zap.Int("starting_from_batch", lastBatchIdx+1))
+
+	// Process each batch
+	for batchIdx, batch := range batches {
+		// Check for context cancellation between batches
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if batchIdx <= lastBatchIdx {
+			logger.Debug("skipping completed batch",
+				zap.Int("batch_idx", batchIdx),
+				zap.Int("last_completed", lastBatchIdx))
+			continue
+		}
+
+		batchCheckpoint, err := sourceAdapter.QueryDataBatch(ctx,
+			task.Mapping.SourceTable,
+			batch,
+			window.Start,
+			window.End,
+			&types.Checkpoint{LastTimestamp: lastTimestamp},
+			func(records []types.Record) error {
+				return e.processBatch(ctx, task.Mapping, records, targetAdapter)
+			},
+			&types.QueryConfig{BatchSize: e.config.Migration.ChunkSize},
+		)
+		if err != nil {
+			return fmt.Errorf("batch %d failed: %w", batchIdx, err)
+		}
+
+		if batchCheckpoint != nil {
+			lastTimestamp = batchCheckpoint.LastTimestamp
+			totalProcessed += batchCheckpoint.ProcessedRows
+		}
+
+		sgCP := &types.ShardGroupCheckpoint{
+			TaskID:              task.ID,
+			ShardGroupID:        fmt.Sprintf("%d", sg.ID),
+			WindowStart:         window.Start.UnixNano(),
+			WindowEnd:           window.End.UnixNano(),
+			LastCompletedBatch:  batchIdx,
+			LastTimestamp:       lastTimestamp,
+			TotalProcessedRows:  totalProcessed,
+			Status:              types.StatusInProgress,
+		}
+		if err := e.checkpointMgr.SaveShardGroupCheckpoint(ctx, sgCP); err != nil {
+			logger.Warn("failed to save shard group checkpoint", zap.Error(err))
+		}
+	}
+
+	// Mark window as completed after all batches processed successfully
+	sgCP := &types.ShardGroupCheckpoint{
+		TaskID:              task.ID,
+		ShardGroupID:        fmt.Sprintf("%d", sg.ID),
+		WindowStart:         window.Start.UnixNano(),
+		WindowEnd:           window.End.UnixNano(),
+		LastCompletedBatch:  len(batches) - 1,
+		LastTimestamp:       lastTimestamp,
+		TotalProcessedRows:  totalProcessed,
+		Status:              types.StatusCompleted,
+	}
+	if err := e.checkpointMgr.SaveShardGroupCheckpoint(ctx, sgCP); err != nil {
+		logger.Warn("failed to save window completed checkpoint", zap.Error(err))
 	}
 
 	return nil
@@ -700,6 +992,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 			timer.Stop()
 			return nil, ctx.Err()
 		case <-timer.C:
+			timer.Stop()
 		}
 	}
 
