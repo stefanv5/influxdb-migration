@@ -386,6 +386,21 @@ func decodeInfluxV1TargetConfig(config map[string]interface{}, cfg interface{}) 
 		}
 	}
 
+	// SSL configuration
+	if sslMap, ok := cfgMap["ssl"].(map[string]interface{}); ok {
+		cfg.(*InfluxDBV1TargetConfig).SSL.Enabled, _ = sslMap["enabled"].(bool)
+		cfg.(*InfluxDBV1TargetConfig).SSL.SkipVerify, _ = sslMap["skip_verify"].(bool)
+		if v, ok := sslMap["ca_cert"].(string); ok {
+			cfg.(*InfluxDBV1TargetConfig).SSL.CaCert = v
+		}
+		if v, ok := sslMap["client_cert"].(string); ok {
+			cfg.(*InfluxDBV1TargetConfig).SSL.ClientCert = v
+		}
+		if v, ok := sslMap["client_key"].(string); ok {
+			cfg.(*InfluxDBV1TargetConfig).SSL.ClientKey = v
+		}
+	}
+
 	return nil
 }
 
@@ -658,6 +673,21 @@ func decodeInfluxV2TargetConfig(config map[string]interface{}, cfg interface{}) 
 	}
 	if v, ok := cfgMap["bucket"].(string); ok {
 		cfg.(*InfluxDBV2TargetConfig).Bucket = v
+	}
+
+	// SSL configuration
+	if sslMap, ok := cfgMap["ssl"].(map[string]interface{}); ok {
+		cfg.(*InfluxDBV2TargetConfig).SSL.Enabled, _ = sslMap["enabled"].(bool)
+		cfg.(*InfluxDBV2TargetConfig).SSL.SkipVerify, _ = sslMap["skip_verify"].(bool)
+		if v, ok := sslMap["ca_cert"].(string); ok {
+			cfg.(*InfluxDBV2TargetConfig).SSL.CaCert = v
+		}
+		if v, ok := sslMap["client_cert"].(string); ok {
+			cfg.(*InfluxDBV2TargetConfig).SSL.ClientCert = v
+		}
+		if v, ok := sslMap["client_key"].(string); ok {
+			cfg.(*InfluxDBV2TargetConfig).SSL.ClientKey = v
+		}
 	}
 
 	return nil

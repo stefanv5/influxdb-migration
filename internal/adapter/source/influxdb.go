@@ -264,12 +264,10 @@ func (a *InfluxDBV1Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter
 }
 
 func (a *InfluxDBV1Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
-	query := fmt.Sprintf(`
-		SHOW SERIES FROM %s
-		WHERE time >= '%s' AND time < '%s'`,
-		influxQuoteIdentifier(measurement),
-		startTime.Format(time.RFC3339Nano),
-		endTime.Format(time.RFC3339Nano))
+	// Note: InfluxDB SHOW SERIES does not support time-based WHERE filtering.
+	// The time parameters are accepted for interface compatibility but ignored.
+	// All series for the measurement are returned.
+	query := fmt.Sprintf(`SHOW SERIES FROM %s`, influxQuoteIdentifier(measurement))
 
 	series, err := a.executeShowSeries(ctx, query)
 	if err != nil {
@@ -279,11 +277,27 @@ func (a *InfluxDBV1Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, meas
 	return series, nil
 }
 
-// DiscoverTagKeys returns nil for V1 adapter.
-// V1 uses column headers from SELECT results to distinguish tags from fields,
-// so no prior tag key discovery is needed.
+// DiscoverTagKeys returns tag keys for V1 adapter using SHOW TAG KEYS.
+// This allows proper distinction between tags and fields when parsing query results.
 func (a *InfluxDBV1Adapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
-	return nil, nil
+	query := fmt.Sprintf("SHOW TAG KEYS FROM %s", influxQuoteIdentifier(measurement))
+	results, err := a.executeQuery(ctx, query)
+	if err != nil {
+		logger.Warn("SHOW TAG KEYS failed for V1 adapter", zap.String("measurement", measurement), zap.Error(err))
+		return nil, nil
+	}
+
+	var tagKeys []string
+	for _, result := range results {
+		for _, values := range result.Values {
+			if len(values) > 0 {
+				if key, ok := values[0].(string); ok {
+					tagKeys = append(tagKeys, key)
+				}
+			}
+		}
+	}
+	return tagKeys, nil
 }
 
 func (a *InfluxDBV1Adapter) executeShowSeries(ctx context.Context, query string) ([]string, error) {
@@ -405,11 +419,8 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 
 		maxTS := records[len(records)-1].Time
 		lastTS = maxTS
-		if maxTS < math.MaxInt64 {
-			startTime = fmt.Sprintf("%d", maxTS+1)
-		} else {
-			startTime = fmt.Sprintf("%d", maxTS)
-		}
+		// Use RFC3339Nano format consistently for time-based pagination
+		startTime = time.Unix(0, maxTS+1).Format(time.RFC3339Nano)
 
 		logger.Debug("fetched batch from InfluxDB V1",
 			zap.String("measurement", measurement),
@@ -1158,20 +1169,18 @@ func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter
 	for _, s := range result.Shards {
 		shardGroups = append(shardGroups, &adapter.ShardGroup{
 			ID:        s.ID,
-			StartTime: time.Unix(0, s.StartTime),
-			EndTime:   time.Unix(0, s.EndTime),
+			StartTime: time.Unix(s.StartTime, 0),
+			EndTime:   time.Unix(s.EndTime, 0),
 		})
 	}
 	return shardGroups, nil
 }
 
 func (a *InfluxDBV2Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
-	// Use V1 compatibility API: SHOW SERIES with time filtering
-	query := fmt.Sprintf(
-		"SHOW SERIES FROM %s WHERE time >= '%s' AND time < '%s'",
-		influxQuoteIdentifier(measurement),
-		startTime.Format(time.RFC3339Nano),
-		endTime.Format(time.RFC3339Nano))
+	// Note: InfluxDB SHOW SERIES does not support time-based WHERE filtering.
+	// The time parameters are accepted for interface compatibility but ignored.
+	// All series for the measurement are returned.
+	query := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
 
 	result, err := a.executeV1Query(ctx, query)
 	if err != nil {

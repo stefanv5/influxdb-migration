@@ -196,6 +196,21 @@ func (v *ConfigValidator) validateTargets() {
 			v.errors = append(v.errors, fmt.Errorf(
 				"target %s: type must be influxdb-v1, influxdb-v2, mysql, or tdengine", tgt.Name))
 		}
+
+		v.validateTargetSSL(tgt)
+	}
+}
+
+func (v *ConfigValidator) validateTargetSSL(tgt types.TargetConfig) {
+	if !tgt.SSL.Enabled {
+		return
+	}
+
+	switch tgt.Type {
+	case "influxdb-v1", "influxdb-v2":
+		if len(tgt.InfluxDB.URL) >= 5 && !strings.HasPrefix(tgt.InfluxDB.URL, "https") {
+			v.errors = append(v.errors, fmt.Errorf("target %s: influxdb URL must use https when SSL is enabled", tgt.Name))
+		}
 	}
 }
 

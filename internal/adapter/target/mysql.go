@@ -20,12 +20,13 @@ type MySQLTargetAdapter struct {
 }
 
 type MySQLTargetConfig struct {
-	Host     string
-	Port     int
-	Username string
-	Password string
-	Database string
-	SSL      types.SSLConfig
+	Host           string
+	Port           int
+	Username       string
+	Password       string
+	Database       string
+	SSL            types.SSLConfig
+	ConnectTimeout time.Duration // Connection timeout for Connect operation
 }
 
 func init() {
@@ -66,7 +67,15 @@ func (a *MySQLTargetAdapter) Connect(ctx context.Context, config map[string]inte
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(1 * time.Hour)
 
-	if err := db.PingContext(ctx); err != nil {
+	// Use timeout context for connection if configured
+	connectCtx := ctx
+	var cancel context.CancelFunc
+	if cfg.ConnectTimeout > 0 {
+		connectCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+		defer cancel()
+	}
+
+	if err := db.PingContext(connectCtx); err != nil {
 		logger.Error("mysql target ping failed", zap.Error(err))
 		return fmt.Errorf("failed to ping mysql: %w", err)
 	}
@@ -179,7 +188,9 @@ func (a *MySQLTargetAdapter) buildInsertSQL(record types.Record) ([]string, stri
 	var placeholders []string
 	var updateColumns []string
 
-	columns = append(columns, "timestamp")
+	// Use internal timestamp column name
+	internalTSCol := "_migration_time"
+	columns = append(columns, internalTSCol)
 	placeholders = append(placeholders, "?")
 
 	for key := range record.Tags {
@@ -205,9 +216,10 @@ func (a *MySQLTargetAdapter) buildInsertSQL(record types.Record) ([]string, stri
 
 func (a *MySQLTargetAdapter) recordToValues(record types.Record, columns []string) ([]interface{}, error) {
 	values := make([]interface{}, 0, len(columns))
+	internalTSCol := "_migration_time"
 
 	for _, col := range columns {
-		if col == "timestamp" {
+		if col == internalTSCol {
 			if record.Time != 0 {
 				t := time.Unix(0, record.Time)
 				values = append(values, t.Format("2006-01-02 15:04:05.000"))
@@ -282,7 +294,10 @@ func (a *MySQLTargetAdapter) buildCreateTableDDL(schema *types.Schema) (string, 
 
 	columns = append(columns, "id BIGINT AUTO_INCREMENT PRIMARY KEY")
 
-	uniqueKeyCols = append(uniqueKeyCols, "timestamp")
+	// Use internal_time column name to avoid conflicts with user-defined columns
+	// The actual timestamp value will be stored in this column
+	internalTSCol := "_migration_time"
+	uniqueKeyCols = append(uniqueKeyCols, internalTSCol)
 
 	for _, tag := range schema.Tags {
 		colName := tag.TargetName
@@ -302,7 +317,7 @@ func (a *MySQLTargetAdapter) buildCreateTableDDL(schema *types.Schema) (string, 
 		columns = append(columns, fmt.Sprintf("%s %s", quoteIdentifier(colName), colType))
 	}
 
-	columns = append(columns, "timestamp DATETIME(3) NOT NULL")
+	columns = append(columns, fmt.Sprintf("%s DATETIME(3) NOT NULL", internalTSCol))
 	columns = append(columns, fmt.Sprintf("UNIQUE KEY uk_identity (%s)", strings.Join(uniqueKeyCols, ", ")))
 
 	tableName := quoteIdentifier(schema.Measurement)
@@ -352,6 +367,28 @@ func decodeMySQLTargetConfig(config map[string]interface{}, cfg interface{}) err
 	}
 	if v, ok := cfgMap["database"].(string); ok {
 		cfg.(*MySQLTargetConfig).Database = v
+	}
+
+	// Connection timeout (e.g., "10s")
+	if v, ok := cfgMap["connect_timeout"].(string); ok {
+		if duration, err := time.ParseDuration(v); err == nil {
+			cfg.(*MySQLTargetConfig).ConnectTimeout = duration
+		}
+	}
+
+	// SSL configuration
+	if sslMap, ok := cfgMap["ssl"].(map[string]interface{}); ok {
+		cfg.(*MySQLTargetConfig).SSL.Enabled, _ = sslMap["enabled"].(bool)
+		cfg.(*MySQLTargetConfig).SSL.SkipVerify, _ = sslMap["skip_verify"].(bool)
+		if v, ok := sslMap["ca_cert"].(string); ok {
+			cfg.(*MySQLTargetConfig).SSL.CaCert = v
+		}
+		if v, ok := sslMap["client_cert"].(string); ok {
+			cfg.(*MySQLTargetConfig).SSL.ClientCert = v
+		}
+		if v, ok := sslMap["client_key"].(string); ok {
+			cfg.(*MySQLTargetConfig).SSL.ClientKey = v
+		}
 	}
 
 	return nil

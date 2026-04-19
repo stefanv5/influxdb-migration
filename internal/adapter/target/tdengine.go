@@ -536,5 +536,20 @@ func decodeTDengineTargetConfig(config map[string]interface{}, cfg interface{}) 
 		cfg.(*TDengineTargetConfig).Version = v
 	}
 
+	// SSL configuration
+	if sslMap, ok := cfgMap["ssl"].(map[string]interface{}); ok {
+		cfg.(*TDengineTargetConfig).SSL.Enabled, _ = sslMap["enabled"].(bool)
+		cfg.(*TDengineTargetConfig).SSL.SkipVerify, _ = sslMap["skip_verify"].(bool)
+		if v, ok := sslMap["ca_cert"].(string); ok {
+			cfg.(*TDengineTargetConfig).SSL.CaCert = v
+		}
+		if v, ok := sslMap["client_cert"].(string); ok {
+			cfg.(*TDengineTargetConfig).SSL.ClientCert = v
+		}
+		if v, ok := sslMap["client_key"].(string); ok {
+			cfg.(*TDengineTargetConfig).SSL.ClientKey = v
+		}
+	}
+
 	return nil
 }

@@ -46,6 +46,10 @@ type ShardGroupCheckpoint struct {
 	LastTimestamp       int64            `json:"last_timestamp"`        // max timestamp of last batch
 	TotalProcessedRows  int64            `json:"total_processed_rows"`
 	Status              CheckpointStatus `json:"status"`
+	// LastCompletedWindow tracks the window index (0-based) that was last STARTED.
+	// Windows with index <= LastCompletedWindow are marked as completed in SaveShardGroupCheckpoint.
+	// This allows resuming from the correct window after a crash.
+	LastCompletedWindow int              `json:"last_completed_window"`
 }
 
 type MigrationTask struct {

@@ -393,6 +393,21 @@ func decodeTDConfig(config map[string]interface{}, cfg interface{}) error {
 		cfg.(*TDengineConfig).Version = v
 	}
 
+	// SSL configuration (at top level, not inside tdengine block)
+	if sslMap, ok := config["ssl"].(map[string]interface{}); ok {
+		cfg.(*TDengineConfig).SSL.Enabled, _ = sslMap["enabled"].(bool)
+		cfg.(*TDengineConfig).SSL.SkipVerify, _ = sslMap["skip_verify"].(bool)
+		if v, ok := sslMap["ca_cert"].(string); ok {
+			cfg.(*TDengineConfig).SSL.CaCert = v
+		}
+		if v, ok := sslMap["client_cert"].(string); ok {
+			cfg.(*TDengineConfig).SSL.ClientCert = v
+		}
+		if v, ok := sslMap["client_key"].(string); ok {
+			cfg.(*TDengineConfig).SSL.ClientKey = v
+		}
+	}
+
 	return nil
 }
 

@@ -31,23 +31,9 @@ func (m *Manager) CreateCheckpoint(task *types.Checkpoint) error {
 	return m.store.SaveCheckpoint(task)
 }
 
-func (m *Manager) SaveCheckpoint(ctx context.Context, taskID, sourceTable string, lastID int64, lastTS int64, processedRows int64, status types.CheckpointStatus) error {
+func (m *Manager) SaveCheckpoint(ctx context.Context, cp *types.Checkpoint) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	cp, err := m.store.LoadCheckpoint(taskID, sourceTable)
-	if err != nil {
-		return err
-	}
-	if cp == nil {
-		return fmt.Errorf("checkpoint not found for task %s, table %s", taskID, sourceTable)
-	}
-
-	cp.LastID = lastID
-	cp.LastTimestamp = lastTS
-	cp.ProcessedRows = processedRows
-	cp.Status = status
-
 	return m.store.SaveCheckpoint(cp)
 }
 
