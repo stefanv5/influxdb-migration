@@ -104,6 +104,21 @@ func (v *ConfigValidator) validateSources() {
 			if src.InfluxDB.URL == "" {
 				v.errors = append(v.errors, fmt.Errorf("source %s: influxdb URL is required", src.Name))
 			}
+			// For V2 source using V1 compatibility API, username/password are required
+			if src.InfluxDB.Version == "2" {
+				if src.InfluxDB.Username == "" {
+					v.errors = append(v.errors, fmt.Errorf("source %s: influxdb username is required for V2 source", src.Name))
+				}
+				if src.InfluxDB.Password == "" {
+					v.errors = append(v.errors, fmt.Errorf("source %s: influxdb password is required for V2 source", src.Name))
+				}
+			}
+			// For V1 source or V2 source using native API, token/org may be needed
+			if src.InfluxDB.Version == "1" {
+				if src.InfluxDB.Username == "" && src.InfluxDB.Token == "" {
+					// V1 can work with just URL, username/password optional
+				}
+			}
 		case "mysql":
 			if src.Host == "" {
 				v.errors = append(v.errors, fmt.Errorf("source %s: mysql host is required", src.Name))

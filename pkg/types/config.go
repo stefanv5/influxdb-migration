@@ -137,11 +137,14 @@ type TDengineConfig struct {
 }
 
 type InfluxDBConfig struct {
-	Version string `mapstructure:"version"`
-	URL     string `mapstructure:"url"`
-	Token   string `mapstructure:"token"`
-	Org     string `mapstructure:"org"`
-	Bucket  string `mapstructure:"bucket"`
+	Version         string `mapstructure:"version"`
+	URL             string `mapstructure:"url"`
+	Token           string `mapstructure:"token"`           // For V2 native API (deprecated for V2 source, use Username/Password)
+	Org             string `mapstructure:"org"`             // For V2 native API (deprecated for V2 source)
+	Bucket          string `mapstructure:"bucket"`
+	Username        string `mapstructure:"username"`        // For V1 compatibility API
+	Password        string `mapstructure:"password"`        // For V1 compatibility API
+	RetentionPolicy string `mapstructure:"retention_policy"` // For V1 compatibility API
 }
 
 type InfluxDBTargetConfig struct {

@@ -36,6 +36,7 @@ type InfluxDBV1Config struct {
 
 type influxV1Result struct {
 	Results []influxV1Series `json:"results"`
+	Error   string           `json:"error"` // V1 API error message
 }
 
 type influxV1Series struct {
@@ -507,18 +508,32 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, err
+		// resp may be non-nil even when err is set (e.g., redirect error)
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		return nil, fmt.Errorf("V1 select query request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read V1 response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("V1 query failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result influxV1Result
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal result: %w", err)
+	}
+
+	// Check for V1 API-level errors
+	if result.Error != "" {
+		return nil, fmt.Errorf("V1 query error: %s", result.Error)
 	}
 
 	var records []types.Record
@@ -601,18 +616,28 @@ func (a *InfluxDBV1Adapter) executeQuery(ctx context.Context, query string) ([]i
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, err
+		// resp may be non-nil even when err is set (e.g., redirect error)
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		return nil, fmt.Errorf("V1 query request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read V1 response body: %w", err)
 	}
 
 	var result influxV1Result
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
+	}
+
+	// Check for V1 API-level errors
+	if result.Error != "" {
+		return nil, fmt.Errorf("V1 query error: %s", result.Error)
 	}
 
 	var series []influxV1Series
@@ -653,11 +678,14 @@ type InfluxDBV2Adapter struct {
 }
 
 type InfluxDBV2Config struct {
-	URL    string
-	Token  string
-	Org    string
-	Bucket string
-	SSL    types.SSLConfig
+	URL             string
+	Token          string
+	Org            string
+	Bucket         string
+	Username       string // V1 compatibility API credentials
+	Password       string
+	RetentionPolicy string // V1 compatibility RP
+	SSL            types.SSLConfig
 }
 
 type fluxRecord struct {
@@ -715,50 +743,164 @@ func (a *InfluxDBV2Adapter) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-func (a *InfluxDBV2Adapter) Ping(ctx context.Context) error {
-	u, err := url.Parse(a.config.URL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
+// buildV1URL returns the V1 compatibility API URL
+func (a *InfluxDBV2Adapter) buildV1URL() string {
+	baseURL := a.config.URL
+	if !strings.HasSuffix(baseURL, "/") {
+		baseURL += "/"
 	}
-	u.Path = "/api/v2"
+	return baseURL + "query"
+}
+
+// buildV1QueryParams builds query parameters for V1 compatibility API
+func (a *InfluxDBV2Adapter) buildV1QueryParams(query string) url.Values {
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("db", a.config.Bucket)
+	if a.config.RetentionPolicy != "" {
+		params.Set("rp", a.config.RetentionPolicy)
+	}
+	params.Set("u", a.config.Username)
+	params.Set("p", a.config.Password)
+	return params
+}
+
+// executeV1Query executes a query using the V1 compatibility API
+func (a *InfluxDBV2Adapter) executeV1Query(ctx context.Context, query string) (*influxV1Result, error) {
+	params := a.buildV1QueryParams(query)
+	u, err := url.Parse(a.buildV1URL())
+	if err != nil {
+		return nil, fmt.Errorf("invalid V1 API URL: %w", err)
+	}
+	u.RawQuery = params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	req.Header.Set("Authorization", "Token "+a.config.Token)
+
+	logger.Debug("executing V1 compatibility query",
+		zap.String("url", redactURL(u)),
+		zap.String("query", query))
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		// resp may be non-nil even when err is set (e.g., redirect error)
 		if resp != nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
-		return err
+		return nil, fmt.Errorf("V1 query request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ping failed with status: %d", resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read V1 response body: %w", err)
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("V1 query failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result influxV1Result
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse V1 response: %w", err)
+	}
+
+	return &result, nil
+}
+
+// executeV1SelectQuery executes a SELECT query and returns records
+func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query string) ([]types.Record, error) {
+	result, err := a.executeV1Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	var records []types.Record
+	for _, series := range result.Results {
+		for _, values := range series.Values {
+			record := parseV1Values(series.Columns, values)
+			records = append(records, *record)
+		}
+	}
+
+	return records, nil
+}
+
+// parseV1Values parses V1 query result values into a Record
+func parseV1Values(columns []string, values []interface{}) *types.Record {
+	record := types.NewRecord()
+
+	for i, col := range columns {
+		if i >= len(values) {
+			continue
+		}
+
+		val := values[i]
+		if val == nil {
+			continue
+		}
+
+		switch col {
+		case "time":
+			if ts, ok := val.(string); ok {
+				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+					record.Time = t.UnixNano()
+				} else if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					record.Time = t.UnixNano()
+					logger.Warn("timestamp parsed with reduced precision",
+						zap.String("timestamp", ts))
+				} else {
+					logger.Warn("failed to parse timestamp, using 0",
+						zap.String("timestamp_string", ts),
+						zap.Error(err))
+				}
+			}
+		default:
+			switch v := val.(type) {
+			case float64:
+				record.AddField(col, v)
+			case string:
+				record.AddField(col, v)
+			case bool:
+				record.AddField(col, v)
+			case int64:
+				record.AddField(col, v)
+			case int:
+				record.AddField(col, int64(v))
+			}
+		}
+	}
+
+	return record
+}
+
+func (a *InfluxDBV2Adapter) Ping(ctx context.Context) error {
+	// Use V1 compatibility API for ping - "SHOW MEASUREMENTS" is a lightweight query
+	result, err := a.executeV1Query(ctx, "SHOW MEASUREMENTS LIMIT 1")
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return fmt.Errorf("V1 ping failed: empty response")
+	}
 	return nil
 }
 
 func (a *InfluxDBV2Adapter) DiscoverTables(ctx context.Context) ([]string, error) {
-	fluxQuery := fmt.Sprintf(`import "influxdata/influxdb/schema"
-schema.measurements(bucket: "%s")`, a.config.Bucket)
-
-	results, err := a.executeFluxQuery(ctx, fluxQuery)
+	// Use V1 compatibility API: SHOW MEASUREMENTS
+	result, err := a.executeV1Query(ctx, "SHOW MEASUREMENTS")
 	if err != nil {
 		return nil, err
 	}
 
 	var measurements []string
-	for _, r := range results {
-		for _, v := range r {
-			if arr, ok := v.([]interface{}); ok && len(arr) > 0 {
-				if name, ok := arr[0].(string); ok {
+	for _, series := range result.Results {
+		for _, values := range series.Values {
+			if len(values) > 0 {
+				if name, ok := values[0].(string); ok {
 					measurements = append(measurements, name)
 				}
 			}
@@ -771,19 +913,21 @@ schema.measurements(bucket: "%s")`, a.config.Bucket)
 // DiscoverTagKeys returns all tag key names for a measurement.
 // Used to distinguish tags from fields in Flux query results.
 func (a *InfluxDBV2Adapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
-	fluxQuery := fmt.Sprintf(`import "influxdata/influxdb/schema"
-schema.tagKeys(bucket: "%s", measurement: "%s")`, a.config.Bucket, measurement)
-
-	results, err := a.executeFluxQuery(ctx, fluxQuery)
+	// Use V1 compatibility API: SHOW TAG KEYS
+	// This returns tag keys without values, which is sufficient for distinguishing tags from fields
+	query := fmt.Sprintf("SHOW TAG KEYS FROM %s", influxQuoteIdentifier(measurement))
+	result, err := a.executeV1Query(ctx, query)
 	if err != nil {
-		return nil, err
+		// V1 API may not support SHOW TAG KEYS in all cases, return empty
+		logger.Warn("SHOW TAG KEYS failed, returning empty tag keys", zap.Error(err))
+		return nil, nil
 	}
 
 	var tagKeys []string
-	for _, r := range results {
-		for _, v := range r {
-			if arr, ok := v.([]interface{}); ok && len(arr) > 0 {
-				if key, ok := arr[0].(string); ok {
+	for _, seriesData := range result.Results {
+		for _, values := range seriesData.Values {
+			if len(values) > 0 {
+				if key, ok := values[0].(string); ok {
 					tagKeys = append(tagKeys, key)
 				}
 			}
@@ -794,64 +938,25 @@ schema.tagKeys(bucket: "%s", measurement: "%s")`, a.config.Bucket, measurement)
 }
 
 func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
-	// Step 1: Get all tag keys
-	tagKeys, err := a.DiscoverTagKeys(ctx, measurement)
+	// Use V1 compatibility API: SHOW SERIES
+	query := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
+	result, err := a.executeV1Query(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tag keys: %w", err)
+		return nil, err
 	}
 
-	if len(tagKeys) == 0 {
-		// No tags, just return measurement itself
-		return []string{measurement}, nil
-	}
-
-	// Step 2: Get values for each tag key
-	tagValues := make(map[string][]string)
-	for _, key := range tagKeys {
-		valuesQuery := fmt.Sprintf(`import "influxdata/influxdb/schema"
-schema.tagValues(bucket: "%s", tag: "%s", measurement: "%s")`,
-			a.config.Bucket, key, measurement)
-
-		results, err := a.executeFluxQuery(ctx, valuesQuery)
-		if err != nil {
-			logger.Warn("failed to get tag values, skipping", zap.String("tag", key), zap.Error(err))
-			continue
-		}
-
-		for _, r := range results {
-			for _, v := range r {
-				if arr, ok := v.([]interface{}); ok && len(arr) > 0 {
-					if val, ok := arr[0].(string); ok {
-						tagValues[key] = append(tagValues[key], val)
-					}
+	var series []string
+	for _, seriesData := range result.Results {
+		for _, values := range seriesData.Values {
+			if len(values) > 0 {
+				if key, ok := values[0].(string); ok {
+					series = append(series, key)
 				}
 			}
 		}
 	}
 
-	// Step 3: Cartesian product to generate series keys
-	var seriesKeys []string
-	var generate func(idx int, parts []string)
-	generate = func(idx int, parts []string) {
-		if idx == len(tagKeys) {
-			seriesKeys = append(seriesKeys, measurement+","+strings.Join(parts, ","))
-			return
-		}
-		key := tagKeys[idx]
-		values := tagValues[key]
-		if len(values) == 0 {
-			// No values for this tag, skip it
-			generate(idx+1, parts)
-			return
-		}
-		for _, v := range values {
-			newParts := append(parts, fmt.Sprintf("%s=%s", key, v))
-			generate(idx+1, newParts)
-		}
-	}
-	generate(0, []string{})
-
-	return seriesKeys, nil
+	return series, nil
 }
 
 func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
@@ -891,10 +996,30 @@ func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter
 }
 
 func (a *InfluxDBV2Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error) {
-	// V2's SHOW SERIES does not support time filtering directly.
-	// Time window filtering is handled by QueryDataBatch using Flux range().
-	// This method returns all series keys, and the query layer applies time filtering.
-	return a.DiscoverSeries(ctx, measurement)
+	// Use V1 compatibility API: SHOW SERIES with time filtering
+	query := fmt.Sprintf(
+		"SHOW SERIES FROM %s WHERE time >= '%s' AND time < '%s'",
+		influxQuoteIdentifier(measurement),
+		startTime.Format(time.RFC3339Nano),
+		endTime.Format(time.RFC3339Nano))
+
+	result, err := a.executeV1Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	var series []string
+	for _, seriesData := range result.Results {
+		for _, values := range seriesData.Values {
+			if len(values) > 0 {
+				if key, ok := values[0].(string); ok {
+					series = append(series, key)
+				}
+			}
+		}
+	}
+
+	return series, nil
 }
 
 func (a *InfluxDBV2Adapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
@@ -913,13 +1038,13 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 	var lastTS int64
 
 	if lastCheckpoint != nil && lastCheckpoint.LastTimestamp != 0 {
-		startTime = fmt.Sprintf("%d", lastCheckpoint.LastTimestamp)
+		startTime = time.Unix(0, lastCheckpoint.LastTimestamp).Format(time.RFC3339Nano)
 		lastTS = lastCheckpoint.LastTimestamp
 	} else {
 		startTime = "1970-01-01T00:00:00Z"
 	}
 
-	endTime := time.Now().Format(time.RFC3339Nano)
+	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339Nano)
 
 	batchSize := 10000
 	if cfg != nil && cfg.BatchSize > 0 {
@@ -928,18 +1053,12 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 	totalRecords := 0
 
 	for {
-		fluxQuery := fmt.Sprintf(`
-			from(bucket: "%s")
-			  |> range(start: %s, stop: %s)
-			  |> filter(fn: (r) => r._measurement == "%s")
-			  |> limit(n: %d)
-		`, a.config.Bucket, startTime, endTime, measurement, batchSize)
+		// Use V1 compatibility API with LIMIT/OFFSET pagination
+		query := fmt.Sprintf(
+			`SELECT * FROM %s WHERE time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
+			influxQuoteIdentifier(measurement), startTime, endTime, batchSize)
 
-		var tagKeys []string
-		if cfg != nil {
-			tagKeys = cfg.TagKeys
-		}
-		records, err := a.executeFluxSelect(ctx, fluxQuery, tagKeys)
+		records, err := a.executeV1SelectQuery(ctx, query)
 		if err != nil {
 			return nil, err
 		}
@@ -958,12 +1077,12 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 		maxTS := records[len(records)-1].Time
 		lastTS = maxTS
 		if maxTS < math.MaxInt64 {
-			startTime = fmt.Sprintf("%d", maxTS+1)
+			startTime = time.Unix(0, maxTS+1).Format(time.RFC3339Nano)
 		} else {
-			startTime = fmt.Sprintf("%d", maxTS)
+			startTime = time.Unix(0, maxTS).Format(time.RFC3339Nano)
 		}
 
-		logger.Debug("fetched batch from InfluxDB V2",
+		logger.Debug("fetched batch from InfluxDB V2 (V1 API)",
 			zap.String("measurement", measurement),
 			zap.Int("batch_size", len(records)),
 			zap.String("next_start", startTime))
@@ -979,7 +1098,7 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 		}
 	}
 
-	logger.Info("completed InfluxDB V2 query",
+	logger.Info("completed InfluxDB V2 query (V1 API)",
 		zap.String("measurement", measurement),
 		zap.Int("total_records", totalRecords))
 
@@ -1005,32 +1124,27 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	}
 
 	batchSize := getBatchSize(cfg)
-	fluxFilter := BuildFluxFilter(series)
+	whereClause := BuildWhereClause(series)
 
 	var totalRecords int
 	var maxTS int64
 
 	for {
-		fluxQuery := fmt.Sprintf(`
-			from(bucket: "%s")
-			  |> range(start: %s, stop: %s)
-			  |> filter(fn: (r) => r._measurement == "%s" and (%s))
-			  |> limit(n: %d)
-		`, a.config.Bucket,
+		// Use V1 compatibility API with WHERE clause for series filtering
+		query := fmt.Sprintf(
+			`SELECT * FROM %s WHERE (%s) AND time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
+			influxQuoteIdentifier(measurement),
+			whereClause,
 			queryStart.Format(time.RFC3339Nano),
 			endTime.Format(time.RFC3339Nano),
-			measurement, fluxFilter, batchSize)
+			batchSize)
 
-		logger.Debug("executing batch query for InfluxDB V2",
+		logger.Debug("executing batch query for InfluxDB V2 (V1 API)",
 			zap.String("measurement", measurement),
 			zap.Int("series_count", len(series)),
-			zap.String("query", fluxQuery))
+			zap.String("query", query))
 
-		var tagKeys []string
-		if cfg != nil {
-			tagKeys = cfg.TagKeys
-		}
-		records, err := a.executeFluxSelect(ctx, fluxQuery, tagKeys)
+		records, err := a.executeV1SelectQuery(ctx, query)
 		if err != nil {
 			return nil, fmt.Errorf("batch query failed: %w", err)
 		}
@@ -1052,7 +1166,7 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 			}
 		}
 
-		logger.Debug("fetched batch from InfluxDB V2",
+		logger.Debug("fetched batch from InfluxDB V2 (V1 API)",
 			zap.String("measurement", measurement),
 			zap.Int("batch_size", len(records)),
 			zap.String("next_start", queryStart.Format(time.RFC3339Nano)))
@@ -1081,7 +1195,7 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		}
 	}
 
-	logger.Info("completed batch query for InfluxDB V2",
+	logger.Info("completed batch query for InfluxDB V2 (V1 API)",
 		zap.String("measurement", measurement),
 		zap.Int("series_count", len(series)),
 		zap.Int("total_records", totalRecords),
@@ -1236,6 +1350,30 @@ func decodeInfluxV2Config(config map[string]interface{}, cfg interface{}) error 
 	if v, ok := cfgMap["bucket"].(string); ok {
 		cfg.(*InfluxDBV2Config).Bucket = v
 	}
+	// V1 compatibility API credentials
+	if v, ok := cfgMap["username"].(string); ok {
+		cfg.(*InfluxDBV2Config).Username = v
+	}
+	if v, ok := cfgMap["password"].(string); ok {
+		cfg.(*InfluxDBV2Config).Password = v
+	}
+	if v, ok := cfgMap["retention_policy"].(string); ok {
+		cfg.(*InfluxDBV2Config).RetentionPolicy = v
+	}
+	// SSL configuration
+	if sslMap, ok := cfgMap["ssl"].(map[string]interface{}); ok {
+		cfg.(*InfluxDBV2Config).SSL.Enabled, _ = sslMap["enabled"].(bool)
+		cfg.(*InfluxDBV2Config).SSL.SkipVerify, _ = sslMap["skip_verify"].(bool)
+		if v, ok := sslMap["ca_cert"].(string); ok {
+			cfg.(*InfluxDBV2Config).SSL.CaCert = v
+		}
+		if v, ok := sslMap["client_cert"].(string); ok {
+			cfg.(*InfluxDBV2Config).SSL.ClientCert = v
+		}
+		if v, ok := sslMap["client_key"].(string); ok {
+			cfg.(*InfluxDBV2Config).SSL.ClientKey = v
+		}
+	}
 
 	return nil
 }
@@ -1245,6 +1383,16 @@ func influxQuoteIdentifier(s string) string {
 		return `""`
 	}
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// redactURL returns URL string with credentials redacted for safe logging
+func redactURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	redacted := *u
+	redacted.RawQuery = "REDACTED"
+	return redacted.String()
 }
 
 // ParseSeriesKey parses "measurement,tag1=value1,tag2=value2" into components
@@ -1275,6 +1423,11 @@ func BuildWhereClause(series []string) string {
 		if len(tagConditions) > 0 {
 			conditions = append(conditions, "("+strings.Join(tagConditions, " AND ")+")")
 		}
+	}
+	if len(conditions) == 0 {
+		// No tag conditions means match all series (no filtering)
+		// Return "1=1" to produce valid SQL: WHERE 1=1 AND time...
+		return "1=1"
 	}
 	return strings.Join(conditions, " OR ")
 }
