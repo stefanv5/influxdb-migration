@@ -31,3 +31,7 @@ vendor/
 # Config (keep example)
 config.yaml
 !config.yaml.example
+
+# Worktrees
+.worktrees/
+worktrees/
