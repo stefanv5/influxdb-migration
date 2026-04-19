@@ -41,6 +41,7 @@ func ApplyDefaults(cfg *types.MigrationConfig) *types.MigrationConfig {
 	if newCfg.Migration.MaxSeriesParallel == 0 {
 		newCfg.Migration.MaxSeriesParallel = 2
 	}
+	// FailOnCheckpointError defaults to false (warn-only for backward compatibility)
 	if newCfg.Retry.MaxAttempts == 0 {
 		newCfg.Retry.MaxAttempts = 3
 	}

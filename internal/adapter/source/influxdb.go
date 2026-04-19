@@ -150,24 +150,78 @@ func (a *InfluxDBV1Adapter) DiscoverTables(ctx context.Context) ([]string, error
 }
 
 func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
-	query := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
-	results, err := a.executeQuery(ctx, query)
-	if err != nil {
-		return nil, err
-	}
+	var allSeries []string
+	var lastKey string
+	batchSize := 10000 // Process series in batches to avoid OOM
 
-	var series []string
-	for _, result := range results {
-		for _, values := range result.Values {
-			if len(values) > 0 {
-				if key, ok := values[0].(string); ok {
-					series = append(series, key)
+	for {
+		var query string
+		if lastKey == "" {
+			query = fmt.Sprintf("SHOW SERIES FROM %s LIMIT %d",
+				influxQuoteIdentifier(measurement), batchSize)
+		} else {
+			// InfluxDB 1.7+ supports WHERE series_key > for pagination
+			query = fmt.Sprintf("SHOW SERIES FROM %s WHERE series_key > '%s' LIMIT %d",
+				influxQuoteIdentifier(measurement), lastKey, batchSize)
+		}
+
+		results, err := a.executeQuery(ctx, query)
+		if err != nil {
+			// If pagination query fails (older InfluxDB), fall back to collecting all
+			if lastKey != "" {
+				logger.Warn("series_key pagination not supported, falling back",
+					zap.Error(err))
+				// Retry with non-paginated query for remaining
+				fallbackQuery := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
+				fallbackResults, fallbackErr := a.executeQuery(ctx, fallbackQuery)
+				if fallbackErr != nil {
+					return nil, fallbackErr
+				}
+				for _, result := range fallbackResults {
+					for _, values := range result.Values {
+						if len(values) > 0 {
+							if key, ok := values[0].(string); ok {
+								// Skip already collected keys
+								if key <= lastKey {
+									continue
+								}
+								allSeries = append(allSeries, key)
+							}
+						}
+					}
+				}
+				return allSeries, nil
+			}
+			return nil, err
+		}
+
+		batchCount := 0
+		for _, result := range results {
+			for _, values := range result.Values {
+				if len(values) > 0 {
+					if key, ok := values[0].(string); ok {
+						allSeries = append(allSeries, key)
+						lastKey = key
+						batchCount++
+					}
 				}
 			}
 		}
+
+		// If returned fewer than batch size, we're done
+		if batchCount < batchSize {
+			break
+		}
+
+		// Check context before continuing
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 	}
 
-	return series, nil
+	return allSeries, nil
 }
 
 func (a *InfluxDBV1Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
@@ -812,7 +866,8 @@ func (a *InfluxDBV2Adapter) executeV1Query(ctx context.Context, query string) (*
 }
 
 // executeV1SelectQuery executes a SELECT query and returns records
-func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query string) ([]types.Record, error) {
+// tagKeySet is used to distinguish tags from fields (nil means treat all as fields)
+func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query string, tagKeySet map[string]bool) ([]types.Record, error) {
 	result, err := a.executeV1Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -821,7 +876,12 @@ func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query stri
 	var records []types.Record
 	for _, series := range result.Results {
 		for _, values := range series.Values {
-			record := parseV1Values(series.Columns, values)
+			var record *types.Record
+			if tagKeySet != nil {
+				record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet)
+			} else {
+				record = parseV1Values(series.Columns, values)
+			}
 			records = append(records, *record)
 		}
 	}
@@ -830,6 +890,7 @@ func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query stri
 }
 
 // parseV1Values parses V1 query result values into a Record
+// This treats all non-time string values as fields (for V1 adapter or when tagKeys is unavailable)
 func parseV1Values(columns []string, values []interface{}) *types.Record {
 	record := types.NewRecord()
 
@@ -870,6 +931,61 @@ func parseV1Values(columns []string, values []interface{}) *types.Record {
 				record.AddField(col, v)
 			case int:
 				record.AddField(col, int64(v))
+			}
+		}
+	}
+
+	return record
+}
+
+// parseV1ValuesWithTagKeys parses V1 query result values into a Record
+// It uses tagKeySet to distinguish tags from fields - strings in tagKeySet are tags
+func parseV1ValuesWithTagKeys(columns []string, values []interface{}, tagKeySet map[string]bool) *types.Record {
+	record := types.NewRecord()
+
+	for i, col := range columns {
+		if i >= len(values) {
+			continue
+		}
+
+		val := values[i]
+		if val == nil {
+			continue
+		}
+
+		switch col {
+		case "time":
+			if ts, ok := val.(string); ok {
+				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+					record.Time = t.UnixNano()
+				} else if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					record.Time = t.UnixNano()
+					logger.Warn("timestamp parsed with reduced precision",
+						zap.String("timestamp", ts))
+				} else {
+					logger.Warn("failed to parse timestamp, using 0",
+						zap.String("timestamp_string", ts),
+						zap.Error(err))
+				}
+			}
+		default:
+			// If this column is a known tag key, store as tag
+			if tagKeySet[col] {
+				record.AddTag(col, fmt.Sprintf("%v", val))
+			} else {
+				// Otherwise store as field
+				switch v := val.(type) {
+				case float64:
+					record.AddField(col, v)
+				case string:
+					record.AddField(col, v)
+				case bool:
+					record.AddField(col, v)
+				case int64:
+					record.AddField(col, v)
+				case int:
+					record.AddField(col, int64(v))
+				}
 			}
 		}
 	}
@@ -938,25 +1054,79 @@ func (a *InfluxDBV2Adapter) DiscoverTagKeys(ctx context.Context, measurement str
 }
 
 func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
-	// Use V1 compatibility API: SHOW SERIES
-	query := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
-	result, err := a.executeV1Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
+	// Use V1 compatibility API: SHOW SERIES with pagination
+	var allSeries []string
+	var lastKey string
+	batchSize := 10000 // Process series in batches to avoid OOM
 
-	var series []string
-	for _, seriesData := range result.Results {
-		for _, values := range seriesData.Values {
-			if len(values) > 0 {
-				if key, ok := values[0].(string); ok {
-					series = append(series, key)
+	for {
+		var query string
+		if lastKey == "" {
+			query = fmt.Sprintf("SHOW SERIES FROM %s LIMIT %d",
+				influxQuoteIdentifier(measurement), batchSize)
+		} else {
+			// InfluxDB 1.7+ supports WHERE series_key > for pagination
+			query = fmt.Sprintf("SHOW SERIES FROM %s WHERE series_key > '%s' LIMIT %d",
+				influxQuoteIdentifier(measurement), lastKey, batchSize)
+		}
+
+		result, err := a.executeV1Query(ctx, query)
+		if err != nil {
+			// If pagination query fails (older InfluxDB), fall back to collecting all
+			if lastKey != "" {
+				logger.Warn("series_key pagination not supported, falling back",
+					zap.Error(err))
+				// Retry with non-paginated query for remaining
+				fallbackQuery := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
+				fallbackResult, fallbackErr := a.executeV1Query(ctx, fallbackQuery)
+				if fallbackErr != nil {
+					return nil, fallbackErr
+				}
+				for _, seriesData := range fallbackResult.Results {
+					for _, values := range seriesData.Values {
+						if len(values) > 0 {
+							if key, ok := values[0].(string); ok {
+								// Skip already collected keys
+								if key <= lastKey {
+									continue
+								}
+								allSeries = append(allSeries, key)
+							}
+						}
+					}
+				}
+				return allSeries, nil
+			}
+			return nil, err
+		}
+
+		batchCount := 0
+		for _, seriesData := range result.Results {
+			for _, values := range seriesData.Values {
+				if len(values) > 0 {
+					if key, ok := values[0].(string); ok {
+						allSeries = append(allSeries, key)
+						lastKey = key
+						batchCount++
+					}
 				}
 			}
 		}
+
+		// If returned fewer than batch size, we're done
+		if batchCount < batchSize {
+			break
+		}
+
+		// Check context before continuing
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 	}
 
-	return series, nil
+	return allSeries, nil
 }
 
 func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
@@ -1052,13 +1222,20 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 	}
 	totalRecords := 0
 
+	// Discover tag keys to distinguish tags from fields
+	tagKeys, _ := a.DiscoverTagKeys(ctx, measurement)
+	tagKeySet := make(map[string]bool)
+	for _, k := range tagKeys {
+		tagKeySet[k] = true
+	}
+
 	for {
 		// Use V1 compatibility API with LIMIT/OFFSET pagination
 		query := fmt.Sprintf(
 			`SELECT * FROM %s WHERE time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
 			influxQuoteIdentifier(measurement), startTime, endTime, batchSize)
 
-		records, err := a.executeV1SelectQuery(ctx, query)
+		records, err := a.executeV1SelectQuery(ctx, query, tagKeySet)
 		if err != nil {
 			return nil, err
 		}
@@ -1126,6 +1303,13 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	batchSize := getBatchSize(cfg)
 	whereClause := BuildWhereClause(series)
 
+	// Discover tag keys to distinguish tags from fields
+	tagKeys, _ := a.DiscoverTagKeys(ctx, measurement)
+	tagKeySet := make(map[string]bool)
+	for _, k := range tagKeys {
+		tagKeySet[k] = true
+	}
+
 	var totalRecords int
 	var maxTS int64
 
@@ -1144,7 +1328,7 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 			zap.Int("series_count", len(series)),
 			zap.String("query", query))
 
-		records, err := a.executeV1SelectQuery(ctx, query)
+		records, err := a.executeV1SelectQuery(ctx, query, tagKeySet)
 		if err != nil {
 			return nil, fmt.Errorf("batch query failed: %w", err)
 		}

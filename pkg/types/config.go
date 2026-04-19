@@ -64,11 +64,12 @@ type RateLimitConfig struct {
 }
 
 type MigrationSettings struct {
-	ParallelTasks     int              `mapstructure:"parallel_tasks"`
-	ChunkSize         int              `mapstructure:"chunk_size"`
-	ChunkInterval     time.Duration    `mapstructure:"chunk_interval"`
-	MaxSeriesParallel int              `mapstructure:"max_series_parallel"`
-	SourceProtection  SourceProtection `mapstructure:"source_protection"`
+	ParallelTasks          int              `mapstructure:"parallel_tasks"`
+	ChunkSize              int              `mapstructure:"chunk_size"`
+	ChunkInterval          time.Duration    `mapstructure:"chunk_interval"`
+	MaxSeriesParallel      int              `mapstructure:"max_series_parallel"`
+	SourceProtection       SourceProtection `mapstructure:"source_protection"`
+	FailOnCheckpointError  bool             `mapstructure:"fail_on_checkpoint_error"`
 }
 
 type SourceProtection struct {
@@ -139,12 +140,20 @@ type TDengineConfig struct {
 type InfluxDBConfig struct {
 	Version         string `mapstructure:"version"`
 	URL             string `mapstructure:"url"`
-	Token           string `mapstructure:"token"`           // For V2 native API (deprecated for V2 source, use Username/Password)
-	Org             string `mapstructure:"org"`             // For V2 native API (deprecated for V2 source)
+	// Token is used for V2 native API authentication
+	// For V2 source using V1 compatibility API, use Username/Password instead
+	Token           string `mapstructure:"token"`
+	// Org is used for V2 native API (not needed for V1 compatibility API)
+	Org             string `mapstructure:"org"`
 	Bucket          string `mapstructure:"bucket"`
-	Username        string `mapstructure:"username"`        // For V1 compatibility API
-	Password        string `mapstructure:"password"`        // For V1 compatibility API
-	RetentionPolicy string `mapstructure:"retention_policy"` // For V1 compatibility API
+	// Username/Password are used for:
+	// 1. V1 source authentication
+	// 2. V2 source using V1 compatibility API
+	Username        string `mapstructure:"username"`
+	Password        string `mapstructure:"password"`
+	// RetentionPolicy is used for V2 source using V1 compatibility API
+	// to specify which retention policy to use
+	RetentionPolicy string `mapstructure:"retention_policy"`
 }
 
 type InfluxDBTargetConfig struct {

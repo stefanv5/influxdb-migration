@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -431,7 +432,10 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 
 			if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
 				0, saveTimestamp, saveProcessed, types.StatusInProgress); err != nil {
-				logger.Warn("failed to save checkpoint", zap.Error(err))
+				if e.config.Migration.FailOnCheckpointError {
+					return fmt.Errorf("failed to save checkpoint: %w", err)
+				}
+				logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
 			}
 
 			err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
@@ -563,20 +567,51 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		MaxSeriesPerQuery: batchSize,
 	}
 
-	var lastCheckpoint *types.Checkpoint
+	// Load checkpoint to resume from previous position
+	lastCheckpoint, err := e.checkpointMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
+	if err != nil {
+		return fmt.Errorf("failed to load checkpoint: %w", err)
+	}
+
+	// Track last completed batch index for resume
+	// ProcessedRows stores the last completed batch index (1-based)
+	// This allows resuming from the correct batch after interruption
+	lastCompletedBatch := -1
+	var lastTimestamp int64
+	if lastCheckpoint != nil && lastCheckpoint.Status == types.StatusInProgress {
+		lastCompletedBatch = int(lastCheckpoint.ProcessedRows) - 1
+		lastTimestamp = lastCheckpoint.LastTimestamp
+		logger.Info("resuming batch mode from checkpoint",
+			zap.String("task_id", task.ID),
+			zap.Int("last_completed_batch", lastCompletedBatch+1))
+	}
+
 	for i, batch := range batches {
+		// Skip already completed batches for resume
+		if i <= lastCompletedBatch {
+			logger.Debug("skipping already completed batch",
+				zap.String("task_id", task.ID),
+				zap.Int("batch_index", i+1))
+			continue
+		}
+
 		logger.Debug("processing batch",
 			zap.String("task_id", task.ID),
 			zap.Int("batch_index", i+1),
 			zap.Int("batch_size", len(batch)))
 
-		checkpoint, err := sourceAdapter.QueryDataBatch(
+		// Create checkpoint for this batch to pass resume point
+		batchCheckpoint := &types.Checkpoint{
+			LastTimestamp: lastTimestamp,
+		}
+
+		cp, queryErr := sourceAdapter.QueryDataBatch(
 			ctx,
 			task.Mapping.SourceTable,
 			batch,
 			startTime,
 			endTime,
-			lastCheckpoint,
+			batchCheckpoint,
 			func(records []types.Record) error {
 				if len(records) == 0 {
 					return nil
@@ -586,19 +621,23 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 			queryCfg,
 		)
 
-		if err != nil {
-			return fmt.Errorf("batch %d/%d failed: %w", i+1, len(batches), err)
+		if queryErr != nil {
+			return fmt.Errorf("batch %d/%d failed: %w", i+1, len(batches), queryErr)
 		}
 
-		if checkpoint != nil {
-			lastCheckpoint = checkpoint
+		if cp != nil {
+			lastTimestamp = cp.LastTimestamp
 
 			// Save checkpoint after each batch to prevent data loss on crash.
+			// ProcessedRows stores the batch index (i+1) for resume tracking.
 			// This uses "at-least-once" semantics: on crash we may re-process
 			// this batch, but we will never lose data.
 			if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
-				0, checkpoint.LastTimestamp, checkpoint.ProcessedRows, types.StatusInProgress); err != nil {
-				logger.Warn("failed to save checkpoint", zap.Error(err))
+				0, cp.LastTimestamp, int64(i+1), types.StatusInProgress); err != nil {
+				if e.config.Migration.FailOnCheckpointError {
+					return fmt.Errorf("failed to save checkpoint: %w", err)
+				}
+				logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
 			}
 		}
 	}
@@ -607,11 +646,10 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		zap.String("task_id", task.ID),
 		zap.Int("total_batches", len(batches)))
 
-	if lastCheckpoint != nil {
-		if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
-			0, lastCheckpoint.LastTimestamp, lastCheckpoint.ProcessedRows, types.StatusCompleted); err != nil {
-			logger.Warn("failed to save final checkpoint", zap.Error(err))
-		}
+	// Save final checkpoint with completed status
+	if err := e.checkpointMgr.SaveCheckpoint(ctx, task.ID, task.Mapping.SourceTable,
+		0, lastTimestamp, int64(len(batches)), types.StatusCompleted); err != nil {
+		logger.Warn("failed to save final checkpoint", zap.Error(err))
 	}
 	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
 		logger.Warn("failed to mark task completed", zap.Error(err))
@@ -702,10 +740,77 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 		zap.String("task_id", task.ID),
 		zap.Int("count", len(relevantGroups)))
 
-	// Process each shard group
-	for _, sg := range relevantGroups {
-		if err := e.migrateShardGroup(ctx, task, sg, sourceAdapter, targetAdapter, queryStart, queryEnd); err != nil {
-			return fmt.Errorf("shard group %d migration failed: %w", sg.ID, err)
+	// Get parallelism setting
+	parallelism := 1
+	if e.config.InfluxToInflux.ShardGroupConfig != nil {
+		parallelism = e.config.InfluxToInflux.ShardGroupConfig.ShardParallelism
+	}
+	if parallelism < 1 {
+		parallelism = 1
+	}
+
+	logger.Info("shard-group parallelism",
+		zap.String("task_id", task.ID),
+		zap.Int("parallelism", parallelism))
+
+	// For single parallelism, process serially (original behavior)
+	if parallelism == 1 {
+		for _, sg := range relevantGroups {
+			if err := e.migrateShardGroup(ctx, task, sg, sourceAdapter, targetAdapter, queryStart, queryEnd); err != nil {
+				return fmt.Errorf("shard group %d migration failed: %w", sg.ID, err)
+			}
+		}
+	} else {
+		// For parallelism > 1, use goroutines with semaphore
+		semaphore := make(chan struct{}, parallelism)
+		var wg sync.WaitGroup
+		var firstErr error
+		var errMu sync.Mutex
+
+		for _, sg := range relevantGroups {
+			wg.Add(1)
+			go func(shardGroup *adapter.ShardGroup) {
+				defer wg.Done()
+
+				// Acquire semaphore slot
+				select {
+				case <-ctx.Done():
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = ctx.Err()
+					}
+					errMu.Unlock()
+					return
+				case semaphore <- struct{}{}:
+					// Got semaphore slot
+				}
+				defer func() { <-semaphore }()
+
+				// Check context before processing
+				select {
+				case <-ctx.Done():
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = ctx.Err()
+					}
+					errMu.Unlock()
+					return
+				default:
+				}
+
+				if err := e.migrateShardGroup(ctx, task, shardGroup, sourceAdapter, targetAdapter, queryStart, queryEnd); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("shard group %d migration failed: %w", shardGroup.ID, err)
+					}
+					errMu.Unlock()
+				}
+			}(sg)
+		}
+
+		wg.Wait()
+		if firstErr != nil {
+			return firstErr
 		}
 	}
 
@@ -980,7 +1085,10 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 
 			if err := e.checkpointMgr.SaveCheckpoint(ctx, taskID, table,
 				0, saveTimestamp, saveProcessed, types.StatusInProgress); err != nil {
-				logger.Warn("failed to save checkpoint", zap.Error(err))
+				if e.config.Migration.FailOnCheckpointError {
+					return fmt.Errorf("failed to save checkpoint: %w", err)
+				}
+				logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
 			}
 
 			err := e.processBatch(ctx, &windowMapping, records, targetAdapter)
@@ -1006,14 +1114,17 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 		}
 
 		// Check context before sleeping to allow graceful shutdown
+		// Note: We create timer fresh each iteration to avoid timer accumulation
 		timer := time.NewTimer(e.config.Migration.ChunkInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return nil, ctx.Err()
 		case <-timer.C:
-			timer.Stop()
+			// Timer fired normally, continue to next iteration
 		}
+		// Explicitly stop timer after use to release resources
+		timer.Stop()
 	}
 
 	return &types.Checkpoint{
@@ -1031,7 +1142,7 @@ func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.Mappi
 
 	transformed := make([]types.Record, 0, len(records))
 	for i := range records {
-		filtered := filterNilValues(&records[i])
+		filtered := e.transformer.FilterNulls(&records[i])
 
 		// Check for tag/field name collisions (InfluxDB allows this but it causes query issues)
 		warnings := e.transformer.ValidateRecord(filtered)
@@ -1071,14 +1182,21 @@ func (e *MigrationEngine) writeWithRetry(ctx context.Context, measurement string
 	}
 
 	var lastErr error
-	delay := e.config.Retry.InitialDelay
-	if delay == 0 {
-		delay = 1 * time.Second
+	baseDelay := e.config.Retry.InitialDelay
+	if baseDelay == 0 {
+		baseDelay = 1 * time.Second
 	}
 	maxDelay := e.config.Retry.MaxDelay
 	if maxDelay == 0 {
 		maxDelay = 60 * time.Second
 	}
+	backoffMultiplier := e.config.Retry.BackoffMultiplier
+	if backoffMultiplier == 0 {
+		backoffMultiplier = 2.0
+	}
+
+	// Initialize delay to base delay
+	delay := baseDelay
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		err := targetAdapter.WriteBatch(ctx, measurement, records)
@@ -1094,46 +1212,30 @@ func (e *MigrationEngine) writeWithRetry(ctx context.Context, measurement string
 			zap.Error(err))
 
 		if attempt < maxAttempts {
+			// Calculate jittered delay: base_delay * (0.5 + random[0,1]) * multiplier^(attempt-1)
+			// This gives range [0.5x, 1.5x] of exponential delay
+			jitterFactor := 0.5 + rand.Float64() // 0.5 to 1.5
+			sleepDuration := time.Duration(float64(delay) * jitterFactor)
+
 			// Use timer to allow early cancellation
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
+			timer := time.NewTimer(sleepDuration)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return ctx.Err()
 			case <-timer.C:
+				// Timer fired normally, proceed with retry
 			}
-			// Timer fired normally, proceed with retry
 
-			// Calculate new delay with overflow protection
-			newDelay := time.Duration(float64(delay) * e.config.Retry.BackoffMultiplier)
-			if newDelay < delay || newDelay > maxDelay {
+			// Calculate new base delay for next iteration (without jitter)
+			delay = time.Duration(float64(delay) * backoffMultiplier)
+			if delay > maxDelay {
 				delay = maxDelay
-			} else {
-				delay = newDelay
 			}
 		}
 	}
 
 	return fmt.Errorf("write batch failed after %d attempts: %w", maxAttempts, lastErr)
-}
-
-func filterNilValues(record *types.Record) *types.Record {
-	filtered := types.NewRecord()
-	filtered.Time = record.Time
-
-	for k, v := range record.Tags {
-		if v != "" {
-			filtered.Tags[k] = v
-		}
-	}
-
-	for k, v := range record.Fields {
-		if v != nil {
-			filtered.Fields[k] = v
-		}
-	}
-
-	return filtered
 }
 
 func (e *MigrationEngine) getSourceConfig(name string) map[string]interface{} {
@@ -1208,13 +1310,49 @@ func (e *MigrationEngine) targetConfigToMap(tgt types.TargetConfig) map[string]i
 	}
 
 	switch tgt.Type {
-	case "influxdb":
-		m["influxdb"] = map[string]interface{}{
+	case "influxdb-v1":
+		influxCfg := map[string]interface{}{
 			"url":     tgt.InfluxDB.URL,
+			"version": tgt.InfluxDB.Version,
+		}
+		// V1 target uses basic_auth with username/password
+		if tgt.User != "" {
+			influxCfg["basic_auth"] = map[string]interface{}{
+				"username": tgt.User,
+				"password": tgt.Password,
+			}
+		}
+		// Include retention_policy if specified
+		if tgt.InfluxDB.RetentionPolicy != "" {
+			influxCfg["retention_policy"] = tgt.InfluxDB.RetentionPolicy
+		}
+		m["influxdb"] = influxCfg
+	case "influxdb-v2":
+		influxCfg := map[string]interface{}{
+			"url":     tgt.InfluxDB.URL,
+			"version": tgt.InfluxDB.Version,
 			"token":   tgt.InfluxDB.Token,
 			"org":     tgt.InfluxDB.Org,
 			"bucket":  tgt.InfluxDB.Bucket,
-			"version": tgt.InfluxDB.Version,
+		}
+		m["influxdb"] = influxCfg
+	case "mysql":
+		m["mysql"] = map[string]interface{}{
+			"host":     tgt.Host,
+			"port":     tgt.Port,
+			"user":     tgt.User,
+			"password": tgt.Password,
+			"database": tgt.Database,
+			"charset":  tgt.MySQL.Charset,
+		}
+	case "tdengine":
+		m["tdengine"] = map[string]interface{}{
+			"host":     tgt.Host,
+			"port":     tgt.Port,
+			"user":     tgt.User,
+			"password": tgt.Password,
+			"database": tgt.Database,
+			"version":  tgt.TDengine.Version,
 		}
 	}
 
