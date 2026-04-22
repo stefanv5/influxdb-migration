@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	_ "github.com/migration-tools/influx-migrator/internal/adapter/source"
+	_ "github.com/migration-tools/influx-migrator/internal/adapter/target"
 	"github.com/spf13/cobra"
 )
 

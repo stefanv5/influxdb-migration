@@ -35,8 +35,13 @@ type InfluxDBV1Config struct {
 }
 
 type influxV1Result struct {
-	Results []influxV1Series `json:"results"`
-	Error   string           `json:"error"` // V1 API error message
+	Results []influxV1ResultSeries `json:"results"`
+	Error   string                  `json:"error"` // V1 API error message
+}
+
+type influxV1ResultSeries struct {
+	StatementID int                `json:"statement_id"`
+	Series     []influxV1Series   `json:"series"`
 }
 
 type influxV1Series struct {
@@ -602,10 +607,12 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 	}
 
 	var records []types.Record
-	for _, series := range result.Results {
-		for _, values := range series.Values {
-			record := a.parseValues(series.Columns, values)
-			records = append(records, *record)
+	for _, r := range result.Results {
+		for _, series := range r.Series {
+			for _, values := range series.Values {
+				record := a.parseValues(series.Columns, values)
+				records = append(records, *record)
+			}
 		}
 	}
 
@@ -707,21 +714,31 @@ func (a *InfluxDBV1Adapter) executeQuery(ctx context.Context, query string) ([]i
 
 	var series []influxV1Series
 	for _, r := range result.Results {
-		series = append(series, r)
+		series = append(series, r.Series...)
 	}
 
 	return series, nil
 }
 
 func decodeInfluxV1Config(config map[string]interface{}, cfg interface{}) error {
+	// Database can be at top level or inside influxdb block - check both
+	if v, ok := config["database"].(string); ok {
+		cfg.(*InfluxDBV1Config).Database = v
+	}
+
 	cfgMap, ok := config["influxdb"].(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("influxdb config not found")
+		// If no influxdb block, at least database should have been set above
+		if cfg.(*InfluxDBV1Config).Database == "" {
+			return fmt.Errorf("influxdb config not found and database not specified at top level")
+		}
+		return nil
 	}
 
 	if v, ok := cfgMap["url"].(string); ok {
 		cfg.(*InfluxDBV1Config).URL = v
 	}
+	// Database inside influxdb block takes precedence if present
 	if v, ok := cfgMap["database"].(string); ok {
 		cfg.(*InfluxDBV1Config).Database = v
 	}
@@ -885,15 +902,17 @@ func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query stri
 	}
 
 	var records []types.Record
-	for _, series := range result.Results {
-		for _, values := range series.Values {
-			var record *types.Record
-			if tagKeySet != nil {
-				record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet)
-			} else {
-				record = parseV1Values(series.Columns, values)
+	for _, r := range result.Results {
+		for _, series := range r.Series {
+			for _, values := range series.Values {
+				var record *types.Record
+				if tagKeySet != nil {
+					record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet)
+				} else {
+					record = parseV1Values(series.Columns, values)
+				}
+				records = append(records, *record)
 			}
-			records = append(records, *record)
 		}
 	}
 
@@ -1024,11 +1043,13 @@ func (a *InfluxDBV2Adapter) DiscoverTables(ctx context.Context) ([]string, error
 	}
 
 	var measurements []string
-	for _, series := range result.Results {
-		for _, values := range series.Values {
-			if len(values) > 0 {
-				if name, ok := values[0].(string); ok {
-					measurements = append(measurements, name)
+	for _, r := range result.Results {
+		for _, series := range r.Series {
+			for _, values := range series.Values {
+				if len(values) > 0 {
+					if name, ok := values[0].(string); ok {
+						measurements = append(measurements, name)
+					}
 				}
 			}
 		}
@@ -1051,11 +1072,13 @@ func (a *InfluxDBV2Adapter) DiscoverTagKeys(ctx context.Context, measurement str
 	}
 
 	var tagKeys []string
-	for _, seriesData := range result.Results {
-		for _, values := range seriesData.Values {
-			if len(values) > 0 {
-				if key, ok := values[0].(string); ok {
-					tagKeys = append(tagKeys, key)
+	for _, r := range result.Results {
+		for _, seriesData := range r.Series {
+			for _, values := range seriesData.Values {
+				if len(values) > 0 {
+					if key, ok := values[0].(string); ok {
+						tagKeys = append(tagKeys, key)
+					}
 				}
 			}
 		}
@@ -1093,15 +1116,17 @@ func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement stri
 				if fallbackErr != nil {
 					return nil, fallbackErr
 				}
-				for _, seriesData := range fallbackResult.Results {
-					for _, values := range seriesData.Values {
-						if len(values) > 0 {
-							if key, ok := values[0].(string); ok {
-								// Skip already collected keys
-								if key <= lastKey {
-									continue
+				for _, r := range fallbackResult.Results {
+					for _, seriesData := range r.Series {
+						for _, values := range seriesData.Values {
+							if len(values) > 0 {
+								if key, ok := values[0].(string); ok {
+									// Skip already collected keys
+									if key <= lastKey {
+										continue
+									}
+									allSeries = append(allSeries, key)
 								}
-								allSeries = append(allSeries, key)
 							}
 						}
 					}
@@ -1112,13 +1137,15 @@ func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement stri
 		}
 
 		batchCount := 0
-		for _, seriesData := range result.Results {
-			for _, values := range seriesData.Values {
-				if len(values) > 0 {
-					if key, ok := values[0].(string); ok {
-						allSeries = append(allSeries, key)
-						lastKey = key
-						batchCount++
+		for _, r := range result.Results {
+			for _, seriesData := range r.Series {
+				for _, values := range seriesData.Values {
+					if len(values) > 0 {
+						if key, ok := values[0].(string); ok {
+							allSeries = append(allSeries, key)
+							lastKey = key
+							batchCount++
+						}
 					}
 				}
 			}
@@ -1188,11 +1215,13 @@ func (a *InfluxDBV2Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, meas
 	}
 
 	var series []string
-	for _, seriesData := range result.Results {
-		for _, values := range seriesData.Values {
-			if len(values) > 0 {
-				if key, ok := values[0].(string); ok {
-					series = append(series, key)
+	for _, r := range result.Results {
+		for _, seriesData := range r.Series {
+			for _, values := range seriesData.Values {
+				if len(values) > 0 {
+					if key, ok := values[0].(string); ok {
+						series = append(series, key)
+					}
 				}
 			}
 		}

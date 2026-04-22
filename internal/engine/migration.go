@@ -1407,8 +1407,9 @@ func (e *MigrationEngine) targetConfigToMap(tgt types.TargetConfig) map[string]i
 	switch tgt.Type {
 	case "influxdb-v1":
 		influxCfg := map[string]interface{}{
-			"url":     tgt.InfluxDB.URL,
-			"version": tgt.InfluxDB.Version,
+			"url":      tgt.InfluxDB.URL,
+			"version":  tgt.InfluxDB.Version,
+			"database": tgt.Database,
 		}
 		// V1 target uses basic_auth with username/password
 		if tgt.User != "" {

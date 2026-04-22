@@ -363,14 +363,24 @@ type influxV1QueryResult struct {
 }
 
 func decodeInfluxV1TargetConfig(config map[string]interface{}, cfg interface{}) error {
+	// Database can be at top level or inside influxdb block - check both
+	if v, ok := config["database"].(string); ok {
+		cfg.(*InfluxDBV1TargetConfig).Database = v
+	}
+
 	cfgMap, ok := config["influxdb"].(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("influxdb config not found")
+		// If no influxdb block, at least database should have been set above
+		if cfg.(*InfluxDBV1TargetConfig).Database == "" {
+			return fmt.Errorf("influxdb config not found and database not specified at top level")
+		}
+		return nil
 	}
 
 	if v, ok := cfgMap["url"].(string); ok {
 		cfg.(*InfluxDBV1TargetConfig).URL = v
 	}
+	// Database inside influxdb block takes precedence if present
 	if v, ok := cfgMap["database"].(string); ok {
 		cfg.(*InfluxDBV1TargetConfig).Database = v
 	}
