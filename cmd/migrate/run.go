@@ -94,9 +94,11 @@ var runCmd = &cobra.Command{
 		sourceDB, targetDB := "", ""
 		sourceRP, targetRP := "", ""
 		sourceType, targetType := "", ""
+		taskName := ""
 
 		if len(cfg.Tasks) > 0 {
 			task := cfg.Tasks[0]
+			taskName = task.Name
 			sourceName = task.Source
 			targetName = task.Target
 
@@ -126,7 +128,7 @@ var runCmd = &cobra.Command{
 			}
 		}
 
-		migrationReport, err := reportGen.GenerateWithDetails(ctx, cfg.Global.Name, cfg.Global.Name,
+		migrationReport, err := reportGen.GenerateWithDetails(ctx, cfg.Global.Name, taskName,
 			sourceName, targetName, sourceDB, targetDB, sourceRP, targetRP, sourceType, targetType)
 		if err != nil {
 			logger.Warn("failed to generate report", zap.Error(err))

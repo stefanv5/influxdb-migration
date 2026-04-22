@@ -83,7 +83,7 @@ func (g *Generator) Generate(ctx context.Context, migrationID, taskName string) 
 }
 
 func (g *Generator) GenerateWithDetails(ctx context.Context, migrationID, taskName, sourceName, targetName, sourceDB, targetDB, sourceRP, targetRP, sourceType, targetType string) (*Report, error) {
-	checkpoints, err := g.checkpointMgr.ListCheckpoints(ctx, migrationID)
+	checkpoints, err := g.checkpointMgr.ListCheckpoints(ctx, taskName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list checkpoints: %w", err)
 	}

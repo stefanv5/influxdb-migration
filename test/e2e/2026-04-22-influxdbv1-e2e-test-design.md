@@ -827,6 +827,30 @@ dataset:
 - 失败原因（如有）
 - 数据完整性校验结果
 
+### 5.5 数据准备脚本
+
+使用 `test/e2e/scripts/setup_test_data.sh` 脚本管理测试数据：
+
+```bash
+# 设置测试数据（创建数据库并写入数据）
+./test/e2e/scripts/setup_test_data.sh setup
+
+# 验证现有数据
+./test/e2e/scripts/setup_test_data.sh verify
+
+# 清理测试数据
+./test/e2e/scripts/setup_test_data.sh cleanup
+```
+
+**环境变量：**
+- `SOURCE_URL` - Source InfluxDB 地址（默认：`http://127.0.0.1:8084`）
+- `SOURCE_DB` - Source 数据库名称（默认：`test_source`）
+- `SOURCE_RP` - Source Retention Policy（可选）
+
+**写入的数据：**
+- TC-S-F01: `cpu` measurement, 100 条记录
+- TC-S-F02: `cpu`, `memory`, `disk` measurements, 各 100 条记录
+
 ---
 
 ## 6. 附录
