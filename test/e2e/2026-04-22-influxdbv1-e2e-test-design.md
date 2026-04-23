@@ -795,6 +795,27 @@ dataset:
 
 ### 5.1 前置条件
 
+#### 5.1.1 系统环境检查
+
+**⚠️ 重要：每次执行测试前必须完成以下环境检查，确保测试环境处于干净状态**
+
+```bash
+# 1. 检查是否有残留的 migrate 进程（这些进程会锁住日志文件和 checkpoint）
+# 如果有残留进程，必须先 kill 掉
+ps aux | grep migrate | grep -v grep
+# 或在 Windows 上
+tasklist | findstr migrate
+
+# 2. 检查 InfluxDB 实例是否正常运行
+curl -s http://127.0.0.1:8084/ping  # Source
+curl -s http://127.0.0.1:8086/ping  # Target
+
+# 3. 检查日志文件是否被占用（如果日志文件 busy，说明有进程在写）
+rm -f test/e2e/logs/*.log
+```
+
+#### 5.1.2 基础设施要求
+
 1. 两个 InfluxDB v1 实例已部署并运行：
    - Source: 127.0.0.1:8084
    - Target: 127.0.0.1:8086
@@ -802,13 +823,87 @@ dataset:
 3. 8 GB 可用内存
 4. 足够的磁盘空间存储测试数据
 
+#### 5.1.3 数据准备
+
+1. **数据准备**：执行 `test/e2e/scripts/setup_test_data.sh setup` 初始化测试数据
+2. **数据验证**：执行 `test/e2e/scripts/setup_test_data.sh verify` 确认数据写入成功
+
 ### 5.2 环境清理
 
-每个测试用例执行前必须清理：
-- Source 数据库
-- Target 数据库
-- Checkpoint 目录
-- Report 目录
+> **⚠️ 警告：执行任何测试前必须完成环境清理。未清理的环境会导致测试结果不准确或进程死锁。**
+
+#### 5.2.1 清理步骤（必须按顺序执行）
+
+```bash
+# 1. 强制终止所有残留的 migrate 进程
+pkill -9 migrate 2>/dev/null || true
+# Windows 上手动结束所有 migrate.exe 进程
+
+# 2. 等待 2 秒确保进程完全退出
+sleep 2
+
+# 3. 清理 Checkpoint 目录（残留的 checkpoint 会导致任务状态混乱）
+rm -rf test/e2e/checkpoints/*
+
+# 4. 清理 Report 目录
+rm -rf test/e2e/reports/*
+
+# 5. 清理日志文件（避免日志被旧进程锁住）
+rm -f test/e2e/logs/*.log
+
+# 6. 清理 Target 数据库数据（避免残留数据影响验证）
+curl -s -X POST "http://127.0.0.1:8086/query" --data-urlencode "q=DROP DATABASE test_target"
+curl -s -X POST "http://127.0.0.1:8086/query" --data-urlencode "q=CREATE DATABASE test_target"
+
+# 7. 可选：清理 Source 数据库（如果需要重新初始化数据）
+# curl -s -X POST "http://127.0.0.1:8084/query" --data-urlencode "q=DROP DATABASE test_source"
+# curl -s -X POST "http://127.0.0.1:8084/query" --data-urlencode "q=CREATE DATABASE test_source"
+```
+
+#### 5.2.2 常见问题处理
+
+| 问题症状 | 原因 | 解决方案 |
+|---------|------|---------|
+| 日志文件无法删除 | 旧进程正在写入 | `pkill -9 migrate` 终止所有残留进程 |
+| Checkpoint 冲突 | 重复的任务 ID | 删除 `test/e2e/checkpoints/` 全部内容 |
+| 迁移卡住无输出 | 进程死锁或日志被锁 | 检查 `ps aux \| grep migrate` |
+| 数据重复 | 未清理 target | 先 DROP DATABASE 再执行测试 |
+
+#### 5.2.3 自动化环境检查脚本
+
+建议在 `test/e2e/scripts/` 目录下创建 `check_env.sh`：
+
+```bash
+#!/bin/bash
+# test/e2e/scripts/check_env.sh - 执行测试前的环境检查
+
+set -e
+
+echo "=== 环境检查 ==="
+
+# 检查 migrate 进程
+MIGRATE_PIDS=$(pgrep -f migrate 2>/dev/null || echo "")
+if [ -n "$MIGRATE_PIDS" ]; then
+    echo "❌ 发现残留的 migrate 进程: $MIGRATE_PIDS"
+    echo "   请先执行: pkill -9 migrate"
+    exit 1
+fi
+echo "✓ 无残留 migrate 进程"
+
+# 检查 InfluxDB 连接
+curl -s http://127.0.0.1:8084/ping > /dev/null 2>&1 || { echo "❌ Source InfluxDB 不可用"; exit 1; }
+echo "✓ Source InfluxDB 可用"
+
+curl -s http://127.0.0.1:8086/ping > /dev/null 2>&1 || { echo "❌ Target InfluxDB 不可用"; exit 1; }
+echo "✓ Target InfluxDB 可用"
+
+# 检查 checkpoint 目录
+if [ -d "test/e2e/checkpoints" ] && [ "$(ls -A test/e2e/checkpoints 2>/dev/null)" ]; then
+    echo "⚠️  Checkpoint 目录非空，将影响任务状态判断"
+fi
+
+echo "=== 环境检查完成 ==="
+```
 
 ### 5.3 验收标准
 

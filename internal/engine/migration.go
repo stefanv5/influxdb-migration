@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -243,6 +244,13 @@ func (e *MigrationEngine) discoverMappings(ctx context.Context, taskConfig types
 				if mapping.SubtablePattern != "" && len(series) > 1 {
 					mapping.TargetMeasurement = e.applySubtablePattern(table, serie, mapping.SubtablePattern)
 				}
+
+				// Deduplicate based on source_table:target_measurement
+				dedupKey := fmt.Sprintf("%s:%s", table, mapping.TargetMeasurement)
+				if seen[dedupKey] {
+					continue
+				}
+				seen[dedupKey] = true
 
 				result = append(result, mapping)
 			}
@@ -579,24 +587,63 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		zap.Int("batch_size", batchSize),
 		zap.Int("total_batches", len(batches)))
 
-	// Parse time range from mapping config, with defaults
-	startTime := time.Now().Add(-24 * time.Hour)
-	endTime := time.Now()
-	if task.Mapping.TimeRange.Start != "" {
-		if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.Start); err == nil {
-			startTime = parsed
+	// Determine time range: use config if specified, otherwise discover from shard groups
+	var startTime, endTime time.Time
+	windowDuration := 168 * time.Hour // default 7 days
+
+	if task.Mapping.TimeRange.Start != "" && task.Mapping.TimeRange.End != "" {
+		// Use configured time range
+		startTime, err = time.Parse(time.RFC3339, task.Mapping.TimeRange.Start)
+		if err != nil {
+			return fmt.Errorf("invalid start time: %w", err)
 		}
-	}
-	if task.Mapping.TimeRange.End != "" {
-		if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.End); err == nil {
-			endTime = parsed
+		endTime, err = time.Parse(time.RFC3339, task.Mapping.TimeRange.End)
+		if err != nil {
+			return fmt.Errorf("invalid end time: %w", err)
+		}
+	} else {
+		// Discover from shard groups: use first shard start and last shard end
+		shardGroups, err := sourceAdapter.DiscoverShardGroups(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to discover shard groups: %w", err)
+		}
+		if len(shardGroups) == 0 {
+			logger.Warn("no shard groups found, using default time range (1970 to now+1h)")
+			startTime = time.Unix(0, 0)
+			endTime = time.Now().Add(1 * time.Hour)
+		} else {
+			// Sort by start time
+			sort.Slice(shardGroups, func(i, j int) bool {
+				return shardGroups[i].StartTime.Before(shardGroups[j].StartTime)
+			})
+			startTime = shardGroups[0].StartTime
+			// Use last shard group's end time
+			lastSG := shardGroups[len(shardGroups)-1]
+			endTime = lastSG.EndTime
+			logger.Info("using time range from shard groups",
+				zap.Time("start", startTime),
+				zap.Time("end", endTime),
+				zap.Int("shard_count", len(shardGroups)))
+		}
+
+		// Override with config if only one is specified
+		if task.Mapping.TimeRange.Start != "" {
+			if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.Start); err == nil {
+				startTime = parsed
+			}
+		}
+		if task.Mapping.TimeRange.End != "" {
+			if parsed, err := time.Parse(time.RFC3339, task.Mapping.TimeRange.End); err == nil {
+				endTime = parsed
+			}
 		}
 	}
 
-	// Process each batch
-	queryCfg := &types.QueryConfig{
-		BatchSize:        e.config.Migration.ChunkSize,
-		MaxSeriesPerQuery: batchSize,
+	// Use time window from config, default 168h (7 days)
+	if task.Mapping.TimeWindow != "" {
+		if tw, err := time.ParseDuration(task.Mapping.TimeWindow); err == nil {
+			windowDuration = tw
+		}
 	}
 
 	// Load checkpoint to resume from previous position
@@ -605,89 +652,114 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		return fmt.Errorf("failed to load checkpoint: %w", err)
 	}
 
-	// Track last completed batch index for resume
-	// ProcessedRows stores the last completed batch index (1-based)
-	// This allows resuming from the correct batch after interruption
-	lastCompletedBatch := -1
+	// Track progress across windows
+	var lastCompletedWindowIdx int = -1
 	var lastTimestamp int64
 	if lastCheckpoint != nil && lastCheckpoint.Status == types.StatusInProgress {
-		lastCompletedBatch = int(lastCheckpoint.ProcessedRows) - 1
+		// For backward compatibility, decode window index from ProcessedRows
+		lastCompletedWindowIdx = int(lastCheckpoint.ProcessedRows) - 1
 		lastTimestamp = lastCheckpoint.LastTimestamp
 		logger.Info("resuming batch mode from checkpoint",
 			zap.String("task_id", task.ID),
-			zap.Int("last_completed_batch", lastCompletedBatch+1))
+			zap.Int("last_completed_window", lastCompletedWindowIdx+1))
 	}
 
-	for i, batch := range batches {
-		// Skip already completed batches for resume
-		if i <= lastCompletedBatch {
-			logger.Debug("skipping already completed batch",
+	// Split time range into windows
+	windows := SplitTimeWindows(startTime, endTime, windowDuration)
+	logger.Info("batch mode: time windows",
+		zap.String("task_id", task.ID),
+		zap.Int("window_count", len(windows)),
+		zap.Duration("window_duration", windowDuration),
+		zap.Time("start", startTime),
+		zap.Time("end", endTime))
+
+	queryCfg := &types.QueryConfig{
+		BatchSize:         e.config.Migration.ChunkSize,
+		MaxSeriesPerQuery: batchSize,
+	}
+
+	// Process each time window
+	for windowIdx, window := range windows {
+		if windowIdx <= lastCompletedWindowIdx {
+			logger.Debug("skipping already completed window",
 				zap.String("task_id", task.ID),
-				zap.Int("batch_index", i+1))
+				zap.Int("window_index", windowIdx+1))
 			continue
 		}
 
-		logger.Debug("processing batch",
+		windowStart := window.Start
+		windowEnd := window.End
+
+		logger.Info("processing window",
 			zap.String("task_id", task.ID),
-			zap.Int("batch_index", i+1),
-			zap.Int("batch_size", len(batch)))
+			zap.Int("window", windowIdx+1),
+			zap.Int("total_windows", len(windows)),
+			zap.Time("window_start", windowStart),
+			zap.Time("window_end", windowEnd))
 
-		// Create checkpoint for this batch to pass resume point
-		batchCheckpoint := &types.Checkpoint{
+		for i, batch := range batches {
+			logger.Debug("processing batch",
+				zap.String("task_id", task.ID),
+				zap.Int("window", windowIdx+1),
+				zap.Int("batch_index", i+1),
+				zap.Int("batch_size", len(batch)))
+
+			batchCheckpoint := &types.Checkpoint{
+				LastTimestamp: lastTimestamp,
+			}
+
+			cp, queryErr := sourceAdapter.QueryDataBatch(
+				ctx,
+				task.Mapping.SourceTable,
+				batch,
+				windowStart,
+				windowEnd,
+				batchCheckpoint,
+				func(records []types.Record) error {
+					if len(records) == 0 {
+						return nil
+					}
+					return e.processBatch(ctx, task.Mapping, records, targetAdapter)
+				},
+				queryCfg,
+			)
+
+			if queryErr != nil {
+				return fmt.Errorf("window %d, batch %d/%d failed: %w", windowIdx+1, i+1, len(batches), queryErr)
+			}
+
+			if cp != nil {
+				lastTimestamp = cp.LastTimestamp
+			}
+		}
+
+		// Save checkpoint after each window
+		windowCP := &types.Checkpoint{
+			TaskID:        task.ID,
+			SourceTable:   task.Mapping.SourceTable,
+			LastID:        0,
 			LastTimestamp: lastTimestamp,
+			ProcessedRows: int64(windowIdx + 1), // Store window index for resume
+			Status:        types.StatusInProgress,
+		}
+		if lastCheckpoint != nil {
+			windowCP.TaskName = lastCheckpoint.TaskName
+			windowCP.TargetMeas = lastCheckpoint.TargetMeas
+			windowCP.MappingConfig = lastCheckpoint.MappingConfig
+		}
+		if err := e.checkpointMgr.SaveCheckpoint(ctx, windowCP); err != nil {
+			if e.config.Migration.FailOnCheckpointError {
+				return fmt.Errorf("failed to save checkpoint: %w", err)
+			}
+			logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
 		}
 
-		cp, queryErr := sourceAdapter.QueryDataBatch(
-			ctx,
-			task.Mapping.SourceTable,
-			batch,
-			startTime,
-			endTime,
-			batchCheckpoint,
-			func(records []types.Record) error {
-				if len(records) == 0 {
-					return nil
-				}
-				return e.processBatch(ctx, task.Mapping, records, targetAdapter)
-			},
-			queryCfg,
-		)
-
-		if queryErr != nil {
-			return fmt.Errorf("batch %d/%d failed: %w", i+1, len(batches), queryErr)
-		}
-
-		if cp != nil {
-			lastTimestamp = cp.LastTimestamp
-
-			// Save checkpoint after each batch to prevent data loss on crash.
-			// ProcessedRows stores the batch index (i+1) for resume tracking.
-			// This uses "at-least-once" semantics: on crash we may re-process
-			// this batch, but we will never lose data.
-			batchCP := &types.Checkpoint{
-				TaskID:        task.ID,
-				SourceTable:   task.Mapping.SourceTable,
-				LastID:        0,
-				LastTimestamp: cp.LastTimestamp,
-				ProcessedRows: int64(i + 1),
-				Status:        types.StatusInProgress,
-			}
-			if lastCheckpoint != nil {
-				batchCP.TaskName = lastCheckpoint.TaskName
-				batchCP.TargetMeas = lastCheckpoint.TargetMeas
-				batchCP.MappingConfig = lastCheckpoint.MappingConfig
-			}
-			if err := e.checkpointMgr.SaveCheckpoint(ctx, batchCP); err != nil {
-				if e.config.Migration.FailOnCheckpointError {
-					return fmt.Errorf("failed to save checkpoint: %w", err)
-				}
-				logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
-			}
-		}
+		lastCompletedWindowIdx = windowIdx
 	}
 
 	logger.Info("completed batch mode task",
 		zap.String("task_id", task.ID),
+		zap.Int("total_windows", len(windows)),
 		zap.Int("total_batches", len(batches)))
 
 	// Save final checkpoint with completed status
@@ -696,7 +768,7 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		SourceTable:   task.Mapping.SourceTable,
 		LastID:        0,
 		LastTimestamp: lastTimestamp,
-		ProcessedRows: int64(len(batches)),
+		ProcessedRows: int64(len(windows)),
 		Status:        types.StatusCompleted,
 	}
 	if lastCheckpoint != nil {
