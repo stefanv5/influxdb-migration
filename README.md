@@ -137,6 +137,32 @@ influx_to_influx:
   max_series_per_query: 100      # default: 100, max: 1000
 ```
 
+#### Time Range Filtering
+
+For InfluxDB → InfluxDB migrations, you can filter data by time range using `time_range` within each mapping:
+
+```yaml
+influx_to_influx:
+  enabled: true
+  query_mode: "batch"
+
+tasks:
+  - name: "time-filtered-migration"
+    source: "source-influx"
+    target: "target-influx"
+    mappings:
+      - source_table: "cpu"
+        target_measurement: "cpu"
+        time_range:
+          start: "2025-04-01T00:00:00Z"
+          end: "2025-04-15T00:00:00Z"
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `time_range.start` | string | Start time in RFC3339 format (inclusive) |
+| `time_range.end` | string | End time in RFC3339 format (exclusive) |
+
 ### Shard-Group Mode (recommended for large datasets)
 Queries InfluxDB for shard group metadata to discover series **per shard group per time window**, avoiding OOM issues without LIMIT/OFFSET. Provides precise crash recovery at shard group + time window + batch level.
 
