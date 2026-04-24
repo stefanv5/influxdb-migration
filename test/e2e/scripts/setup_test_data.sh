@@ -113,6 +113,154 @@ write_tc_s_f01_data() {
     fi
 }
 
+# Write TC-M-F01 test data: 5 measurements, 5000 records each
+write_tc_m_f01_data() {
+    log_info "Writing TC-M-F01 test data (5 measurements, 5000 records each)..."
+
+    local measurements=("cpu" "memory" "disk" "network" "process")
+    local records_per_meas=5000
+    local base_ts=1745280000000000000
+    local tmpfile=$(mktemp)
+
+    for meas in "${measurements[@]}"; do
+        log_info "  - Writing ${meas} (${records_per_meas} records)..."
+
+        local batch_size=1000
+        for batch_start in $(seq 0 $batch_size $((records_per_meas - 1))); do
+            > "$tmpfile"
+            local batch_end=$((batch_start + batch_size - 1))
+            if [ $batch_end -ge $records_per_meas ]; then
+                batch_end=$((records_per_meas - 1))
+            fi
+
+            for i in $(seq $batch_start $batch_end); do
+                local offset=$((i * 60 * 1000000000))
+                local ts=$((base_ts + offset))
+                local value=$((RANDOM % 100)).$((RANDOM % 100))
+
+                case $meas in
+                    cpu)
+                        echo "cpu,host=server-$(printf "%03d" $((i % 5 + 1))),region=us-west cpu_usage=${value} ${ts}" >> "$tmpfile"
+                        ;;
+                    memory)
+                        echo "memory,host=server-$(printf "%03d" $((i % 5 + 1))),region=us-west memory_usage=${value} ${ts}" >> "$tmpfile"
+                        ;;
+                    disk)
+                        echo "disk,host=server-$(printf "%03d" $((i % 5 + 1))),region=us-west disk_usage=${value} ${ts}" >> "$tmpfile"
+                        ;;
+                    network)
+                        echo "network,host=server-$(printf "%03d" $((i % 5 + 1))),region=us-west network_usage=${value} ${ts}" >> "$tmpfile"
+                        ;;
+                    process)
+                        echo "process,host=server-$(printf "%03d" $((i % 5 + 1))),region=us-west process_count=$((RANDOM % 100)) ${ts}" >> "$tmpfile"
+                        ;;
+                esac
+            done
+
+            local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
+            curl -s -X POST "${write_url}" \
+                -H "Content-Type: text/plain" \
+                --data-binary "@$tmpfile" > /dev/null
+        done
+
+        log_info "  - ${meas}: ${records_per_meas} records written"
+    done
+
+    rm -f "$tmpfile"
+}
+
+# Write TC-M-F02 test data: 1 measurement, 20 series, 1000 records each
+write_tc_m_f02_data() {
+    log_info "Writing TC-M-F02 test data (metrics, 20 series, 1000 records each)..."
+
+    local meas="metrics"
+    local series_count=20
+    local records_per_series=1000
+    local base_ts=1745280000000000000
+    local hosts=("server-001" "server-002" "server-003" "server-004" "server-005")
+    local regions=("us-west" "us-east" "eu-west" "ap-east")
+    local tmpfile=$(mktemp)
+
+    for s in $(seq 0 $((series_count - 1))); do
+        local host="${hosts[$((s % 5))]}"
+        local region="${regions[$((s % 4))]}"
+        local tags="host=${host},region=${region},env=prod"
+
+        local batch_size=500
+        for batch_start in $(seq 0 $batch_size $((records_per_series - 1))); do
+            > "$tmpfile"
+            local batch_end=$((batch_start + batch_size - 1))
+            if [ $batch_end -ge $records_per_series ]; then
+                batch_end=$((records_per_series - 1))
+            fi
+
+            for i in $(seq $batch_start $batch_end); do
+                local offset=$((i * 60 * 1000000000))
+                local ts=$((base_ts + offset))
+                local value=$((RANDOM % 100)).$((RANDOM % 100))
+                echo "${meas},${tags} value=${value} ${ts}" >> "$tmpfile"
+            done
+
+            local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
+            curl -s -X POST "${write_url}" \
+                -H "Content-Type: text/plain" \
+                --data-binary "@$tmpfile" > /dev/null
+        done
+
+        log_info "  - Series $((s + 1))/20 completed"
+    done
+
+    rm -f "$tmpfile"
+    log_info "  - ${meas}: $((series_count * records_per_series)) total records"
+}
+
+# Write TC-L-F01 test data: ~100k records for shard-group testing
+write_tc_l_f01_data() {
+    log_info "Writing TC-L-F01 test data (~100k records for shard-group)..."
+
+    local meas="metrics"
+    local total_records=100000
+    local base_ts=1745280000000000000  # 2025-04-22
+    local hosts=("server-001" "server-002" "server-003" "server-004" "server-005")
+    local regions=("us-west" "us-east" "eu-west" "ap-east")
+    local tmpfile=$(mktemp)
+
+    log_info "  - Target: ${total_records} records across 30 days"
+
+    local batch_size=5000
+    local batch_count=0
+
+    for batch_start in $(seq 0 $batch_size $((total_records - 1))); do
+        > "$tmpfile"
+        local batch_end=$((batch_start + batch_size - 1))
+        if [ $batch_end -ge $total_records ]; then
+            batch_end=$((total_records - 1))
+        fi
+
+        for i in $(seq $batch_start $batch_end); do
+            local offset=$((i * 25 * 1000000000))  # ~25 second intervals
+            local ts=$((base_ts + offset))
+            local host="${hosts[$((i % 5))]}"
+            local region="${regions[$((i % 4))]}"
+            local value=$((RANDOM % 100)).$((RANDOM % 100))
+            echo "${meas},host=${host},region=${region} value=${value} ${ts}" >> "$tmpfile"
+        done
+
+        local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
+        curl -s -X POST "${write_url}" \
+            -H "Content-Type: text/plain" \
+            --data-binary "@$tmpfile" > /dev/null
+
+        batch_count=$((batch_count + 1))
+        if [ $((batch_count % 5)) -eq 0 ]; then
+            log_info "  - Progress: $((batch_start + batch_size))/${total_records}"
+        fi
+    done
+
+    rm -f "$tmpfile"
+    log_info "  - ${meas}: ${total_records} records written (spanning ~30 days)"
+}
+
 # Write TC-S-F02 test data: 3 measurements, 100 records each
 write_tc_s_f02_data() {
     log_info "Writing TC-S-F02 test data (cpu, memory, disk measurements, 100 records each)..."
@@ -163,10 +311,10 @@ write_tc_s_f02_data() {
 verify_data() {
     log_info "Verifying data in ${SOURCE_DB}..."
 
-    for meas in cpu memory disk; do
+    for meas in cpu memory disk network process metrics; do
         local count=$(curl -s -G "${SOURCE_URL}/query" \
             --data-urlencode "db=${SOURCE_DB}" \
-            --data-urlencode "q=SELECT COUNT(*) FROM ${meas}" | \
+            --data-urlencode "q=SELECT COUNT(*) FROM ${meas}" 2>/dev/null | \
             grep -o '"value":[0-9]*' | grep -o '[0-9]*' || echo "0")
 
         if [ -n "$count" ] && [ "$count" != "0" ]; then
@@ -179,7 +327,7 @@ verify_data() {
 cleanup() {
     log_info "Cleaning up test data..."
 
-    for meas in cpu memory disk; do
+    for meas in cpu memory disk network process; do
         curl -s -X POST "${SOURCE_URL}/query" \
             --data-urlencode "q=DROP MEASUREMENT ${meas}" \
             --data-urlencode "db=${SOURCE_DB}" > /dev/null
@@ -198,6 +346,9 @@ main() {
             create_database
             write_tc_s_f01_data
             write_tc_s_f02_data
+            write_tc_m_f01_data
+            write_tc_m_f02_data
+            write_tc_l_f01_data
             verify_data
             ;;
         verify)
