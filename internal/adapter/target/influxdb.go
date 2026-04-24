@@ -169,6 +169,9 @@ func formatTags(tags map[string]string) string {
 
 	var parts []string
 	for k, v := range tags {
+		if v == "" {
+			continue
+		}
 		parts = append(parts, fmt.Sprintf("%s=%s", escapeTagValue(k), escapeTagValue(v)))
 	}
 	return strings.Join(parts, ",")
