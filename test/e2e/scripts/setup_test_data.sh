@@ -379,11 +379,47 @@ write_tc_s_d06_data() {
     fi
 }
 
+# Write TC-S-D07 test data: special float values (NaN, Inf)
+# Note: InfluxDB Line Protocol doesn't support NaN/Inf directly
+# We write them as strings to test how the migrator handles them
+write_tc_s_d07_data() {
+    log_info "Writing TC-S-D07 test data (special float values)..."
+
+    local meas="special_floats"
+    local base_ts=1745280000000000000
+    local tmpfile=$(mktemp)
+
+    # InfluxDB doesn't support NaN/Inf in line protocol
+    # We write them as special string values to test how the migrator handles them
+    for i in $(seq 1 100); do
+        local offset=$(( (i - 1) * 60 * 1000000000))
+        local ts=$((base_ts + offset))
+
+        # Write as string since InfluxDB line protocol doesn't support NaN/Inf
+        echo "${meas},host=server-001 nan_val=\"NaN\",pos_inf=\"+Inf\",neg_inf=\"-Inf\" ${ts}" >> "$tmpfile"
+    done
+
+    local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
+    response=$(curl -s -w "\n%{http_code}" -X POST "${write_url}" \
+        -H "Content-Type: text/plain" \
+        --data-binary "@$tmpfile")
+    local http_code=$(echo "$response" | tail -n1)
+    if [ "$http_code" = "204" ] || [ "$http_code" = "200" ]; then
+        log_info "  - ${meas}: 100 records with special float values written"
+    else
+        log_error "Failed to write data: HTTP ${http_code}"
+        rm -f "$tmpfile"
+        exit 1
+    fi
+
+    rm -f "$tmpfile"
+}
+
 # Verify data
 verify_data() {
     log_info "Verifying data in ${SOURCE_DB}..."
 
-    for meas in cpu memory disk network process metrics special_names special_tag_values; do
+    for meas in cpu memory disk network process metrics special_names special_tag_values special_floats; do
         local count=$(curl -s -G "${SOURCE_URL}/query" \
             --data-urlencode "db=${SOURCE_DB}" \
             --data-urlencode "q=SELECT COUNT(*) FROM ${meas}" 2>/dev/null | \
@@ -399,7 +435,7 @@ verify_data() {
 cleanup() {
     log_info "Cleaning up test data..."
 
-    for meas in cpu memory disk network process special_names special_tag_values; do
+    for meas in cpu memory disk network process special_names special_tag_values special_floats; do
         curl -s -X POST "${SOURCE_URL}/query" \
             --data-urlencode "q=DROP MEASUREMENT ${meas}" \
             --data-urlencode "db=${SOURCE_DB}" > /dev/null
@@ -420,6 +456,7 @@ main() {
             write_tc_s_f02_data
             write_tc_s_d05_data
             write_tc_s_d06_data
+            write_tc_s_d07_data
             write_tc_m_f01_data
             write_tc_m_f02_data
             write_tc_l_f01_data
