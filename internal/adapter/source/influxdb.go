@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -394,61 +394,48 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 		startTime = time.Unix(0, lastTS).Format(time.RFC3339Nano)
 	}
 
-	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339)
+	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339Nano)
 
-	batchSize := 10000
+	chunkSize := 10000
 	if cfg != nil && cfg.BatchSize > 0 {
-		batchSize = cfg.BatchSize
+		chunkSize = cfg.BatchSize
 	}
-	totalRecords := int(totalProcessed)
 
-	for {
-		query := fmt.Sprintf(`SELECT * FROM %s WHERE time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
-			influxQuoteIdentifier(measurement), startTime, endTime, batchSize)
+	// Build query without LIMIT - InfluxDB will return data in chunks
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE time >= '%s' AND time < '%s'`,
+		influxQuoteIdentifier(measurement), startTime, endTime)
 
-		records, err := a.executeSelectQuery(ctx, query)
-		if err != nil {
-			return nil, err
-		}
+	logger.Debug("executing chunked query for InfluxDB V1",
+		zap.String("measurement", measurement),
+		zap.Int("chunk_size", chunkSize),
+		zap.String("query_start", startTime),
+		zap.String("query_end", endTime))
 
-		if len(records) == 0 {
-			break
-		}
+	var totalRecords int
+	var maxTS int64
 
-		if err := batchFunc(records); err != nil {
-			return nil, err
-		}
-
+	// Use chunked query - InfluxDB automatically splits response into chunks
+	err := a.executeChunkedQuery(ctx, query, chunkSize, func(records []types.Record) error {
 		totalRecords += len(records)
 		totalProcessed += int64(len(records))
-
-		maxTS := records[len(records)-1].Time
-		lastTS = maxTS
-		// Use RFC3339Nano format consistently for time-based pagination
-		startTime = time.Unix(0, maxTS+1).Format(time.RFC3339Nano)
-
-		logger.Debug("fetched batch from InfluxDB V1",
-			zap.String("measurement", measurement),
-			zap.Int("batch_size", len(records)),
-			zap.String("next_start", startTime))
-
-		if len(records) < batchSize {
-			break
+		for _, record := range records {
+			if record.Time > maxTS {
+				maxTS = record.Time
+			}
 		}
+		return batchFunc(records)
+	})
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+	if err != nil {
+		return nil, fmt.Errorf("chunked query failed: %w", err)
 	}
 
-	logger.Info("completed InfluxDB V1 query",
+	logger.Info("completed chunked query for InfluxDB V1",
 		zap.String("measurement", measurement),
 		zap.Int("total_records", totalRecords))
 
 	return &types.Checkpoint{
-		LastTimestamp: lastTS,
+		LastTimestamp: maxTS,
 		ProcessedRows: totalProcessed,
 	}, nil
 }
@@ -468,81 +455,42 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		queryStart = time.Unix(0, lastTS)
 	}
 
-	batchSize := getBatchSize(cfg)
+	chunkSize := getBatchSize(cfg)
 	whereClause := BuildWhereClause(series)
+
+	// Build query without LIMIT - InfluxDB will return data in chunks
+	query := fmt.Sprintf("SELECT * FROM %s WHERE (%s) AND time >= '%s' AND time < '%s'",
+		influxQuoteIdentifier(measurement),
+		whereClause,
+		queryStart.Format(time.RFC3339Nano),
+		endTime.Format(time.RFC3339Nano))
+
+	logger.Debug("executing chunked query for InfluxDB V1",
+		zap.String("measurement", measurement),
+		zap.Int("series_count", len(series)),
+		zap.Int("chunk_size", chunkSize),
+		zap.String("query_start", queryStart.Format(time.RFC3339Nano)),
+		zap.String("query_end", endTime.Format(time.RFC3339Nano)))
 
 	var totalRecords int
 	var maxTS int64
 
-	for {
-		// Query with time bounds: startTime (or resume point) AND endTime
-		query := fmt.Sprintf(`
-			SELECT * FROM %s
-			WHERE (%s) AND time >= '%s' AND time < '%s'
-			LIMIT %d ORDER BY time`,
-			influxQuoteIdentifier(measurement),
-			whereClause,
-			queryStart.Format(time.RFC3339Nano),
-			endTime.Format(time.RFC3339Nano),
-			batchSize)
-
-		logger.Debug("executing batch query for InfluxDB V1",
-			zap.String("measurement", measurement),
-			zap.Int("series_count", len(series)),
-			zap.String("query", query))
-
-		records, err := a.executeSelectQuery(ctx, query)
-		if err != nil {
-			return nil, fmt.Errorf("batch query failed: %w", err)
-		}
-
-		if len(records) == 0 {
-			break
-		}
-
-		if err := batchFunc(records); err != nil {
-			return nil, fmt.Errorf("batch func failed: %w", err)
-		}
-
+	// Use chunked query - InfluxDB automatically splits response into chunks
+	err := a.executeChunkedQuery(ctx, query, chunkSize, func(records []types.Record) error {
 		totalRecords += len(records)
-
-		// Update max timestamp from this batch
 		for _, record := range records {
 			if record.Time > maxTS {
 				maxTS = record.Time
 			}
 		}
+		return batchFunc(records)
+	})
 
-		logger.Debug("fetched batch from InfluxDB V1",
-			zap.String("measurement", measurement),
-			zap.Int("batch_size", len(records)),
-			zap.String("next_start", queryStart.Format(time.RFC3339Nano)))
-
-		// If we got fewer records than batch size, we're done
-		if len(records) < batchSize {
-			break
-		}
-
-		// Update queryStart for next query using the last record's timestamp
-		if maxTS < math.MaxInt64 {
-			queryStart = time.Unix(0, maxTS+1)
-		} else {
-			queryStart = time.Unix(0, maxTS)
-		}
-
-		// Don't query beyond window end
-		if queryStart.UnixNano() >= endTime.UnixNano() {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+	if err != nil {
+		return nil, fmt.Errorf("chunked query failed: %w", err)
 	}
 
-	logger.Info("completed batch query for InfluxDB V1",
+	logger.Info("completed chunked query for InfluxDB V1",
 		zap.String("measurement", measurement),
 		zap.Int("series_count", len(series)),
 		zap.Int("total_records", totalRecords),
@@ -610,7 +558,7 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 	for _, r := range result.Results {
 		for _, series := range r.Series {
 			for _, values := range series.Values {
-				record := a.parseValues(series.Columns, values)
+				record := a.parseValues(series.Columns, values, series.Tags)
 				records = append(records, *record)
 			}
 		}
@@ -619,8 +567,122 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 	return records, nil
 }
 
-func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}) *types.Record {
+// executeChunkedQuery 执行chunked查询，流式处理每个chunk
+// 适用于 SELECT * 查询，让InfluxDB自动按chunk_size分块返回
+// 注意：InfluxDB的chunked响应是多个JSON数组，每个数组是一个chunk
+func (a *InfluxDBV1Adapter) executeChunkedQuery(
+	ctx context.Context,
+	query string,
+	chunkSize int,
+	batchFunc func([]types.Record) error,
+) error {
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("db", a.config.Database)
+	params.Set("chunked", "true")
+	params.Set("chunk_size", strconv.Itoa(chunkSize))
+
+	if a.config.Username != "" {
+		params.Set("u", a.config.Username)
+		params.Set("p", a.config.Password)
+	}
+
+	u, err := url.Parse(a.baseURL)
+	if err != nil {
+		return fmt.Errorf("invalid base URL: %w", err)
+	}
+	u.Path = "/query"
+	u.RawQuery = params.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("create request failed: %w", err)
+	}
+
+	logger.Debug("executing chunked query for InfluxDB V1",
+		zap.String("url", redactURL(u)))
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("chunked query request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("query failed with status %d", resp.StatusCode)
+		}
+		return fmt.Errorf("query failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// 使用json.Decoder流式读取chunked响应
+	decoder := json.NewDecoder(resp.Body)
+	totalRecords := 0
+	chunkIndex := 0
+
+	for {
+		chunkIndex++
+		// 读取一个chunk - InfluxDB返回的是序列数组格式
+		// 每个chunk是一个influxV1Result对象
+		var result influxV1Result
+		if err := decoder.Decode(&result); err != nil {
+			if err == io.EOF {
+				logger.Debug("chunked query EOF",
+					zap.Int("chunk_index", chunkIndex),
+					zap.Int("total_records", totalRecords))
+				break
+			}
+			return fmt.Errorf("decode chunk failed: %w", err)
+		}
+
+		// 检查V1 API错误
+		if result.Error != "" {
+			return fmt.Errorf("V1 query error: %s", result.Error)
+		}
+
+		// 解析chunk为records
+		records := make([]types.Record, 0)
+		seriesCount := 0
+		for _, r := range result.Results {
+			seriesCount += len(r.Series)
+			for _, series := range r.Series {
+				for _, values := range series.Values {
+					record := a.parseValues(series.Columns, values, series.Tags)
+					records = append(records, *record)
+				}
+			}
+		}
+
+		logger.Debug("chunked query chunk processed",
+			zap.Int("chunk_index", chunkIndex),
+			zap.Int("series_count", seriesCount),
+			zap.Int("records_in_chunk", len(records)),
+			zap.Int("total_records_so_far", totalRecords))
+
+		// 处理records
+		if len(records) > 0 {
+			if err := batchFunc(records); err != nil {
+				return fmt.Errorf("batch func failed: %w", err)
+			}
+			totalRecords += len(records)
+		}
+	}
+
+	logger.Debug("completed chunked query for InfluxDB V1",
+		zap.Int("total_records", totalRecords))
+
+	return nil
+}
+
+func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}, seriesTags map[string]string) *types.Record {
 	record := types.NewRecord()
+
+	// First, copy series-level tags (e.g., host, region, env from InfluxDB series tags)
+	// These are the tags that define the series identity but aren't repeated in each row
+	for k, v := range seriesTags {
+		record.AddTag(k, v)
+	}
 
 	for i, col := range columns {
 		if i >= len(values) {
@@ -907,9 +969,9 @@ func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query stri
 			for _, values := range series.Values {
 				var record *types.Record
 				if tagKeySet != nil {
-					record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet)
+					record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet, series.Tags)
 				} else {
-					record = parseV1Values(series.Columns, values)
+					record = parseV1Values(series.Columns, values, series.Tags)
 				}
 				records = append(records, *record)
 			}
@@ -919,10 +981,106 @@ func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query stri
 	return records, nil
 }
 
+// executeV1ChunkedQuery executes chunked query using V1 compatibility API for V2 adapter
+// This allows V2 adapter to use the native InfluxDB chunked response format
+func (a *InfluxDBV2Adapter) executeV1ChunkedQuery(
+	ctx context.Context,
+	query string,
+	chunkSize int,
+	tagKeySet map[string]bool,
+	batchFunc func([]types.Record) error,
+) error {
+	params := a.buildV1QueryParams(query)
+	params.Set("chunked", "true")
+	params.Set("chunk_size", strconv.Itoa(chunkSize))
+
+	u, err := url.Parse(a.buildV1URL())
+	if err != nil {
+		return fmt.Errorf("invalid V1 API URL: %w", err)
+	}
+	u.RawQuery = params.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("create request failed: %w", err)
+	}
+
+	logger.Debug("executing chunked query for InfluxDB V2 (V1 API)",
+		zap.String("url", redactURL(u)))
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("chunked query request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("query failed with status %d", resp.StatusCode)
+		}
+		return fmt.Errorf("query failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Use json.Decoder to stream through chunked response
+	decoder := json.NewDecoder(resp.Body)
+	totalRecords := 0
+
+	for {
+		// Read one chunk - InfluxDB returns series arrays
+		var result influxV1Result
+		if err := decoder.Decode(&result); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("decode chunk failed: %w", err)
+		}
+
+		// Check for V1 API errors
+		if result.Error != "" {
+			return fmt.Errorf("V1 query error: %s", result.Error)
+		}
+
+		// Parse chunk into records
+		records := make([]types.Record, 0)
+		for _, r := range result.Results {
+			for _, series := range r.Series {
+				for _, values := range series.Values {
+					var record *types.Record
+					if tagKeySet != nil {
+						record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet, series.Tags)
+					} else {
+						record = parseV1Values(series.Columns, values, series.Tags)
+					}
+					records = append(records, *record)
+				}
+			}
+		}
+
+		// Process records
+		if len(records) > 0 {
+			if err := batchFunc(records); err != nil {
+				return fmt.Errorf("batch func failed: %w", err)
+			}
+			totalRecords += len(records)
+		}
+	}
+
+	logger.Debug("completed chunked query for InfluxDB V2 (V1 API)",
+		zap.Int("total_records", totalRecords))
+
+	return nil
+}
+
 // parseV1Values parses V1 query result values into a Record
 // This treats all non-time string values as fields (for V1 adapter or when tagKeys is unavailable)
-func parseV1Values(columns []string, values []interface{}) *types.Record {
+func parseV1Values(columns []string, values []interface{}, seriesTags map[string]string) *types.Record {
 	record := types.NewRecord()
+
+	// First, copy series-level tags
+	for k, v := range seriesTags {
+		record.AddTag(k, v)
+	}
 
 	for i, col := range columns {
 		if i >= len(values) {
@@ -970,8 +1128,13 @@ func parseV1Values(columns []string, values []interface{}) *types.Record {
 
 // parseV1ValuesWithTagKeys parses V1 query result values into a Record
 // It uses tagKeySet to distinguish tags from fields - strings in tagKeySet are tags
-func parseV1ValuesWithTagKeys(columns []string, values []interface{}, tagKeySet map[string]bool) *types.Record {
+func parseV1ValuesWithTagKeys(columns []string, values []interface{}, tagKeySet map[string]bool, seriesTags map[string]string) *types.Record {
 	record := types.NewRecord()
+
+	// First, copy series-level tags
+	for k, v := range seriesTags {
+		record.AddTag(k, v)
+	}
 
 	for i, col := range columns {
 		if i >= len(values) {
@@ -1243,22 +1406,19 @@ func (a *InfluxDBV2Adapter) DiscoverSchema(ctx context.Context, table string) (*
 func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	var startTime string
 	var totalProcessed int64
-	var lastTS int64
 
 	if lastCheckpoint != nil && lastCheckpoint.LastTimestamp != 0 {
 		startTime = time.Unix(0, lastCheckpoint.LastTimestamp).Format(time.RFC3339Nano)
-		lastTS = lastCheckpoint.LastTimestamp
 	} else {
 		startTime = "1970-01-01T00:00:00Z"
 	}
 
 	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339Nano)
 
-	batchSize := 10000
+	chunkSize := 10000
 	if cfg != nil && cfg.BatchSize > 0 {
-		batchSize = cfg.BatchSize
+		chunkSize = cfg.BatchSize
 	}
-	totalRecords := 0
 
 	// Discover tag keys to distinguish tags from fields
 	tagKeys, _ := a.DiscoverTagKeys(ctx, measurement)
@@ -1267,58 +1427,42 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 		tagKeySet[k] = true
 	}
 
-	for {
-		// Use V1 compatibility API with LIMIT/OFFSET pagination
-		query := fmt.Sprintf(
-			`SELECT * FROM %s WHERE time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
-			influxQuoteIdentifier(measurement), startTime, endTime, batchSize)
+	// Build query without LIMIT - InfluxDB will return data in chunks
+	query := fmt.Sprintf(
+		`SELECT * FROM %s WHERE time >= '%s' AND time < '%s'`,
+		influxQuoteIdentifier(measurement), startTime, endTime)
 
-		records, err := a.executeV1SelectQuery(ctx, query, tagKeySet)
-		if err != nil {
-			return nil, err
-		}
+	logger.Debug("executing chunked query for InfluxDB V2 (V1 API)",
+		zap.String("measurement", measurement),
+		zap.Int("chunk_size", chunkSize),
+		zap.String("query_start", startTime),
+		zap.String("query_end", endTime))
 
-		if len(records) == 0 {
-			break
-		}
+	var totalRecords int
+	var maxTS int64
 
-		if err := batchFunc(records); err != nil {
-			return nil, err
-		}
-
+	// Use chunked query - InfluxDB automatically splits response into chunks
+	err := a.executeV1ChunkedQuery(ctx, query, chunkSize, tagKeySet, func(records []types.Record) error {
 		totalRecords += len(records)
 		totalProcessed += int64(len(records))
-
-		maxTS := records[len(records)-1].Time
-		lastTS = maxTS
-		if maxTS < math.MaxInt64 {
-			startTime = time.Unix(0, maxTS+1).Format(time.RFC3339Nano)
-		} else {
-			startTime = time.Unix(0, maxTS).Format(time.RFC3339Nano)
+		for _, record := range records {
+			if record.Time > maxTS {
+				maxTS = record.Time
+			}
 		}
+		return batchFunc(records)
+	})
 
-		logger.Debug("fetched batch from InfluxDB V2 (V1 API)",
-			zap.String("measurement", measurement),
-			zap.Int("batch_size", len(records)),
-			zap.String("next_start", startTime))
-
-		if len(records) < batchSize {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+	if err != nil {
+		return nil, fmt.Errorf("chunked query failed: %w", err)
 	}
 
-	logger.Info("completed InfluxDB V2 query (V1 API)",
+	logger.Info("completed chunked query for InfluxDB V2 (V1 API)",
 		zap.String("measurement", measurement),
 		zap.Int("total_records", totalRecords))
 
 	return &types.Checkpoint{
-		LastTimestamp: lastTS,
+		LastTimestamp: maxTS,
 		ProcessedRows: totalProcessed,
 	}, nil
 }
@@ -1338,7 +1482,7 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		queryStart = time.Unix(0, lastTS)
 	}
 
-	batchSize := getBatchSize(cfg)
+	chunkSize := getBatchSize(cfg)
 	whereClause := BuildWhereClause(series)
 
 	// Discover tag keys to distinguish tags from fields
@@ -1348,76 +1492,40 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		tagKeySet[k] = true
 	}
 
+	// Build query without LIMIT - InfluxDB will return data in chunks
+	query := fmt.Sprintf(
+		`SELECT * FROM %s WHERE (%s) AND time >= '%s' AND time < '%s'`,
+		influxQuoteIdentifier(measurement),
+		whereClause,
+		queryStart.Format(time.RFC3339Nano),
+		endTime.Format(time.RFC3339Nano))
+
+	logger.Debug("executing chunked query for InfluxDB V2 (V1 API)",
+		zap.String("measurement", measurement),
+		zap.Int("series_count", len(series)),
+		zap.Int("chunk_size", chunkSize),
+		zap.String("query_start", queryStart.Format(time.RFC3339Nano)),
+		zap.String("query_end", endTime.Format(time.RFC3339Nano)))
+
 	var totalRecords int
 	var maxTS int64
 
-	for {
-		// Use V1 compatibility API with WHERE clause for series filtering
-		query := fmt.Sprintf(
-			`SELECT * FROM %s WHERE (%s) AND time >= '%s' AND time < '%s' ORDER BY time LIMIT %d`,
-			influxQuoteIdentifier(measurement),
-			whereClause,
-			queryStart.Format(time.RFC3339Nano),
-			endTime.Format(time.RFC3339Nano),
-			batchSize)
-
-		logger.Debug("executing batch query for InfluxDB V2 (V1 API)",
-			zap.String("measurement", measurement),
-			zap.Int("series_count", len(series)),
-			zap.String("query", query))
-
-		records, err := a.executeV1SelectQuery(ctx, query, tagKeySet)
-		if err != nil {
-			return nil, fmt.Errorf("batch query failed: %w", err)
-		}
-
-		if len(records) == 0 {
-			break
-		}
-
-		if err := batchFunc(records); err != nil {
-			return nil, fmt.Errorf("batch func failed: %w", err)
-		}
-
+	// Use chunked query - InfluxDB automatically splits response into chunks
+	err := a.executeV1ChunkedQuery(ctx, query, chunkSize, tagKeySet, func(records []types.Record) error {
 		totalRecords += len(records)
-
-		// Update max timestamp from this batch
 		for _, record := range records {
 			if record.Time > maxTS {
 				maxTS = record.Time
 			}
 		}
+		return batchFunc(records)
+	})
 
-		logger.Debug("fetched batch from InfluxDB V2 (V1 API)",
-			zap.String("measurement", measurement),
-			zap.Int("batch_size", len(records)),
-			zap.String("next_start", queryStart.Format(time.RFC3339Nano)))
-
-		// If we got fewer records than batch size, we're done
-		if len(records) < batchSize {
-			break
-		}
-
-		// Update queryStart for next query using the last record's timestamp
-		if maxTS < math.MaxInt64 {
-			queryStart = time.Unix(0, maxTS+1)
-		} else {
-			queryStart = time.Unix(0, maxTS)
-		}
-
-		// Don't query beyond window end
-		if queryStart.UnixNano() >= endTime.UnixNano() {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+	if err != nil {
+		return nil, fmt.Errorf("chunked query failed: %w", err)
 	}
 
-	logger.Info("completed batch query for InfluxDB V2 (V1 API)",
+	logger.Info("completed chunked query for InfluxDB V2 (V1 API)",
 		zap.String("measurement", measurement),
 		zap.Int("series_count", len(series)),
 		zap.Int("total_records", totalRecords),
