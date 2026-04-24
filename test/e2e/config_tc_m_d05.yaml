@@ -1,0 +1,47 @@
+global:
+  name: "TC-M-D05"
+  checkpoint_dir: "./test/e2e/checkpoints/tc-m-d05"
+  report_dir: "./test/e2e/reports/tc-m-d05"
+
+logging:
+  level: "info"
+  output: "both"
+  file:
+    path: "test/e2e/logs/tc-m-d05.log"
+    max_size: 20
+    max_backups: 5
+    max_age: 14
+    compress: true
+
+influx_to_influx:
+  enabled: true
+  query_mode: "batch"
+  max_series_per_query: 100
+
+sources:
+  - name: "influxdb-v1"
+    type: influxdb
+    database: "test_source"
+    influxdb:
+      version: "1"
+      url: "http://127.0.0.1:8084"
+
+targets:
+  - name: "influxdb-v1"
+    type: influxdb-v1
+    database: "test_target"
+    influxdb:
+      version: "1"
+      url: "http://127.0.0.1:8086"
+
+migration:
+  parallel_tasks: 4
+
+tasks:
+  - name: "high-cardinality-migration"
+    source: "influxdb-v1"
+    target: "influxdb-v1"
+    parallel_tasks: 4
+    mappings:
+      - source_table: "metrics"
+        target_measurement: "metrics"

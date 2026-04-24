@@ -415,6 +415,61 @@ write_tc_s_d07_data() {
     rm -f "$tmpfile"
 }
 
+# Write TC-M-D05 test data: high cardinality (1500 series, 150000 records)
+write_tc_m_d05_data() {
+    log_info "Writing TC-M-D05 test data (high cardinality: 1500 series, 150000 records)..."
+
+    local meas="metrics"
+    local total_records=150000
+    local base_ts=1745280000000000000
+    local tmpfile=$(mktemp)
+
+    # 50 hosts * 10 regions * 3 env = 1500 series
+    local hosts=()
+    for i in $(seq 1 50); do
+        hosts+=("server-$(printf "%03d" $i)")
+    done
+    local regions=("us-west" "us-east" "eu-west" "ap-east" "sa-east" "ap-south" "eu-north" "us-central" "ap-northeast" "sa-north")
+    local envs=("prod" "staging" "dev")
+
+    local batch_size=5000
+    local record_count=0
+
+    log_info "  - Target: ${total_records} records across 1500 series"
+
+    for batch_start in $(seq 0 $batch_size $((total_records - 1))); do
+        > "$tmpfile"
+        local batch_end=$((batch_start + batch_size - 1))
+        if [ $batch_end -ge $total_records ]; then
+            batch_end=$((total_records - 1))
+        fi
+
+        for i in $(seq $batch_start $batch_end); do
+            local offset=$((i * 10 * 1000000000))  # 10 second intervals
+            local ts=$((base_ts + offset))
+            local host_idx=$((i % 50))
+            local region_idx=$((i % 10))
+            local env_idx=$((i % 3))
+            local value=$((RANDOM % 100)).$((RANDOM % 100))
+
+            echo "${meas},host=${hosts[$host_idx]},region=${regions[$region_idx]},env=${envs[$env_idx]} value=${value} ${ts}" >> "$tmpfile"
+            record_count=$((record_count + 1))
+        done
+
+        local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
+        curl -s -X POST "${write_url}" \
+            -H "Content-Type: text/plain" \
+            --data-binary "@$tmpfile" > /dev/null
+
+        if [ $(( (batch_start / batch_size + 1) % 5 )) -eq 0 ]; then
+            log_info "  - Progress: $((batch_start + batch_size))/${total_records}"
+        fi
+    done
+
+    rm -f "$tmpfile"
+    log_info "  - ${meas}: ${record_count} records written (1500 series)"
+}
+
 # Verify data
 verify_data() {
     log_info "Verifying data in ${SOURCE_DB}..."
@@ -435,7 +490,7 @@ verify_data() {
 cleanup() {
     log_info "Cleaning up test data..."
 
-    for meas in cpu memory disk network process special_names special_tag_values special_floats; do
+    for meas in cpu memory disk network process metrics special_names special_tag_values special_floats; do
         curl -s -X POST "${SOURCE_URL}/query" \
             --data-urlencode "q=DROP MEASUREMENT ${meas}" \
             --data-urlencode "db=${SOURCE_DB}" > /dev/null
@@ -460,6 +515,7 @@ main() {
             write_tc_m_f01_data
             write_tc_m_f02_data
             write_tc_l_f01_data
+            write_tc_m_d05_data
             verify_data
             ;;
         verify)
