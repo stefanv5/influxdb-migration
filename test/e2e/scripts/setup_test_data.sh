@@ -338,6 +338,35 @@ write_tc_s_d05_data() {
     log_info "  - ${meas}: 100 records with special names written"
 }
 
+# Write TC-S-D06 test data: tag values with separator characters
+write_tc_s_d06_data() {
+    log_info "Writing TC-S-D06 test data (special tag values)..."
+
+    local meas="special_tag_values"
+    local base_ts=1745280000000000000
+    local tmpfile=$(mktemp)
+
+    # Tag values with separators: us-west,1 (comma), host=server1 (equals), multi\nline (newline), _empty_ (placeholder for empty), _space_ (space in value)
+    for i in $(seq 1 100); do
+        local offset=$(( (i - 1) * 60 * 1000000000))
+        local ts=$((base_ts + offset))
+        local value=$((RANDOM % 100)).$((RANDOM % 100))
+
+        # Note: comma and equals in tag values must be escaped
+        # Note: empty tag value not allowed in InfluxDB, use _empty_ placeholder
+        # Note: space in tag value not allowed without escaping, use _space_ placeholder
+        echo "${meas},tag_v1=us-west\\,1,tag_v2=host\\=server1,tag_v3=multi\\nline,tag_v4=_empty_,tag_v5=_space_ value=${value} ${ts}" >> "$tmpfile"
+    done
+
+    local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
+    curl -s -X POST "${write_url}" \
+        -H "Content-Type: text/plain" \
+        --data-binary "@$tmpfile" > /dev/null
+
+    rm -f "$tmpfile"
+    log_info "  - ${meas}: 100 records with special tag values written"
+}
+
 # Verify data
 verify_data() {
     log_info "Verifying data in ${SOURCE_DB}..."
@@ -358,7 +387,7 @@ verify_data() {
 cleanup() {
     log_info "Cleaning up test data..."
 
-    for meas in cpu memory disk network process special_names; do
+    for meas in cpu memory disk network process special_names special_tag_values; do
         curl -s -X POST "${SOURCE_URL}/query" \
             --data-urlencode "q=DROP MEASUREMENT ${meas}" \
             --data-urlencode "db=${SOURCE_DB}" > /dev/null
@@ -378,6 +407,7 @@ main() {
             write_tc_s_f01_data
             write_tc_s_f02_data
             write_tc_s_d05_data
+            write_tc_s_d06_data
             write_tc_m_f01_data
             write_tc_m_f02_data
             write_tc_l_f01_data

@@ -1,0 +1,42 @@
+global:
+  name: "TC-S-D06"
+  checkpoint_dir: "./test/e2e/checkpoints/tc-s-d06"
+  report_dir: "./test/e2e/reports/tc-s-d06"
+
+logging:
+  level: "debug"
+  output: "both"
+  file:
+    path: "test/e2e/logs/tc-s-d06.log"
+    max_size: 10
+    max_backups: 3
+    max_age: 7
+    compress: true
+
+influx_to_influx:
+  enabled: true
+  query_mode: "single"
+
+sources:
+  - name: "influxdb-v1"
+    type: influxdb
+    database: "test_source"
+    influxdb:
+      version: "1"
+      url: "http://127.0.0.1:8084"
+
+targets:
+  - name: "influxdb-v1"
+    type: influxdb-v1
+    database: "test_target"
+    influxdb:
+      version: "1"
+      url: "http://127.0.0.1:8086"
+
+tasks:
+  - name: "special-tag-values-migration"
+    source: "influxdb-v1"
+    target: "influxdb-v1"
+    mappings:
+      - source_table: "special_tag_values"
+        target_measurement: "special_tag_values"
