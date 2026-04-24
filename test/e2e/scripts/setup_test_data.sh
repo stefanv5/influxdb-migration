@@ -330,12 +330,18 @@ write_tc_s_d05_data() {
     done
 
     local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
-    curl -s -X POST "${write_url}" \
+    response=$(curl -s -w "\n%{http_code}" -X POST "${write_url}" \
         -H "Content-Type: text/plain" \
-        --data-binary "@$tmpfile" > /dev/null
+        --data-binary "@$tmpfile")
 
-    rm -f "$tmpfile"
-    log_info "  - ${meas}: 100 records with special names written"
+    local http_code=$(echo "$response" | tail -n1)
+    if [ "$http_code" = "204" ] || [ "$http_code" = "200" ]; then
+        log_info "  - ${meas}: 100 records with special names written"
+    else
+        log_error "Failed to write data: HTTP ${http_code}"
+        rm -f "$tmpfile"
+        exit 1
+    fi
 }
 
 # Write TC-S-D06 test data: tag values with separator characters
@@ -359,19 +365,25 @@ write_tc_s_d06_data() {
     done
 
     local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
-    curl -s -X POST "${write_url}" \
+    response=$(curl -s -w "\n%{http_code}" -X POST "${write_url}" \
         -H "Content-Type: text/plain" \
-        --data-binary "@$tmpfile" > /dev/null
+        --data-binary "@$tmpfile")
 
-    rm -f "$tmpfile"
-    log_info "  - ${meas}: 100 records with special tag values written"
+    local http_code=$(echo "$response" | tail -n1)
+    if [ "$http_code" = "204" ] || [ "$http_code" = "200" ]; then
+        log_info "  - ${meas}: 100 records with special tag values written"
+    else
+        log_error "Failed to write data: HTTP ${http_code}"
+        rm -f "$tmpfile"
+        exit 1
+    fi
 }
 
 # Verify data
 verify_data() {
     log_info "Verifying data in ${SOURCE_DB}..."
 
-    for meas in cpu memory disk network process metrics; do
+    for meas in cpu memory disk network process metrics special_names special_tag_values; do
         local count=$(curl -s -G "${SOURCE_URL}/query" \
             --data-urlencode "db=${SOURCE_DB}" \
             --data-urlencode "q=SELECT COUNT(*) FROM ${meas}" 2>/dev/null | \
