@@ -95,12 +95,12 @@ func (g *Generator) GenerateWithDetails(ctx context.Context, migrationID, taskNa
 	measurementSet := make(map[string]bool)
 
 	for _, cp := range checkpoints {
-		totalRows += cp.ProcessedRows
+		totalRows += cp.TotalMigratedRows
 		measurementSet[cp.TargetMeas] = true
 		if cp.Status == types.StatusCompleted {
-			transferredRows += cp.ProcessedRows
+			transferredRows += cp.TotalMigratedRows
 		} else if cp.Status == types.StatusFailed {
-			failedRows += cp.ProcessedRows
+			failedRows += cp.TotalMigratedRows
 			status = "failed"
 		}
 		if cp.UpdatedAt.After(latestTime) {
