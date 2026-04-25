@@ -496,12 +496,13 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 
 	// Build final checkpoint with all fields
 	cp := &types.Checkpoint{
-		TaskID:        task.ID,
-		SourceTable:   task.Mapping.SourceTable,
-		LastID:        0,
-		LastTimestamp: lastTimestamp,
-		ProcessedRows: totalProcessed,
-		Status:        types.StatusCompleted,
+		TaskID:             task.ID,
+		SourceTable:        task.Mapping.SourceTable,
+		LastID:             0,
+		LastTimestamp:      lastTimestamp,
+		ProcessedRows:      totalProcessed,
+		TotalMigratedRows:  totalProcessed,
+		Status:            types.StatusCompleted,
 	}
 	if existingCP != nil {
 		cp.TaskName = existingCP.TaskName
@@ -655,10 +656,12 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 	// Track progress across windows
 	var lastCompletedWindowIdx int = -1
 	var lastTimestamp int64
+	var totalMigratedRows int64
 	if lastCheckpoint != nil && lastCheckpoint.Status == types.StatusInProgress {
 		// For backward compatibility, decode window index from ProcessedRows
 		lastCompletedWindowIdx = int(lastCheckpoint.ProcessedRows) - 1
 		lastTimestamp = lastCheckpoint.LastTimestamp
+		totalMigratedRows = lastCheckpoint.TotalMigratedRows
 		logger.Info("resuming batch mode from checkpoint",
 			zap.String("task_id", task.ID),
 			zap.Int("last_completed_window", lastCompletedWindowIdx+1))
@@ -730,17 +733,19 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 
 			if cp != nil {
 				lastTimestamp = cp.LastTimestamp
+				totalMigratedRows += cp.ProcessedRows
 			}
 		}
 
 		// Save checkpoint after each window
 		windowCP := &types.Checkpoint{
-			TaskID:        task.ID,
-			SourceTable:   task.Mapping.SourceTable,
-			LastID:        0,
-			LastTimestamp: lastTimestamp,
-			ProcessedRows: int64(windowIdx + 1), // Store window index for resume
-			Status:        types.StatusInProgress,
+			TaskID:             task.ID,
+			SourceTable:        task.Mapping.SourceTable,
+			LastID:             0,
+			LastTimestamp:      lastTimestamp,
+			ProcessedRows:      int64(windowIdx + 1), // Store window index for resume
+			TotalMigratedRows:  totalMigratedRows,
+			Status:             types.StatusInProgress,
 		}
 		if lastCheckpoint != nil {
 			windowCP.TaskName = lastCheckpoint.TaskName
@@ -764,12 +769,13 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 
 	// Save final checkpoint with completed status
 	finalCP := &types.Checkpoint{
-		TaskID:        task.ID,
-		SourceTable:   task.Mapping.SourceTable,
-		LastID:        0,
-		LastTimestamp: lastTimestamp,
-		ProcessedRows: int64(len(windows)),
-		Status:        types.StatusCompleted,
+		TaskID:             task.ID,
+		SourceTable:        task.Mapping.SourceTable,
+		LastID:             0,
+		LastTimestamp:      lastTimestamp,
+		ProcessedRows:      int64(len(windows)),
+		TotalMigratedRows:  totalMigratedRows,
+		Status:            types.StatusCompleted,
 	}
 	if lastCheckpoint != nil {
 		finalCP.TaskName = lastCheckpoint.TaskName
