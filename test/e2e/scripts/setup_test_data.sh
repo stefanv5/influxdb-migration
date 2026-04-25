@@ -45,15 +45,19 @@ check_prereqs() {
     log_info "Prerequisites OK"
 }
 
-# Create database if not exists
-create_database() {
-    log_info "Creating database ${SOURCE_DB} if not exists..."
+# Drop and recreate database for clean state
+reset_database() {
+    log_info "Resetting database ${SOURCE_DB} (drop + recreate)..."
 
+    # Drop database if exists
     curl -s -X POST "${SOURCE_URL}/query" \
-        --data-urlencode "q=CREATE DATABASE IF NOT EXISTS ${SOURCE_DB}" \
-        > /dev/null
+        --data-urlencode "q=DROP DATABASE ${SOURCE_DB}" > /dev/null 2>&1
 
-    log_info "Database ${SOURCE_DB} ready"
+    # Recreate database
+    curl -s -X POST "${SOURCE_URL}/query" \
+        --data-urlencode "q=CREATE DATABASE ${SOURCE_DB}" > /dev/null
+
+    log_info "Database ${SOURCE_DB} reset complete"
 }
 
 # Write TC-S-F01 test data: single measurement, 100 records
@@ -530,7 +534,7 @@ main() {
     case $command in
         setup)
             check_prereqs
-            create_database
+            reset_database
             write_tc_s_f01_data
             write_tc_s_f02_data
             write_tc_s_d05_data
