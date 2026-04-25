@@ -202,7 +202,7 @@ func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpo
 }
 
 func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error) {
-	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config, total_migrated_rows
 	          FROM checkpoints WHERE task_name = ?`
 
 	rows, err := s.db.Query(query, taskID)
@@ -220,6 +220,7 @@ func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error
 			&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
 			&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
 			&createdAt, &updatedAt, &cp.ErrorMessage, &mappingConfigJSON,
+			&cp.TotalMigratedRows,
 		)
 		if err != nil {
 			return nil, err
@@ -246,7 +247,7 @@ func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error
 }
 
 func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.Checkpoint, error) {
-	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config, total_migrated_rows
 	          FROM checkpoints WHERE status = ?`
 
 	rows, err := s.db.Query(query, status)
@@ -264,6 +265,7 @@ func (s *SQLiteStore) GetTasksByStatus(status types.CheckpointStatus) ([]*types.
 			&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
 			&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
 			&createdAt, &updatedAt, &cp.ErrorMessage, &mappingConfigJSON,
+			&cp.TotalMigratedRows,
 		)
 		if err != nil {
 			return nil, err
