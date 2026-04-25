@@ -35,6 +35,8 @@ func NewSQLiteStore(dir string) (*SQLiteStore, error) {
 	if err := store.initSchema(); err != nil {
 		return nil, fmt.Errorf("failed to init schema: %w", err)
 	}
+	// Best-effort migration: add total_migrated_rows column if it doesn't exist
+	_ = store.maybeAddTotalMigratedRowsColumn()
 
 	return store, nil
 }
@@ -99,14 +101,30 @@ func (s *SQLiteStore) initSchema() error {
 	return err
 }
 
+func (s *SQLiteStore) maybeAddTotalMigratedRowsColumn() error {
+	// Check if column exists
+	var count int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('checkpoints') WHERE name='total_migrated_rows'").Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		_, err = s.db.Exec("ALTER TABLE checkpoints ADD COLUMN total_migrated_rows INTEGER DEFAULT 0")
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
 func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 	query := `
-	INSERT INTO checkpoints (task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO checkpoints (task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config, total_migrated_rows)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(task_id, source_table) DO UPDATE SET
 		last_id = excluded.last_id,
 		last_timestamp = excluded.last_timestamp,
@@ -114,7 +132,8 @@ func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 		status = excluded.status,
 		updated_at = excluded.updated_at,
 		error_message = excluded.error_message,
-		mapping_config = excluded.mapping_config
+		mapping_config = excluded.mapping_config,
+		total_migrated_rows = excluded.total_migrated_rows
 	`
 
 	now := time.Now().UTC()
@@ -137,6 +156,7 @@ func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 		cp.LastID, ts, cp.ProcessedRows, cp.Status,
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 		cp.ErrorMessage, string(mappingConfigJSON),
+		cp.TotalMigratedRows,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to save checkpoint: %w", err)
@@ -145,7 +165,7 @@ func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {
 }
 
 func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpoint, error) {
-	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config
+	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config, total_migrated_rows
 	          FROM checkpoints WHERE task_id = ? AND source_table = ?`
 
 	var cp types.Checkpoint
@@ -155,6 +175,7 @@ func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpo
 		&cp.ID, &cp.TaskID, &cp.TaskName, &cp.SourceTable, &cp.TargetMeas,
 		&cp.LastID, &lastTS, &cp.ProcessedRows, &cp.Status,
 		&createdAt, &updatedAt, &cp.ErrorMessage, &mappingConfigJSON,
+		&cp.TotalMigratedRows,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
