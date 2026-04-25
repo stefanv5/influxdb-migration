@@ -158,9 +158,15 @@ write_tc_m_f01_data() {
             done
 
             local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
-            curl -s -X POST "${write_url}" \
+            response=$(curl -s -w "\n%{http_code}" -X POST "${write_url}" \
                 -H "Content-Type: text/plain" \
-                --data-binary "@$tmpfile" > /dev/null
+                --data-binary "@$tmpfile")
+            http_code=$(echo "$response" | tail -n1)
+            if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
+                log_error "Failed to write ${meas} batch: HTTP ${http_code}"
+                rm -f "$tmpfile"
+                exit 1
+            fi
         done
 
         log_info "  - ${meas}: ${records_per_meas} records written"
@@ -202,9 +208,15 @@ write_tc_m_f02_data() {
             done
 
             local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
-            curl -s -X POST "${write_url}" \
+            response=$(curl -s -w "\n%{http_code}" -X POST "${write_url}" \
                 -H "Content-Type: text/plain" \
-                --data-binary "@$tmpfile" > /dev/null
+                --data-binary "@$tmpfile")
+            http_code=$(echo "$response" | tail -n1)
+            if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
+                log_error "Failed to write metrics series batch: HTTP ${http_code}"
+                rm -f "$tmpfile"
+                exit 1
+            fi
         done
 
         log_info "  - Series $((s + 1))/20 completed"
@@ -247,9 +259,15 @@ write_tc_l_f01_data() {
         done
 
         local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
-        curl -s -X POST "${write_url}" \
+        response=$(curl -s -w "\n%{http_code}" -X POST "${write_url}" \
             -H "Content-Type: text/plain" \
-            --data-binary "@$tmpfile" > /dev/null
+            --data-binary "@$tmpfile")
+        http_code=$(echo "$response" | tail -n1)
+        if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
+            log_error "Failed to write metrics batch: HTTP ${http_code}"
+            rm -f "$tmpfile"
+            exit 1
+        fi
 
         batch_count=$((batch_count + 1))
         if [ $((batch_count % 5)) -eq 0 ]; then
@@ -457,9 +475,15 @@ write_tc_m_d05_data() {
         done
 
         local write_url="${SOURCE_URL}/write?db=${SOURCE_DB}"
-        curl -s -X POST "${write_url}" \
+        response=$(curl -s -w "\n%{http_code}" -X POST "${write_url}" \
             -H "Content-Type: text/plain" \
-            --data-binary "@$tmpfile" > /dev/null
+            --data-binary "@$tmpfile")
+        http_code=$(echo "$response" | tail -n1)
+        if [ "$http_code" != "204" ] && [ "$http_code" != "200" ]; then
+            log_error "Failed to write TC-M-D05 batch: HTTP ${http_code}"
+            rm -f "$tmpfile"
+            exit 1
+        fi
 
         if [ $(( (batch_start / batch_size + 1) % 5 )) -eq 0 ]; then
             log_info "  - Progress: $((batch_start + batch_size))/${total_records}"
