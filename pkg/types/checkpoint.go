@@ -29,7 +29,11 @@ type Checkpoint struct {
 	LastID        int64
 	LastTimestamp int64
 	ProcessedRows int64
-	Status        CheckpointStatus
+	// TotalMigratedRows tracks the actual number of rows migrated to target.
+	// This is the authoritative count for reporting, regardless of mode.
+	// ProcessedRows continues to be used for resume progress tracking.
+	TotalMigratedRows int64
+	Status            CheckpointStatus
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 	ErrorMessage  string

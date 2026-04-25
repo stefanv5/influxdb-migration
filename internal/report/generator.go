@@ -58,14 +58,15 @@ type ErrorEntry struct {
 }
 
 type CheckpointEntry struct {
-	Table         string    `json:"table"`
-	Measurement   string    `json:"measurement"`
-	TargetMeas    string    `json:"target_measurement"`
-	LastID        int64     `json:"last_id"`
-	LastTimestamp int64     `json:"last_timestamp"`
-	ProcessedRows int64     `json:"processed_rows"`
-	Status        string    `json:"status"`
-	SavedAt       time.Time `json:"saved_at"`
+	Table             string    `json:"table"`
+	Measurement       string    `json:"measurement"`
+	TargetMeas        string    `json:"target_measurement"`
+	LastID            int64     `json:"last_id"`
+	LastTimestamp     int64     `json:"last_timestamp"`
+	ProcessedRows     int64     `json:"processed_rows"`      // kept for debugging
+	TotalMigratedRows int64     `json:"total_migrated_rows"` // new field for reporting
+	Status            string    `json:"status"`
+	SavedAt           time.Time `json:"saved_at"`
 }
 
 func NewGenerator(checkpointMgr *checkpoint.Manager, reportDir string) *Generator {
