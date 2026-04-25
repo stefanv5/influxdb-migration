@@ -735,6 +735,15 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 				lastTimestamp = cp.LastTimestamp
 				totalMigratedRows += cp.ProcessedRows
 			}
+
+			// Progress feedback every 10 batches
+			if i > 0 && i%10 == 0 {
+				logger.Info("batch progress",
+					zap.Int("window", windowIdx+1),
+					zap.Int("batch", i+1),
+					zap.Int("total_batches", len(batches)),
+					zap.Int64("total_migrated_rows", totalMigratedRows))
+			}
 		}
 
 		// Save checkpoint after each window

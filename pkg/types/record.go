@@ -6,20 +6,20 @@ import (
 
 type Record struct {
 	ID     int64
-	Fields map[string]interface{}
+	Fields map[string]any
 	Tags   map[string]string
 	Time   int64
 }
 
 func NewRecord() *Record {
 	return &Record{
-		Fields: make(map[string]interface{}),
+		Fields: make(map[string]any),
 		Tags:   make(map[string]string),
 		Time:   0,
 	}
 }
 
-func (r *Record) AddField(key string, value interface{}) {
+func (r *Record) AddField(key string, value any) {
 	if value != nil {
 		r.Fields[key] = value
 	}
