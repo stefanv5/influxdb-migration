@@ -140,14 +140,15 @@ func (g *Generator) GenerateWithDetails(ctx context.Context, migrationID, taskNa
 
 	for i, cp := range checkpoints {
 		report.Checkpoints[i] = CheckpointEntry{
-			Table:         cp.SourceTable,
-			Measurement:   cp.SourceTable,
-			TargetMeas:    cp.TargetMeas,
-			LastID:        cp.LastID,
-			LastTimestamp: cp.LastTimestamp,
-			ProcessedRows: cp.ProcessedRows,
-			Status:        string(cp.Status),
-			SavedAt:       cp.UpdatedAt,
+			Table:             cp.SourceTable,
+			Measurement:       cp.SourceTable,
+			TargetMeas:        cp.TargetMeas,
+			LastID:            cp.LastID,
+			LastTimestamp:     cp.LastTimestamp,
+			ProcessedRows:     cp.ProcessedRows,
+			TotalMigratedRows: cp.TotalMigratedRows,
+			Status:            string(cp.Status),
+			SavedAt:           cp.UpdatedAt,
 		}
 	}
 
