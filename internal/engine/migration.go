@@ -952,6 +952,42 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 		zap.String("task_id", task.ID),
 		zap.Int("shard_groups_processed", len(relevantGroups)))
 
+	// Aggregate TotalMigratedRows from all shard group checkpoints
+	sgCheckpoints, err := e.checkpointMgr.ListShardGroupCheckpoints(ctx, task.ID)
+	if err != nil {
+		logger.Warn("failed to list shard group checkpoints", zap.Error(err))
+	}
+
+	var totalMigratedRows int64
+	var lastTimestamp int64
+	for _, sgCP := range sgCheckpoints {
+		totalMigratedRows += sgCP.TotalProcessedRows
+		if sgCP.LastTimestamp > lastTimestamp {
+			lastTimestamp = sgCP.LastTimestamp
+		}
+	}
+
+	// Save final task-level checkpoint with aggregated row count
+	finalCP := &types.Checkpoint{
+		TaskID:            task.ID,
+		SourceTable:       task.Mapping.SourceTable,
+		LastID:            0,
+		LastTimestamp:     lastTimestamp,
+		ProcessedRows:     int64(len(relevantGroups)), // shard count for resume
+		TotalMigratedRows: totalMigratedRows,
+		Status:            types.StatusCompleted,
+	}
+	// Preserve task metadata from existing checkpoint if available
+	lastCheckpoint, _ := e.checkpointMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
+	if lastCheckpoint != nil {
+		finalCP.TaskName = lastCheckpoint.TaskName
+		finalCP.TargetMeas = lastCheckpoint.TargetMeas
+		finalCP.MappingConfig = lastCheckpoint.MappingConfig
+	}
+	if err := e.checkpointMgr.SaveCheckpoint(ctx, finalCP); err != nil {
+		logger.Warn("failed to save final checkpoint", zap.Error(err))
+	}
+
 	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
 		logger.Warn("failed to mark task completed", zap.Error(err))
 	}
