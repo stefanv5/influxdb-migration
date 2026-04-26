@@ -444,16 +444,10 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	series []string, startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
 	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 
-	var lastTS int64
-	if lastCheckpoint != nil {
-		lastTS = lastCheckpoint.LastTimestamp
-	}
-
-	// Determine effective start time
+	// Determine effective start time - always use the original startTime in batch mode
+	// The lastCheckpoint.LastTimestamp is for progress tracking only, not for
+	// modifying query parameters. Each batch queries its full assigned time range.
 	queryStart := startTime
-	if lastTS > 0 && lastTS > startTime.UnixNano() {
-		queryStart = time.Unix(0, lastTS)
-	}
 
 	chunkSize := getBatchSize(cfg)
 	whereClause := BuildWhereClause(series)
