@@ -859,6 +859,14 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 		}
 	}
 
+	// If start was not configured (still 1970), discover from shard groups
+	if task.Mapping.TimeRange.Start == "" && len(shardGroups) > 0 {
+		sort.Slice(shardGroups, func(i, j int) bool {
+			return shardGroups[i].StartTime.Before(shardGroups[j].StartTime)
+		})
+		queryStart = shardGroups[0].StartTime
+	}
+
 	// Validate time range
 	if !queryEnd.After(queryStart) {
 		return fmt.Errorf("invalid time range: end time %s must be after start time %s",
