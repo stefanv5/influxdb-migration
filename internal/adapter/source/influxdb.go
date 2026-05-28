@@ -363,6 +363,9 @@ func parseTime(v interface{}) time.Time {
 		// Likely seconds
 		return time.Unix(int64(val), 0)
 	case int64:
+		if val > 1e12 {
+			return time.Unix(0, val)
+		}
 		return time.Unix(val, 0)
 	}
 	return time.Time{}
@@ -414,6 +417,17 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 	var totalRecords int
 	var maxTS int64
 
+	// Discover tag keys to distinguish tags from string fields
+	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	if tagErr != nil {
+		logger.Warn("failed to discover tag keys, strings will be treated as fields",
+			zap.String("measurement", measurement), zap.Error(tagErr))
+	}
+	tagKeySet := make(map[string]bool)
+	for _, k := range tagKeys {
+		tagKeySet[k] = true
+	}
+
 	// Use chunked query - InfluxDB automatically splits response into chunks
 	err := a.executeChunkedQuery(ctx, query, chunkSize, func(records []types.Record) error {
 		totalRecords += len(records)
@@ -424,7 +438,7 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 			}
 		}
 		return batchFunc(records)
-	})
+	}, tagKeySet)
 
 	if err != nil {
 		return nil, fmt.Errorf("chunked query failed: %w", err)
@@ -469,6 +483,17 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	var totalRecords int
 	var maxTS int64
 
+	// Discover tag keys to distinguish tags from string fields
+	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	if tagErr != nil {
+		logger.Warn("failed to discover tag keys, strings will be treated as fields",
+			zap.String("measurement", measurement), zap.Error(tagErr))
+	}
+	tagKeySet := make(map[string]bool)
+	for _, k := range tagKeys {
+		tagKeySet[k] = true
+	}
+
 	// Use chunked query - InfluxDB automatically splits response into chunks
 	err := a.executeChunkedQuery(ctx, query, chunkSize, func(records []types.Record) error {
 		totalRecords += len(records)
@@ -478,7 +503,7 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 			}
 		}
 		return batchFunc(records)
-	})
+	}, tagKeySet)
 
 	if err != nil {
 		return nil, fmt.Errorf("chunked query failed: %w", err)
@@ -552,7 +577,7 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 	for _, r := range result.Results {
 		for _, series := range r.Series {
 			for _, values := range series.Values {
-				record := a.parseValues(series.Columns, values, series.Tags)
+				record := a.parseValues(series.Columns, values, series.Tags, nil)
 				records = append(records, *record)
 			}
 		}
@@ -569,6 +594,7 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 	query string,
 	chunkSize int,
 	batchFunc func([]types.Record) error,
+	tagKeySet map[string]bool,
 ) error {
 	params := url.Values{}
 	params.Set("q", query)
@@ -598,6 +624,10 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return fmt.Errorf("chunked query request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -642,7 +672,7 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 			seriesCount += len(r.Series)
 			for _, series := range r.Series {
 				for _, values := range series.Values {
-					record := a.parseValues(series.Columns, values, series.Tags)
+					record := a.parseValues(series.Columns, values, series.Tags, tagKeySet)
 					records = append(records, *record)
 				}
 			}
@@ -669,7 +699,7 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 	return nil
 }
 
-func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}, seriesTags map[string]string) *types.Record {
+func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}, seriesTags map[string]string, tagKeySet map[string]bool) *types.Record {
 	record := types.NewRecord()
 
 	// First, copy series-level tags (e.g., host, region, env from InfluxDB series tags)
@@ -708,11 +738,17 @@ func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}, 
 			case float64:
 				record.AddField(col, v)
 			case string:
-				// In InfluxDB V1, string values from query results are typically tags
-				// (InfluxDB stores strings as tags by default)
-				record.AddTag(col, v)
+				if tagKeySet[col] {
+					record.AddTag(col, v)
+				} else {
+					record.AddField(col, v)
+				}
 			case bool:
 				record.AddField(col, v)
+			case int64:
+				record.AddField(col, v)
+			case int:
+				record.AddField(col, int64(v))
 			}
 		}
 	}
@@ -1004,6 +1040,10 @@ func (a *InfluxDBV2Adapter) executeV1ChunkedQuery(
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return fmt.Errorf("chunked query request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1334,9 +1374,18 @@ func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("shard query failed with status %d: %s", resp.StatusCode, string(body))
+	}
 
 	var result struct {
 		Shards []struct {
@@ -1353,8 +1402,8 @@ func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter
 	for _, s := range result.Shards {
 		shardGroups = append(shardGroups, &adapter.ShardGroup{
 			ID:        s.ID,
-			StartTime: time.Unix(s.StartTime, 0),
-			EndTime:   time.Unix(s.EndTime, 0),
+			StartTime: time.Unix(0, s.StartTime),
+			EndTime:   time.Unix(0, s.EndTime),
 		})
 	}
 	return shardGroups, nil
@@ -1415,7 +1464,11 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 	}
 
 	// Discover tag keys to distinguish tags from fields
-	tagKeys, _ := a.DiscoverTagKeys(ctx, measurement)
+	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	if tagErr != nil {
+		logger.Warn("failed to discover tag keys, strings will be treated as fields",
+			zap.String("measurement", measurement), zap.Error(tagErr))
+	}
 	tagKeySet := make(map[string]bool)
 	for _, k := range tagKeys {
 		tagKeySet[k] = true
@@ -1465,22 +1518,20 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	series []string, startTime, endTime time.Time, lastCheckpoint *types.Checkpoint,
 	batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 
-	var lastTS int64
-	if lastCheckpoint != nil && lastCheckpoint.LastTimestamp != 0 {
-		lastTS = lastCheckpoint.LastTimestamp
-	}
-
-	// Determine effective start time
+	// Always use the original startTime in batch mode.
+	// The lastCheckpoint.LastTimestamp is for progress tracking only, not for
+	// modifying query parameters. Each batch queries its full assigned time range.
 	queryStart := startTime
-	if lastTS > 0 && lastTS > startTime.UnixNano() {
-		queryStart = time.Unix(0, lastTS)
-	}
 
 	chunkSize := getBatchSize(cfg)
 	whereClause := BuildWhereClause(series)
 
 	// Discover tag keys to distinguish tags from fields
-	tagKeys, _ := a.DiscoverTagKeys(ctx, measurement)
+	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	if tagErr != nil {
+		logger.Warn("failed to discover tag keys, strings will be treated as fields",
+			zap.String("measurement", measurement), zap.Error(tagErr))
+	}
 	tagKeySet := make(map[string]bool)
 	for _, k := range tagKeys {
 		tagKeySet[k] = true
@@ -1644,9 +1695,18 @@ func (a *InfluxDBV2Adapter) executeFluxQuery(ctx context.Context, query string) 
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("flux query failed with status %d: %s", resp.StatusCode, string(body))
+	}
 
 	var result [][]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {

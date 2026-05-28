@@ -154,6 +154,9 @@ func (a *InfluxDBV1TargetAdapter) formatInfluxLine(measurement string, r types.R
 	timestampStr := ""
 	if r.Time != 0 {
 		timestampStr = fmt.Sprintf(" %d", r.Time)
+	} else {
+		logger.Warn("record has zero timestamp, InfluxDB will assign current time",
+			zap.String("measurement", measurement))
 	}
 
 	if tagsStr != "" {
@@ -657,9 +660,18 @@ func (a *InfluxDBV2TargetAdapter) executeFluxQuery(ctx context.Context, query st
 
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("flux query failed with status %d: %s", resp.StatusCode, string(body))
+	}
 
 	var result [][]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {

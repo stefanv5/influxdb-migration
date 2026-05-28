@@ -78,14 +78,16 @@ var runCmd = &cobra.Command{
 		go func() {
 			sig := <-sigChan
 			logger.Info("received shutdown signal", zap.String("signal", sig.String()))
-			logger.Info("marking in-progress tasks for resume...")
-			migrationEngine.MarkInProgressAsInterrupted(ctx)
 			cancel()
 		}()
 
-		if err := migrationEngine.Run(ctx); err != nil {
-			logger.Error("migration failed", zap.Error(err))
-			return fmt.Errorf("migration failed: %w", err)
+		runErr := migrationEngine.Run(ctx)
+		// Mark in-progress tasks as interrupted after Run returns (no race).
+		// Always execute regardless of Run's error status.
+		migrationEngine.MarkInProgressAsInterrupted(context.Background())
+		if runErr != nil {
+			logger.Error("migration failed", zap.Error(runErr))
+			return fmt.Errorf("migration failed: %w", runErr)
 		}
 
 		reportGen := report.NewGenerator(checkpointMgr, cfg.Global.ReportDir)

@@ -201,11 +201,11 @@ func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpo
 	return &cp, nil
 }
 
-func (s *SQLiteStore) ListCheckpoints(taskID string) ([]*types.Checkpoint, error) {
+func (s *SQLiteStore) ListCheckpoints(taskName string) ([]*types.Checkpoint, error) {
 	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config, total_migrated_rows
 	          FROM checkpoints WHERE task_name = ?`
 
-	rows, err := s.db.Query(query, taskID)
+	rows, err := s.db.Query(query, taskName)
 	if err != nil {
 		return nil, err
 	}

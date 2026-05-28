@@ -262,7 +262,7 @@ func TestManager_ListCheckpoints(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	checkpoints, err := mgr.ListCheckpoints(ctx, "task1")
+	checkpoints, err := mgr.ListCheckpoints(ctx, "Test Task")
 	if err != nil {
 		t.Fatalf("ListCheckpoints failed: %v", err)
 	}

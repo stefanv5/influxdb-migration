@@ -63,10 +63,10 @@ func (m *Manager) LoadCheckpoint(ctx context.Context, taskID, sourceTable string
 	return m.store.LoadCheckpoint(taskID, sourceTable)
 }
 
-func (m *Manager) ListCheckpoints(ctx context.Context, taskID string) ([]*types.Checkpoint, error) {
+func (m *Manager) ListCheckpoints(ctx context.Context, taskName string) ([]*types.Checkpoint, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.store.ListCheckpoints(taskID)
+	return m.store.ListCheckpoints(taskName)
 }
 
 func (m *Manager) GetPendingTasks(ctx context.Context) ([]*types.Checkpoint, error) {

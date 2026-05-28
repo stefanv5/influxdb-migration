@@ -49,13 +49,24 @@ func (r *RateLimiter) Allow(points int) bool {
 	return false
 }
 
-func (r *RateLimiter) Wait(points int) {
-	for !r.Allow(points) {
-		time.Sleep(10 * time.Millisecond)
+func (r *RateLimiter) Wait(ctx context.Context, points int) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if r.Allow(points) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
-func (r *RateLimiter) WaitWithDeadline(points int, deadline time.Time) error {
+func (r *RateLimiter) WaitWithDeadline(ctx context.Context, points int, deadline time.Time) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		if r.Allow(points) {
 			return nil
@@ -63,7 +74,11 @@ func (r *RateLimiter) WaitWithDeadline(points int, deadline time.Time) error {
 		if time.Now().After(deadline) {
 			return ErrRateLimitExceeded
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

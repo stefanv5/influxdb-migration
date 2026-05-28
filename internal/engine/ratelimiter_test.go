@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func TestRateLimiter_Wait(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		limiter.Wait(1)
+		_ = limiter.Wait(context.Background(), 1)
 		done <- true
 	}()
 
@@ -110,7 +111,7 @@ func TestRateLimiter_WaitWithDeadline(t *testing.T) {
 	limiter.Allow(5)
 
 	deadline := time.Now().Add(10 * time.Millisecond)
-	err := limiter.WaitWithDeadline(1, deadline)
+	err := limiter.WaitWithDeadline(context.Background(), 1, deadline)
 
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)
@@ -123,7 +124,7 @@ func TestRateLimiter_WaitWithDeadline_Timeout(t *testing.T) {
 	limiter.Allow(1)
 
 	deadline := time.Now().Add(1 * time.Millisecond)
-	err := limiter.WaitWithDeadline(1, deadline)
+	err := limiter.WaitWithDeadline(context.Background(), 1, deadline)
 
 	if err != ErrRateLimitExceeded {
 		t.Errorf("Expected ErrRateLimitExceeded, got %v", err)

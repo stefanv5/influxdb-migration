@@ -1258,14 +1258,16 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 			mapping.TimeRange.End, mapping.TimeRange.Start)
 	}
 
-	if mapping.TimeWindow == "" {
-		mapping.TimeWindow = "168h"
+	// Use a local copy to avoid mutating the original mapping
+	taskMapping := *mapping
+	if taskMapping.TimeWindow == "" {
+		taskMapping.TimeWindow = "168h"
 	}
 
-	windowDuration, err := time.ParseDuration(mapping.TimeWindow)
+	windowDuration, err := time.ParseDuration(taskMapping.TimeWindow)
 	if err != nil {
 		logger.Warn("invalid time window, using default 168h",
-			zap.String("time_window", mapping.TimeWindow),
+			zap.String("time_window", taskMapping.TimeWindow),
 			zap.Error(err))
 		windowDuration = 168 * time.Hour
 	}
@@ -1280,7 +1282,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 			windowEnd = endTime
 		}
 
-		windowMapping := *mapping
+		windowMapping := taskMapping
 		windowMapping.TimeRange = types.TimeRange{
 			Start: windowStart.Format(time.RFC3339),
 			End:   windowEnd.Format(time.RFC3339),
@@ -1516,11 +1518,14 @@ func (e *MigrationEngine) sourceConfigToMap(src types.SourceConfig) map[string]i
 		}
 	case "influxdb":
 		m["influxdb"] = map[string]interface{}{
-			"url":     src.InfluxDB.URL,
-			"token":   src.InfluxDB.Token,
-			"org":     src.InfluxDB.Org,
-			"bucket":  src.InfluxDB.Bucket,
-			"version": src.InfluxDB.Version,
+			"url":              src.InfluxDB.URL,
+			"token":            src.InfluxDB.Token,
+			"org":              src.InfluxDB.Org,
+			"bucket":           src.InfluxDB.Bucket,
+			"version":          src.InfluxDB.Version,
+			"username":         src.InfluxDB.Username,
+			"password":         src.InfluxDB.Password,
+			"retention_policy": src.InfluxDB.RetentionPolicy,
 		}
 	}
 
