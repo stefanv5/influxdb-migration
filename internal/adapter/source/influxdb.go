@@ -36,12 +36,13 @@ type InfluxDBV1Config struct {
 
 type influxV1Result struct {
 	Results []influxV1ResultSeries `json:"results"`
-	Error   string                  `json:"error"` // V1 API error message
+	Error   string                 `json:"error"` // V1 API error message
 }
 
 type influxV1ResultSeries struct {
-	StatementID int                `json:"statement_id"`
-	Series     []influxV1Series   `json:"series"`
+	StatementID int              `json:"statement_id"`
+	Series      []influxV1Series `json:"series"`
+	Error       string           `json:"error"`
 }
 
 type influxV1Series struct {
@@ -371,6 +372,39 @@ func parseTime(v interface{}) time.Time {
 	return time.Time{}
 }
 
+func effectiveQueryBounds(lastTS int64, cfg *types.QueryConfig) (string, string) {
+	var start time.Time
+	if cfg != nil && !cfg.StartTime.IsZero() {
+		start = cfg.StartTime
+	} else if lastTS != 0 {
+		start = time.Unix(0, lastTS)
+	}
+
+	startTime := "1970-01-01T00:00:00Z"
+	if !start.IsZero() {
+		startTime = start.Format(time.RFC3339Nano)
+	}
+
+	end := time.Now().Add(1 * time.Hour)
+	if cfg != nil && !cfg.EndTime.IsZero() {
+		end = cfg.EndTime
+	}
+
+	return startTime, end.Format(time.RFC3339Nano)
+}
+
+func checkInfluxV1ResultError(result influxV1Result) error {
+	if result.Error != "" {
+		return fmt.Errorf("V1 query error: %s", result.Error)
+	}
+	for _, statement := range result.Results {
+		if statement.Error != "" {
+			return fmt.Errorf("V1 query error: %s", statement.Error)
+		}
+	}
+	return nil
+}
+
 func (a *InfluxDBV1Adapter) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
 	// InfluxDB is a time-series database with schemaless writes.
 	// Return a minimal schema with just the measurement name.
@@ -390,14 +424,7 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 		totalProcessed = lastCheckpoint.ProcessedRows
 	}
 
-	var startTime string
-	if lastTS == 0 {
-		startTime = "1970-01-01T00:00:00Z"
-	} else {
-		startTime = time.Unix(0, lastTS).Format(time.RFC3339Nano)
-	}
-
-	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339Nano)
+	startTime, endTime := effectiveQueryBounds(lastTS, cfg)
 
 	chunkSize := 10000
 	if cfg != nil && cfg.BatchSize > 0 {
@@ -464,7 +491,18 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	queryStart := startTime
 
 	chunkSize := getBatchSize(cfg)
-	whereClause := BuildWhereClause(series)
+
+	// Discover tag keys to distinguish tags from string fields
+	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	if tagErr != nil {
+		logger.Warn("failed to discover tag keys, strings will be treated as fields",
+			zap.String("measurement", measurement), zap.Error(tagErr))
+	}
+	tagKeySet := make(map[string]bool)
+	for _, k := range tagKeys {
+		tagKeySet[k] = true
+	}
+	whereClause := BuildWhereClauseWithTagKeys(series, tagKeys)
 
 	// Build query without LIMIT - InfluxDB will return data in chunks
 	query := fmt.Sprintf("SELECT * FROM %s WHERE (%s) AND time >= '%s' AND time < '%s'",
@@ -482,17 +520,6 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 
 	var totalRecords int
 	var maxTS int64
-
-	// Discover tag keys to distinguish tags from string fields
-	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
-	if tagErr != nil {
-		logger.Warn("failed to discover tag keys, strings will be treated as fields",
-			zap.String("measurement", measurement), zap.Error(tagErr))
-	}
-	tagKeySet := make(map[string]bool)
-	for _, k := range tagKeys {
-		tagKeySet[k] = true
-	}
 
 	// Use chunked query - InfluxDB automatically splits response into chunks
 	err := a.executeChunkedQuery(ctx, query, chunkSize, func(records []types.Record) error {
@@ -569,8 +596,8 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 	}
 
 	// Check for V1 API-level errors
-	if result.Error != "" {
-		return nil, fmt.Errorf("V1 query error: %s", result.Error)
+	if err := checkInfluxV1ResultError(result); err != nil {
+		return nil, err
 	}
 
 	var records []types.Record
@@ -661,8 +688,8 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 		}
 
 		// 检查V1 API错误
-		if result.Error != "" {
-			return fmt.Errorf("V1 query error: %s", result.Error)
+		if err := checkInfluxV1ResultError(result); err != nil {
+			return err
 		}
 
 		// 解析chunk为records
@@ -800,8 +827,8 @@ func (a *InfluxDBV1Adapter) executeQuery(ctx context.Context, query string) ([]i
 	}
 
 	// Check for V1 API-level errors
-	if result.Error != "" {
-		return nil, fmt.Errorf("V1 query error: %s", result.Error)
+	if err := checkInfluxV1ResultError(result); err != nil {
+		return nil, err
 	}
 
 	var series []influxV1Series
@@ -834,6 +861,12 @@ func decodeInfluxV1Config(config map[string]interface{}, cfg interface{}) error 
 	if v, ok := cfgMap["database"].(string); ok {
 		cfg.(*InfluxDBV1Config).Database = v
 	}
+	if v, ok := cfgMap["username"].(string); ok {
+		cfg.(*InfluxDBV1Config).Username = v
+	}
+	if v, ok := cfgMap["password"].(string); ok {
+		cfg.(*InfluxDBV1Config).Password = v
+	}
 	if basicAuth, ok := cfgMap["basic_auth"].(map[string]interface{}); ok {
 		if u, ok := basicAuth["username"].(string); ok {
 			cfg.(*InfluxDBV1Config).Username = u
@@ -853,13 +886,13 @@ type InfluxDBV2Adapter struct {
 
 type InfluxDBV2Config struct {
 	URL             string
-	Token          string
-	Org            string
-	Bucket         string
-	Username       string // V1 compatibility API credentials
-	Password       string
+	Token           string
+	Org             string
+	Bucket          string
+	Username        string // V1 compatibility API credentials
+	Password        string
 	RetentionPolicy string // V1 compatibility RP
-	SSL            types.SSLConfig
+	SSL             types.SSLConfig
 }
 
 type fluxRecord struct {
@@ -934,8 +967,12 @@ func (a *InfluxDBV2Adapter) buildV1QueryParams(query string) url.Values {
 	if a.config.RetentionPolicy != "" {
 		params.Set("rp", a.config.RetentionPolicy)
 	}
-	params.Set("u", a.config.Username)
-	params.Set("p", a.config.Password)
+	if a.config.Username != "" {
+		params.Set("u", a.config.Username)
+	}
+	if a.config.Password != "" {
+		params.Set("p", a.config.Password)
+	}
 	return params
 }
 
@@ -980,6 +1017,9 @@ func (a *InfluxDBV2Adapter) executeV1Query(ctx context.Context, query string) (*
 	var result influxV1Result
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse V1 response: %w", err)
+	}
+	if err := checkInfluxV1ResultError(result); err != nil {
+		return nil, err
 	}
 
 	return &result, nil
@@ -1071,8 +1111,8 @@ func (a *InfluxDBV2Adapter) executeV1ChunkedQuery(
 		}
 
 		// Check for V1 API errors
-		if result.Error != "" {
-			return fmt.Errorf("V1 query error: %s", result.Error)
+		if err := checkInfluxV1ResultError(result); err != nil {
+			return err
 		}
 
 		// Parse chunk into records
@@ -1447,16 +1487,14 @@ func (a *InfluxDBV2Adapter) DiscoverSchema(ctx context.Context, table string) (*
 }
 
 func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
-	var startTime string
+	var lastTS int64
 	var totalProcessed int64
 
 	if lastCheckpoint != nil && lastCheckpoint.LastTimestamp != 0 {
-		startTime = time.Unix(0, lastCheckpoint.LastTimestamp).Format(time.RFC3339Nano)
-	} else {
-		startTime = "1970-01-01T00:00:00Z"
+		lastTS = lastCheckpoint.LastTimestamp
 	}
 
-	endTime := time.Now().Add(1 * time.Hour).Format(time.RFC3339Nano)
+	startTime, endTime := effectiveQueryBounds(lastTS, cfg)
 
 	chunkSize := 10000
 	if cfg != nil && cfg.BatchSize > 0 {
@@ -1524,7 +1562,6 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	queryStart := startTime
 
 	chunkSize := getBatchSize(cfg)
-	whereClause := BuildWhereClause(series)
 
 	// Discover tag keys to distinguish tags from fields
 	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
@@ -1536,6 +1573,7 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 	for _, k := range tagKeys {
 		tagKeySet[k] = true
 	}
+	whereClause := BuildWhereClauseWithTagKeys(series, tagKeys)
 
 	// Build query without LIMIT - InfluxDB will return data in chunks
 	query := fmt.Sprintf(
@@ -1779,30 +1817,58 @@ func redactURL(u *url.URL) string {
 	return redacted.String()
 }
 
-// ParseSeriesKey parses "measurement,tag1=value1,tag2=value2" into components
+// ParseSeriesKey parses "measurement,tag1=value1,tag2=value2" into components.
+// It follows Influx line protocol escaping for commas, equals signs, and backslashes.
 func ParseSeriesKey(key string) (tags map[string]string) {
-	tags = make(map[string]string)
-	parts := strings.Split(key, ",")
-	// First part is measurement, skip it
-	for _, part := range parts[1:] {
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) == 2 {
-			tags[kv[0]] = kv[1]
-		}
-	}
-	return
+	return types.ParseSeriesKey(key).Tags
+}
+
+func influxQuoteStringLiteral(s string) string {
+	escaped := strings.ReplaceAll(s, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `'`, `\'`)
+	return "'" + escaped + "'"
 }
 
 // BuildWhereClause builds "(tag1='v1' AND tag2='v2') OR (tag1='v3' AND tag2='v4')"
 func BuildWhereClause(series []string) string {
-	var conditions []string
+	return buildWhereClause(series, nil)
+}
+
+// BuildWhereClauseWithTagKeys builds a series filter using the measurement's full tag key set.
+func BuildWhereClauseWithTagKeys(series []string, measurementTagKeys []string) string {
+	return buildWhereClause(series, measurementTagKeys)
+}
+
+func buildWhereClause(series []string, measurementTagKeys []string) string {
+	seriesTags := make([]map[string]string, 0, len(series))
+	tagKeySet := make(map[string]struct{})
+
+	for _, k := range measurementTagKeys {
+		tagKeySet[k] = struct{}{}
+	}
 	for _, s := range series {
 		tags := ParseSeriesKey(s)
+		seriesTags = append(seriesTags, tags)
+		for k := range tags {
+			tagKeySet[k] = struct{}{}
+		}
+	}
+
+	tagKeys := make([]string, 0, len(tagKeySet))
+	for k := range tagKeySet {
+		tagKeys = append(tagKeys, k)
+	}
+	sort.Strings(tagKeys)
+
+	var conditions []string
+	for _, tags := range seriesTags {
 		var tagConditions []string
-		for k, v := range tags {
-			// Escape single quotes in tag values for InfluxQL security
-			escapedValue := strings.ReplaceAll(v, "'", "''")
-			tagConditions = append(tagConditions, fmt.Sprintf("%s='%s'", influxQuoteIdentifier(k), escapedValue))
+		for _, k := range tagKeys {
+			if v, ok := tags[k]; ok {
+				tagConditions = append(tagConditions, fmt.Sprintf("%s=%s", influxQuoteIdentifier(k), influxQuoteStringLiteral(v)))
+			} else {
+				tagConditions = append(tagConditions, fmt.Sprintf("%s !~ /.*/", influxQuoteIdentifier(k)))
+			}
 		}
 		if len(tagConditions) > 0 {
 			conditions = append(conditions, "("+strings.Join(tagConditions, " AND ")+")")

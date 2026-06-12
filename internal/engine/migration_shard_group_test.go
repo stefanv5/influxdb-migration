@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -13,23 +15,34 @@ import (
 
 // MockSourceAdapterForShardGroup implements SourceAdapter for shard group testing
 type MockSourceAdapterForShardGroup struct {
-	shardGroups    []*adapter.ShardGroup
-	seriesInWindow map[string][]string // key is "windowStart-windowEnd"
-	queryCalled    bool
-	queryBatches   [][]string
+	shardGroups            []*adapter.ShardGroup
+	discoverShardGroupsErr error
+	series                 []string
+	seriesInWindow         map[string][]string // key is "windowStart-windowEnd"
+	queryDataBatchErr      error
+	queryCalled            bool
+	queryBatches           [][]string
+	queryConfigs           []*types.QueryConfig
 }
 
-func (m *MockSourceAdapterForShardGroup) Name() string                                    { return "mock" }
-func (m *MockSourceAdapterForShardGroup) SupportedVersions() []string                     { return []string{"1.0"} }
-func (m *MockSourceAdapterForShardGroup) Connect(ctx context.Context, config map[string]interface{}) error { return nil }
-func (m *MockSourceAdapterForShardGroup) Disconnect(ctx context.Context) error             { return nil }
-func (m *MockSourceAdapterForShardGroup) Ping(ctx context.Context) error                  { return nil }
-func (m *MockSourceAdapterForShardGroup) DiscoverTables(ctx context.Context) ([]string, error) { return nil, nil }
+func (m *MockSourceAdapterForShardGroup) Name() string                { return "mock" }
+func (m *MockSourceAdapterForShardGroup) SupportedVersions() []string { return []string{"1.0"} }
+func (m *MockSourceAdapterForShardGroup) Connect(ctx context.Context, config map[string]interface{}) error {
+	return nil
+}
+func (m *MockSourceAdapterForShardGroup) Disconnect(ctx context.Context) error { return nil }
+func (m *MockSourceAdapterForShardGroup) Ping(ctx context.Context) error       { return nil }
+func (m *MockSourceAdapterForShardGroup) DiscoverTables(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
 func (m *MockSourceAdapterForShardGroup) DiscoverSchema(ctx context.Context, table string) (*types.TableSchema, error) {
 	return &types.TableSchema{TableName: table, Columns: []types.Column{}}, nil
 }
 
 func (m *MockSourceAdapterForShardGroup) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
+	if m.discoverShardGroupsErr != nil {
+		return nil, m.discoverShardGroupsErr
+	}
 	return m.shardGroups, nil
 }
 
@@ -47,17 +60,27 @@ func (m *MockSourceAdapterForShardGroup) DiscoverTagKeys(ctx context.Context, me
 }
 
 func (m *MockSourceAdapterForShardGroup) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
+	if m.series != nil {
+		return m.series, nil
+	}
 	return []string{}, nil
 }
 
 func (m *MockSourceAdapterForShardGroup) QueryData(ctx context.Context, table string, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
-	return nil, nil
+	if cfg != nil {
+		copied := *cfg
+		m.queryConfigs = append(m.queryConfigs, &copied)
+	}
+	return &types.Checkpoint{ProcessedRows: 0}, nil
 }
 
 func (m *MockSourceAdapterForShardGroup) QueryDataBatch(ctx context.Context, measurement string, series []string, startTime, endTime time.Time, lastCheckpoint *types.Checkpoint, batchFunc func([]types.Record) error, cfg *types.QueryConfig) (*types.Checkpoint, error) {
 	m.queryCalled = true
 	// Copy the slice to avoid shared underlying array
 	m.queryBatches = append(m.queryBatches, append([]string(nil), series...))
+	if m.queryDataBatchErr != nil {
+		return nil, m.queryDataBatchErr
+	}
 
 	// Calculate offset based on lastCheckpoint for resume simulation
 	offset := int64(0)
@@ -90,17 +113,23 @@ type MockTargetAdapterForShardGroup struct {
 	receivedRecords []types.Record
 }
 
-func (m *MockTargetAdapterForShardGroup) Name() string                          { return "mock-target" }
-func (m *MockTargetAdapterForShardGroup) SupportedVersions() []string           { return []string{"1.0"} }
-func (m *MockTargetAdapterForShardGroup) Connect(ctx context.Context, config map[string]interface{}) error { return nil }
+func (m *MockTargetAdapterForShardGroup) Name() string                { return "mock-target" }
+func (m *MockTargetAdapterForShardGroup) SupportedVersions() []string { return []string{"1.0"} }
+func (m *MockTargetAdapterForShardGroup) Connect(ctx context.Context, config map[string]interface{}) error {
+	return nil
+}
 func (m *MockTargetAdapterForShardGroup) Disconnect(ctx context.Context) error { return nil }
-func (m *MockTargetAdapterForShardGroup) Ping(ctx context.Context) error        { return nil }
+func (m *MockTargetAdapterForShardGroup) Ping(ctx context.Context) error       { return nil }
 func (m *MockTargetAdapterForShardGroup) WriteBatch(ctx context.Context, measurement string, records []types.Record) error {
 	m.receivedRecords = append(m.receivedRecords, records...)
 	return nil
 }
-func (m *MockTargetAdapterForShardGroup) MeasurementExists(ctx context.Context, name string) (bool, error) { return true, nil }
-func (m *MockTargetAdapterForShardGroup) CreateMeasurement(ctx context.Context, schema *types.Schema) error { return nil }
+func (m *MockTargetAdapterForShardGroup) MeasurementExists(ctx context.Context, name string) (bool, error) {
+	return true, nil
+}
+func (m *MockTargetAdapterForShardGroup) CreateMeasurement(ctx context.Context, schema *types.Schema) error {
+	return nil
+}
 
 func TestShardGroupMigration(t *testing.T) {
 	// Create mock adapters
@@ -214,14 +243,14 @@ func TestShardGroupMigrationWithResume(t *testing.T) {
 	windowStart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
 	windowEnd := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).UnixNano()
 	sgCP := &types.ShardGroupCheckpoint{
-		TaskID:              "test-task-resume",
-		ShardGroupID:        "1",
-		WindowStart:         windowStart,
-		WindowEnd:           windowEnd,
-		LastCompletedBatch:  0, // First batch (index 0) completed, so start from batch 1
+		TaskID:             "test-task-resume",
+		ShardGroupID:       "1",
+		WindowStart:        windowStart,
+		WindowEnd:          windowEnd,
+		LastCompletedBatch: 0, // First batch (index 0) completed, so start from batch 1
 		LastTimestamp:      time.Now().UnixNano(),
-		TotalProcessedRows:  10,
-		Status:              types.StatusInProgress,
+		TotalProcessedRows: 10,
+		Status:             types.StatusInProgress,
 	}
 	err = cpMgr.SaveShardGroupCheckpoint(context.Background(), sgCP)
 	if err != nil {
@@ -354,14 +383,14 @@ func TestCrashRecoveryBetweenWindows(t *testing.T) {
 
 	// Simulate crash after first window was completed
 	sgCP := &types.ShardGroupCheckpoint{
-		TaskID:              "test-crash-recovery",
-		ShardGroupID:        "1",
-		WindowStart:         time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
-		WindowEnd:           time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).UnixNano(),
-		LastCompletedBatch:  0,
+		TaskID:             "test-crash-recovery",
+		ShardGroupID:       "1",
+		WindowStart:        time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+		WindowEnd:          time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).UnixNano(),
+		LastCompletedBatch: 0,
 		LastTimestamp:      time.Now().UnixNano(),
-		TotalProcessedRows:  10,
-		Status:              types.StatusCompleted,
+		TotalProcessedRows: 10,
+		Status:             types.StatusCompleted,
 	}
 	err = cpMgr.SaveShardGroupCheckpoint(context.Background(), sgCP)
 	if err != nil {
@@ -422,4 +451,550 @@ func TestCrashRecoveryBetweenWindows(t *testing.T) {
 	// Verify we got exactly 1 batch which is expected for crash recovery
 	t.Logf("Crash recovery: processed %d batches, target received %d records",
 		len(sourceAdapter.queryBatches), len(targetAdapter.receivedRecords))
+}
+
+func TestBatchAndShardGroupModesMarkTaskInProgressAtStartup(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		queryMode string
+		run       func(*MigrationEngine, *MigrationTask) error
+	}{
+		{
+			name:      "batch",
+			queryMode: "batch",
+			run: func(engine *MigrationEngine, task *MigrationTask) error {
+				return engine.runTaskBatchMode(ctx, task)
+			},
+		},
+		{
+			name:      "shard-group",
+			queryMode: "shard-group",
+			run: func(engine *MigrationEngine, task *MigrationTask) error {
+				return engine.runTaskShardGroupMode(ctx, task)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sourceAdapter := &MockSourceAdapterForShardGroup{}
+			if tt.queryMode == "batch" {
+				sourceAdapter.series = []string{"series1"}
+				sourceAdapter.queryDataBatchErr = errors.New("simulated batch failure")
+			} else {
+				sourceAdapter.discoverShardGroupsErr = errors.New("simulated shard discovery failure")
+			}
+			targetAdapter := &MockTargetAdapterForShardGroup{}
+			cpMgr, err := checkpoint.NewManager(t.TempDir())
+			if err != nil {
+				t.Fatalf("failed to create checkpoint manager: %v", err)
+			}
+			defer cpMgr.Close()
+
+			task := &MigrationTask{
+				ID:            "startup-" + tt.queryMode,
+				SourceAdapter: "mock",
+				TargetAdapter: "mock-target",
+				Mapping: &types.MappingConfig{
+					SourceTable:       "test_measurement",
+					TargetMeasurement: "test_measurement",
+					TimeRange: types.TimeRange{
+						Start: "2024-01-01T00:00:00Z",
+						End:   "2024-01-02T00:00:00Z",
+					},
+				},
+			}
+			if err := cpMgr.CreateCheckpoint(&types.Checkpoint{
+				TaskID:        task.ID,
+				TaskName:      "startup",
+				SourceTable:   task.Mapping.SourceTable,
+				TargetMeas:    task.Mapping.TargetMeasurement,
+				Status:        types.StatusPending,
+				MappingConfig: *task.Mapping,
+			}); err != nil {
+				t.Fatalf("failed to create checkpoint: %v", err)
+			}
+
+			engine := &MigrationEngine{
+				sourceRegistry: adapter.NewRegistry(),
+				targetRegistry: adapter.NewRegistry(),
+				checkpointMgr:  cpMgr,
+				config: &types.MigrationConfig{
+					InfluxToInflux: types.InfluxToInfluxConfig{
+						Enabled:           true,
+						QueryMode:         tt.queryMode,
+						MaxSeriesPerQuery: 10,
+						ShardGroupConfig: &types.ShardGroupConfig{
+							TimeWindow: 24 * time.Hour,
+						},
+					},
+					Migration: types.MigrationSettings{
+						ChunkSize: 100,
+					},
+				},
+			}
+			engine.sourceRegistry.RegisterSource("mock", func() adapter.SourceAdapter { return sourceAdapter })
+			engine.targetRegistry.RegisterTarget("mock-target", func() adapter.TargetAdapter { return targetAdapter })
+
+			if err := tt.run(engine, task); err == nil {
+				t.Fatal("expected migration to fail after startup checkpoint was marked")
+			}
+
+			loaded, err := cpMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
+			if err != nil {
+				t.Fatalf("failed to load checkpoint: %v", err)
+			}
+			if loaded.Status != types.StatusInProgress {
+				t.Fatalf("expected startup checkpoint status %s, got %s", types.StatusInProgress, loaded.Status)
+			}
+		})
+	}
+}
+
+func TestNoOpModesSaveCompletedTaskCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name      string
+		queryMode string
+		source    *MockSourceAdapterForShardGroup
+		mapping   types.MappingConfig
+		run       func(*MigrationEngine, *MigrationTask) error
+	}{
+		{
+			name:      "batch no series",
+			queryMode: "batch",
+			source:    &MockSourceAdapterForShardGroup{series: []string{}},
+			mapping: types.MappingConfig{
+				SourceTable:       "test_measurement",
+				TargetMeasurement: "test_measurement",
+				TimeRange: types.TimeRange{
+					Start: start.Format(time.RFC3339),
+					End:   end.Format(time.RFC3339),
+				},
+			},
+			run: func(engine *MigrationEngine, task *MigrationTask) error {
+				return engine.runTaskBatchMode(ctx, task)
+			},
+		},
+		{
+			name:      "shard-group no shard groups",
+			queryMode: "shard-group",
+			source:    &MockSourceAdapterForShardGroup{shardGroups: []*adapter.ShardGroup{}},
+			mapping: types.MappingConfig{
+				SourceTable:       "test_measurement",
+				TargetMeasurement: "test_measurement",
+				TimeRange: types.TimeRange{
+					Start: start.Format(time.RFC3339),
+					End:   end.Format(time.RFC3339),
+				},
+			},
+			run: func(engine *MigrationEngine, task *MigrationTask) error {
+				return engine.runTaskShardGroupMode(ctx, task)
+			},
+		},
+		{
+			name:      "shard-group no relevant shard groups",
+			queryMode: "shard-group",
+			source: &MockSourceAdapterForShardGroup{
+				shardGroups: []*adapter.ShardGroup{
+					{ID: 1, StartTime: start, EndTime: end},
+				},
+			},
+			mapping: types.MappingConfig{
+				SourceTable:       "test_measurement",
+				TargetMeasurement: "test_measurement",
+				TimeRange: types.TimeRange{
+					Start: start.Add(48 * time.Hour).Format(time.RFC3339),
+					End:   end.Add(48 * time.Hour).Format(time.RFC3339),
+				},
+			},
+			run: func(engine *MigrationEngine, task *MigrationTask) error {
+				return engine.runTaskShardGroupMode(ctx, task)
+			},
+		},
+		{
+			name:      "shard-group no series in relevant shard",
+			queryMode: "shard-group",
+			source: &MockSourceAdapterForShardGroup{
+				shardGroups: []*adapter.ShardGroup{
+					{ID: 1, StartTime: start, EndTime: end},
+				},
+				seriesInWindow: map[string][]string{},
+			},
+			mapping: types.MappingConfig{
+				SourceTable:       "test_measurement",
+				TargetMeasurement: "test_measurement",
+				TimeRange: types.TimeRange{
+					Start: start.Format(time.RFC3339),
+					End:   end.Format(time.RFC3339),
+				},
+			},
+			run: func(engine *MigrationEngine, task *MigrationTask) error {
+				return engine.runTaskShardGroupMode(ctx, task)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targetAdapter := &MockTargetAdapterForShardGroup{}
+			cpMgr, err := checkpoint.NewManager(t.TempDir())
+			if err != nil {
+				t.Fatalf("failed to create checkpoint manager: %v", err)
+			}
+			defer cpMgr.Close()
+
+			engine := &MigrationEngine{
+				sourceRegistry: adapter.NewRegistry(),
+				targetRegistry: adapter.NewRegistry(),
+				checkpointMgr:  cpMgr,
+				config: &types.MigrationConfig{
+					InfluxToInflux: types.InfluxToInfluxConfig{
+						Enabled:           true,
+						QueryMode:         tt.queryMode,
+						MaxSeriesPerQuery: 10,
+						ShardGroupConfig: &types.ShardGroupConfig{
+							ShardParallelism: 1,
+							TimeWindow:       24 * time.Hour,
+						},
+					},
+					Migration: types.MigrationSettings{
+						ChunkSize: 100,
+					},
+				},
+			}
+			engine.sourceRegistry.RegisterSource("mock", func() adapter.SourceAdapter { return tt.source })
+			engine.targetRegistry.RegisterTarget("mock-target", func() adapter.TargetAdapter { return targetAdapter })
+
+			mapping := tt.mapping
+			task := &MigrationTask{
+				ID:            "noop-" + tt.name,
+				SourceAdapter: "mock",
+				TargetAdapter: "mock-target",
+				Mapping:       &mapping,
+			}
+
+			if err := tt.run(engine, task); err != nil {
+				t.Fatalf("migration failed: %v", err)
+			}
+
+			loaded, err := cpMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
+			if err != nil {
+				t.Fatalf("failed to load checkpoint: %v", err)
+			}
+			if loaded == nil {
+				t.Fatal("expected task checkpoint")
+			}
+			if loaded.Status != types.StatusCompleted {
+				t.Fatalf("expected completed task checkpoint, got %s", loaded.Status)
+			}
+			if loaded.TotalMigratedRows != 0 {
+				t.Fatalf("expected no-op migrated rows 0, got %d", loaded.TotalMigratedRows)
+			}
+		})
+	}
+}
+
+func TestShardGroupUsesShardGroupSeriesBatchSize(t *testing.T) {
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC)
+	sourceAdapter := &MockSourceAdapterForShardGroup{
+		shardGroups: []*adapter.ShardGroup{
+			{ID: 1, StartTime: start, EndTime: end},
+		},
+		seriesInWindow: map[string][]string{
+			start.Format(time.RFC3339Nano) + "-" + end.Format(time.RFC3339Nano): {
+				"series1", "series2", "series3", "series4", "series5", "series6", "series7",
+			},
+		},
+	}
+	targetAdapter := &MockTargetAdapterForShardGroup{}
+	cpMgr, err := checkpoint.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create checkpoint manager: %v", err)
+	}
+	defer cpMgr.Close()
+
+	engine := &MigrationEngine{
+		sourceRegistry: adapter.NewRegistry(),
+		targetRegistry: adapter.NewRegistry(),
+		checkpointMgr:  cpMgr,
+		config: &types.MigrationConfig{
+			InfluxToInflux: types.InfluxToInfluxConfig{
+				Enabled:           true,
+				QueryMode:         "shard-group",
+				MaxSeriesPerQuery: 10,
+				ShardGroupConfig: &types.ShardGroupConfig{
+					SeriesBatchSize:  3,
+					ShardParallelism: 1,
+					TimeWindow:       168 * time.Hour,
+				},
+			},
+			Migration: types.MigrationSettings{
+				ChunkSize: 10000,
+			},
+		},
+	}
+	engine.sourceRegistry.RegisterSource("mock", func() adapter.SourceAdapter { return sourceAdapter })
+	engine.targetRegistry.RegisterTarget("mock-target", func() adapter.TargetAdapter { return targetAdapter })
+
+	task := &MigrationTask{
+		ID:            "test-shard-batch-size",
+		SourceAdapter: "mock",
+		TargetAdapter: "mock-target",
+		Mapping: &types.MappingConfig{
+			SourceTable:       "test_measurement",
+			TargetMeasurement: "test_measurement",
+			TimeRange: types.TimeRange{
+				Start: start.Format(time.RFC3339),
+				End:   end.Format(time.RFC3339),
+			},
+		},
+	}
+
+	if err := engine.runTaskShardGroupMode(context.Background(), task); err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+
+	expected := [][]string{
+		{"series1", "series2", "series3"},
+		{"series4", "series5", "series6"},
+		{"series7"},
+	}
+	if len(sourceAdapter.queryBatches) != len(expected) {
+		t.Fatalf("expected %d batches, got %d", len(expected), len(sourceAdapter.queryBatches))
+	}
+	for i := range expected {
+		if !slices.Equal(sourceAdapter.queryBatches[i], expected[i]) {
+			t.Fatalf("batch %d: expected %v, got %v", i, expected[i], sourceAdapter.queryBatches[i])
+		}
+	}
+}
+
+func TestMigrateShardGroupDoesNotOverwriteWindowCheckpointWithStaleOuterCheckpoint(t *testing.T) {
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	mid := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	sourceAdapter := &MockSourceAdapterForShardGroup{
+		seriesInWindow: map[string][]string{
+			mid.Format(time.RFC3339Nano) + "-" + end.Format(time.RFC3339Nano): {"series1", "series2"},
+		},
+	}
+	targetAdapter := &MockTargetAdapterForShardGroup{}
+	cpMgr, err := checkpoint.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create checkpoint manager: %v", err)
+	}
+	defer cpMgr.Close()
+
+	firstWindowCP := &types.ShardGroupCheckpoint{
+		TaskID:             "test-no-stale-overwrite",
+		ShardGroupID:       "1",
+		WindowStart:        start.UnixNano(),
+		WindowEnd:          mid.UnixNano(),
+		LastCompletedBatch: 4,
+		LastTimestamp:      start.Add(time.Hour).UnixNano(),
+		TotalProcessedRows: 111,
+		Status:             types.StatusCompleted,
+	}
+	if err := cpMgr.SaveShardGroupCheckpoint(context.Background(), firstWindowCP); err != nil {
+		t.Fatalf("failed to seed checkpoint: %v", err)
+	}
+
+	engine := &MigrationEngine{
+		checkpointMgr: cpMgr,
+		config: &types.MigrationConfig{
+			InfluxToInflux: types.InfluxToInfluxConfig{
+				ShardGroupConfig: &types.ShardGroupConfig{
+					TimeWindow: 7 * 24 * time.Hour,
+				},
+			},
+			Migration: types.MigrationSettings{
+				ChunkSize: 100,
+			},
+		},
+	}
+	task := &MigrationTask{
+		ID: "test-no-stale-overwrite",
+		Mapping: &types.MappingConfig{
+			SourceTable:       "test_measurement",
+			TargetMeasurement: "test_measurement",
+		},
+	}
+	sg := &adapter.ShardGroup{ID: 1, StartTime: start, EndTime: end}
+
+	if err := engine.migrateShardGroup(context.Background(), task, sg, sourceAdapter, targetAdapter, start, end); err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+
+	secondWindowCP, err := cpMgr.LoadShardGroupCheckpointForWindow(context.Background(), task.ID, "1", mid.UnixNano(), end.UnixNano())
+	if err != nil {
+		t.Fatalf("failed to load second window checkpoint: %v", err)
+	}
+	if secondWindowCP == nil {
+		t.Fatal("expected second window checkpoint")
+	}
+	if secondWindowCP.TotalProcessedRows != 20 {
+		t.Fatalf("expected second window processed rows 20, got %d", secondWindowCP.TotalProcessedRows)
+	}
+	if secondWindowCP.LastCompletedBatch != 0 {
+		t.Fatalf("expected second window last batch 0, got %d", secondWindowCP.LastCompletedBatch)
+	}
+}
+
+func TestQueryWithTimeRangePassesWindowBoundsInQueryConfig(t *testing.T) {
+	queryConfigType := reflect.TypeOf(types.QueryConfig{})
+	if _, ok := queryConfigType.FieldByName("StartTime"); !ok {
+		t.Skip("types.QueryConfig does not define StartTime in this slice")
+	}
+	if _, ok := queryConfigType.FieldByName("EndTime"); !ok {
+		t.Skip("types.QueryConfig does not define EndTime in this slice")
+	}
+
+	sourceAdapter := &MockSourceAdapterForShardGroup{}
+	targetAdapter := &MockTargetAdapterForShardGroup{}
+	cpMgr, err := checkpoint.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create checkpoint manager: %v", err)
+	}
+	defer cpMgr.Close()
+
+	engine := &MigrationEngine{
+		checkpointMgr: cpMgr,
+		config: &types.MigrationConfig{
+			Migration: types.MigrationSettings{
+				ChunkInterval: 0,
+				ChunkSize:     100,
+			},
+		},
+	}
+	mapping := &types.MappingConfig{
+		SourceTable:       "test_measurement",
+		TargetMeasurement: "test_measurement",
+		TimeRange: types.TimeRange{
+			Start: "2024-01-01T00:00:00Z",
+			End:   "2024-01-03T00:00:00Z",
+		},
+		TimeWindow: "24h",
+	}
+
+	_, err = engine.queryWithTimeRange(context.Background(), sourceAdapter, "test_measurement", mapping, nil, targetAdapter, "query-bounds", &types.QueryConfig{BatchSize: 100})
+	if err != nil {
+		t.Fatalf("queryWithTimeRange failed: %v", err)
+	}
+
+	if len(sourceAdapter.queryConfigs) != 2 {
+		t.Fatalf("expected 2 query configs, got %d", len(sourceAdapter.queryConfigs))
+	}
+
+	expectedStarts := []time.Time{
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
+	}
+	expectedEnds := []time.Time{
+		time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC),
+	}
+	for i, cfg := range sourceAdapter.queryConfigs {
+		start, ok := queryConfigTimeValue(cfg, "StartTime")
+		if !ok {
+			t.Fatalf("query config %d missing StartTime value", i)
+		}
+		end, ok := queryConfigTimeValue(cfg, "EndTime")
+		if !ok {
+			t.Fatalf("query config %d missing EndTime value", i)
+		}
+		if !start.Equal(expectedStarts[i]) || !end.Equal(expectedEnds[i]) {
+			t.Fatalf("query config %d: expected [%s,%s), got [%s,%s)",
+				i, expectedStarts[i], expectedEnds[i], start, end)
+		}
+	}
+}
+
+func TestQueryWithTimeRangeResumeSkipsCompletedFirstWindow(t *testing.T) {
+	sourceAdapter := &MockSourceAdapterForShardGroup{}
+	targetAdapter := &MockTargetAdapterForShardGroup{}
+	cpMgr, err := checkpoint.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create checkpoint manager: %v", err)
+	}
+	defer cpMgr.Close()
+
+	engine := &MigrationEngine{
+		checkpointMgr: cpMgr,
+		config: &types.MigrationConfig{
+			Migration: types.MigrationSettings{
+				ChunkInterval: 0,
+				ChunkSize:     100,
+			},
+		},
+	}
+	firstStart := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	firstEnd := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+	finalEnd := time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)
+	mapping := &types.MappingConfig{
+		SourceTable:       "test_measurement",
+		TargetMeasurement: "test_measurement",
+		TimeRange: types.TimeRange{
+			Start: firstStart.Format(time.RFC3339),
+			End:   finalEnd.Format(time.RFC3339),
+		},
+		TimeWindow: "24h",
+	}
+	lastCheckpoint := &types.Checkpoint{
+		TaskID:        "query-resume",
+		TaskName:      "query-resume",
+		SourceTable:   mapping.SourceTable,
+		TargetMeas:    mapping.TargetMeasurement,
+		LastTimestamp: firstEnd.UnixNano(),
+		ProcessedRows: 10,
+		Status:        types.StatusInProgress,
+		MappingConfig: *mapping,
+	}
+
+	_, err = engine.queryWithTimeRange(context.Background(), sourceAdapter, mapping.SourceTable, mapping, lastCheckpoint, targetAdapter, "query-resume", &types.QueryConfig{BatchSize: 100})
+	if err != nil {
+		t.Fatalf("queryWithTimeRange failed: %v", err)
+	}
+
+	if len(sourceAdapter.queryConfigs) != 1 {
+		t.Fatalf("expected only the second window to be queried, got %d configs", len(sourceAdapter.queryConfigs))
+	}
+	start, ok := queryConfigTimeValue(sourceAdapter.queryConfigs[0], "StartTime")
+	if !ok {
+		t.Fatal("query config missing StartTime value")
+	}
+	end, ok := queryConfigTimeValue(sourceAdapter.queryConfigs[0], "EndTime")
+	if !ok {
+		t.Fatal("query config missing EndTime value")
+	}
+	if !start.Equal(firstEnd) || !end.Equal(finalEnd) {
+		t.Fatalf("expected resumed query window [%s,%s), got [%s,%s)", firstEnd, finalEnd, start, end)
+	}
+}
+
+func queryConfigTimeValue(cfg *types.QueryConfig, fieldName string) (time.Time, bool) {
+	field := reflect.ValueOf(cfg).Elem().FieldByName(fieldName)
+	if !field.IsValid() {
+		return time.Time{}, false
+	}
+	timeType := reflect.TypeOf(time.Time{})
+	switch {
+	case field.Type() == timeType:
+		value := field.Interface().(time.Time)
+		return value, !value.IsZero()
+	case field.Kind() == reflect.Ptr && field.Type().Elem() == timeType && !field.IsNil():
+		value := field.Elem().Interface().(time.Time)
+		return value, !value.IsZero()
+	case field.Kind() == reflect.Int64:
+		value := field.Int()
+		return time.Unix(0, value), value != 0
+	default:
+		return time.Time{}, false
+	}
 }

@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/migration-tools/influx-migrator/pkg/types"
+	_ "modernc.org/sqlite"
 )
 
 type SQLiteStore struct {
@@ -37,6 +37,9 @@ func NewSQLiteStore(dir string) (*SQLiteStore, error) {
 	}
 	// Best-effort migration: add total_migrated_rows column if it doesn't exist
 	_ = store.maybeAddTotalMigratedRowsColumn()
+	if err := store.maybeMigrateShardGroupCheckpointUniqueKey(); err != nil {
+		return nil, fmt.Errorf("failed to migrate shard group checkpoint schema: %w", err)
+	}
 
 	return store, nil
 }
@@ -92,7 +95,7 @@ func (s *SQLiteStore) initSchema() error {
 		status TEXT NOT NULL DEFAULT 'pending',
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
-		UNIQUE(task_id, shard_group_id, window_start)
+		UNIQUE(task_id, shard_group_id, window_start, window_end)
 	);
 	`
 
@@ -115,6 +118,111 @@ func (s *SQLiteStore) maybeAddTotalMigratedRowsColumn() error {
 		}
 	}
 	return nil
+}
+
+func (s *SQLiteStore) maybeMigrateShardGroupCheckpointUniqueKey() error {
+	hasExpectedKey, err := s.hasShardGroupCheckpointWindowEndUniqueKey()
+	if err != nil || hasExpectedKey {
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+	CREATE TABLE shard_group_checkpoints_new (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id TEXT NOT NULL,
+		shard_group_id TEXT NOT NULL,
+		window_start INTEGER NOT NULL,
+		window_end INTEGER NOT NULL,
+		last_completed_batch INTEGER NOT NULL DEFAULT 0,
+		last_timestamp INTEGER NOT NULL DEFAULT 0,
+		total_processed_rows INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(task_id, shard_group_id, window_start, window_end)
+	);
+	INSERT INTO shard_group_checkpoints_new
+		(id, task_id, shard_group_id, window_start, window_end, last_completed_batch,
+		 last_timestamp, total_processed_rows, status, created_at, updated_at)
+	SELECT id, task_id, shard_group_id, window_start, window_end,
+	       CASE WHEN status = 'completed' THEN -1 ELSE last_completed_batch END,
+	       CASE WHEN status = 'completed' THEN 0 ELSE last_timestamp END,
+	       CASE WHEN status = 'completed' THEN 0 ELSE total_processed_rows END,
+	       CASE WHEN status = 'completed' THEN 'in_progress' ELSE status END,
+	       created_at, updated_at
+	FROM shard_group_checkpoints;
+	DROP TABLE shard_group_checkpoints;
+	ALTER TABLE shard_group_checkpoints_new RENAME TO shard_group_checkpoints;
+	`)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) hasShardGroupCheckpointWindowEndUniqueKey() (bool, error) {
+	indexRows, err := s.db.Query("PRAGMA index_list('shard_group_checkpoints')")
+	if err != nil {
+		return false, err
+	}
+	defer indexRows.Close()
+
+	for indexRows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := indexRows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return false, err
+		}
+		if unique == 0 {
+			continue
+		}
+
+		cols, err := s.indexColumns(name)
+		if err != nil {
+			return false, err
+		}
+		if len(cols) == 4 &&
+			cols[0] == "task_id" &&
+			cols[1] == "shard_group_id" &&
+			cols[2] == "window_start" &&
+			cols[3] == "window_end" {
+			return true, nil
+		}
+	}
+	if err := indexRows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (s *SQLiteStore) indexColumns(indexName string) ([]string, error) {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA index_info(%q)", indexName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var cols []string
+	for rows.Next() {
+		var seqno int
+		var cid int
+		var name string
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			return nil, err
+		}
+		cols = append(cols, name)
+	}
+	return cols, rows.Err()
 }
 
 func (s *SQLiteStore) Close() error {
@@ -203,9 +311,9 @@ func (s *SQLiteStore) LoadCheckpoint(taskID, sourceTable string) (*types.Checkpo
 
 func (s *SQLiteStore) ListCheckpoints(taskName string) ([]*types.Checkpoint, error) {
 	query := `SELECT id, task_id, task_name, source_table, target_meas, last_id, last_timestamp, processed_rows, status, created_at, updated_at, error_message, mapping_config, total_migrated_rows
-	          FROM checkpoints WHERE task_name = ?`
+	          FROM checkpoints WHERE task_name = ? OR task_id = ?`
 
-	rows, err := s.db.Query(query, taskName)
+	rows, err := s.db.Query(query, taskName, taskName)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +417,8 @@ func (s *SQLiteStore) SaveShardGroupCheckpoint(cp *types.ShardGroupCheckpoint) e
 		(task_id, shard_group_id, window_start, window_end, last_completed_batch,
 		 last_timestamp, total_processed_rows, status, created_at, updated_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	ON CONFLICT(task_id, shard_group_id, window_start) DO UPDATE SET
+	ON CONFLICT(task_id, shard_group_id, window_start, window_end) DO UPDATE SET
+		window_end = excluded.window_end,
 		last_completed_batch = excluded.last_completed_batch,
 		last_timestamp = excluded.last_timestamp,
 		total_processed_rows = excluded.total_processed_rows,

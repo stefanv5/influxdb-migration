@@ -109,6 +109,18 @@ func TestShardGroupOverlaps(t *testing.T) {
 			queryEnd:   time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
 			expected:   true,
 		},
+		{
+			name:       "query end touches shard start",
+			queryStart: time.Date(2023, 12, 25, 0, 0, 0, 0, time.UTC),
+			queryEnd:   time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+			expected:   false,
+		},
+		{
+			name:       "query start touches shard end",
+			queryStart: time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
+			queryEnd:   time.Date(2024, 1, 20, 0, 0, 0, 0, time.UTC),
+			expected:   false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -129,39 +141,39 @@ func TestShardGroupEffectiveTimeRange(t *testing.T) {
 	}
 
 	tests := []struct {
-		name            string
-		queryStart      time.Time
-		queryEnd        time.Time
-		expectedStart   time.Time
-		expectedEnd     time.Time
+		name          string
+		queryStart    time.Time
+		queryEnd      time.Time
+		expectedStart time.Time
+		expectedEnd   time.Time
 	}{
 		{
-			name:            "query before shard",
-			queryStart:      time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
-			queryEnd:        time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
-			expectedStart:   time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC),
-			expectedEnd:     time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
+			name:          "query before shard",
+			queryStart:    time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+			queryEnd:      time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
+			expectedStart: time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC),
+			expectedEnd:   time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
 		},
 		{
-			name:            "query after shard",
-			queryStart:      time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
-			queryEnd:        time.Date(2024, 1, 20, 0, 0, 0, 0, time.UTC),
-			expectedStart:   time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
-			expectedEnd:     time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),
+			name:          "query after shard",
+			queryStart:    time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
+			queryEnd:      time.Date(2024, 1, 20, 0, 0, 0, 0, time.UTC),
+			expectedStart: time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC),
+			expectedEnd:   time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),
 		},
 		{
-			name:            "query spans shard",
-			queryStart:      time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
-			queryEnd:        time.Date(2024, 1, 20, 0, 0, 0, 0, time.UTC),
-			expectedStart:   time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC),
-			expectedEnd:     time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),
+			name:          "query spans shard",
+			queryStart:    time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+			queryEnd:      time.Date(2024, 1, 20, 0, 0, 0, 0, time.UTC),
+			expectedStart: time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC),
+			expectedEnd:   time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),
 		},
 		{
-			name:            "query within shard",
-			queryStart:      time.Date(2024, 1, 7, 0, 0, 0, 0, time.UTC),
-			queryEnd:        time.Date(2024, 1, 12, 0, 0, 0, 0, time.UTC),
-			expectedStart:   time.Date(2024, 1, 7, 0, 0, 0, 0, time.UTC),
-			expectedEnd:     time.Date(2024, 1, 12, 0, 0, 0, 0, time.UTC),
+			name:          "query within shard",
+			queryStart:    time.Date(2024, 1, 7, 0, 0, 0, 0, time.UTC),
+			queryEnd:      time.Date(2024, 1, 12, 0, 0, 0, 0, time.UTC),
+			expectedStart: time.Date(2024, 1, 7, 0, 0, 0, 0, time.UTC),
+			expectedEnd:   time.Date(2024, 1, 12, 0, 0, 0, 0, time.UTC),
 		},
 	}
 

@@ -2,6 +2,7 @@ package checkpoint
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -391,5 +392,156 @@ func TestManager_GetInProgressTasks(t *testing.T) {
 
 	if len(inProgress) != 1 {
 		t.Errorf("Expected 1 in-progress task, got %d", len(inProgress))
+	}
+}
+
+func TestManager_ShardGroupCheckpointUniqueIncludesWindowEnd(t *testing.T) {
+	mgr, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	first := &types.ShardGroupCheckpoint{
+		TaskID:             "task1",
+		ShardGroupID:       "sg1",
+		WindowStart:        100,
+		WindowEnd:          200,
+		LastCompletedBatch: 1,
+		LastTimestamp:      1000,
+		TotalProcessedRows: 10,
+		Status:             types.StatusInProgress,
+	}
+	second := &types.ShardGroupCheckpoint{
+		TaskID:             "task1",
+		ShardGroupID:       "sg1",
+		WindowStart:        100,
+		WindowEnd:          300,
+		LastCompletedBatch: 2,
+		LastTimestamp:      2000,
+		TotalProcessedRows: 20,
+		Status:             types.StatusCompleted,
+	}
+
+	if err := mgr.SaveShardGroupCheckpoint(ctx, first); err != nil {
+		t.Fatalf("SaveShardGroupCheckpoint first failed: %v", err)
+	}
+	if err := mgr.SaveShardGroupCheckpoint(ctx, second); err != nil {
+		t.Fatalf("SaveShardGroupCheckpoint second failed: %v", err)
+	}
+
+	checkpoints, err := mgr.ListShardGroupCheckpoints(ctx, "task1")
+	if err != nil {
+		t.Fatalf("ListShardGroupCheckpoints failed: %v", err)
+	}
+	if len(checkpoints) != 2 {
+		t.Fatalf("expected 2 checkpoints with same start and different end, got %d", len(checkpoints))
+	}
+}
+
+func TestManager_ShardGroupCheckpointUpsertUpdatesSameWindow(t *testing.T) {
+	mgr, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	original := &types.ShardGroupCheckpoint{
+		TaskID:             "task1",
+		ShardGroupID:       "sg1",
+		WindowStart:        100,
+		WindowEnd:          200,
+		LastCompletedBatch: 0,
+		LastTimestamp:      1000,
+		TotalProcessedRows: 10,
+		Status:             types.StatusInProgress,
+	}
+	updated := &types.ShardGroupCheckpoint{
+		TaskID:             "task1",
+		ShardGroupID:       "sg1",
+		WindowStart:        100,
+		WindowEnd:          200,
+		LastCompletedBatch: 3,
+		LastTimestamp:      4000,
+		TotalProcessedRows: 40,
+		Status:             types.StatusCompleted,
+	}
+
+	if err := mgr.SaveShardGroupCheckpoint(ctx, original); err != nil {
+		t.Fatalf("SaveShardGroupCheckpoint original failed: %v", err)
+	}
+	if err := mgr.SaveShardGroupCheckpoint(ctx, updated); err != nil {
+		t.Fatalf("SaveShardGroupCheckpoint updated failed: %v", err)
+	}
+
+	loaded, err := mgr.LoadShardGroupCheckpointForWindow(ctx, "task1", "sg1", 100, 200)
+	if err != nil {
+		t.Fatalf("LoadShardGroupCheckpointForWindow failed: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected checkpoint")
+	}
+	if loaded.WindowEnd != 200 {
+		t.Fatalf("expected window_end 200, got %d", loaded.WindowEnd)
+	}
+	if loaded.LastCompletedBatch != 3 || loaded.LastTimestamp != 4000 || loaded.TotalProcessedRows != 40 || loaded.Status != types.StatusCompleted {
+		t.Fatalf("loaded checkpoint was not updated: %+v", loaded)
+	}
+}
+
+func TestManager_MigratesLegacyCompletedShardGroupCheckpointAsInProgressWithResetProgress(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "checkpoints.db"))
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = db.Exec(`
+	CREATE TABLE shard_group_checkpoints (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id TEXT NOT NULL,
+		shard_group_id TEXT NOT NULL,
+		window_start INTEGER NOT NULL,
+		window_end INTEGER NOT NULL,
+		last_completed_batch INTEGER NOT NULL DEFAULT 0,
+		last_timestamp INTEGER NOT NULL DEFAULT 0,
+		total_processed_rows INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(task_id, shard_group_id, window_start)
+	);
+	INSERT INTO shard_group_checkpoints
+		(task_id, shard_group_id, window_start, window_end, last_completed_batch,
+		 last_timestamp, total_processed_rows, status, created_at, updated_at)
+	VALUES ('task1', 'sg1', 100, 200, 7, 150, 99, 'completed', ?, ?);
+	`, now, now)
+	if err != nil {
+		t.Fatalf("failed to seed legacy checkpoint: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("failed to close seed db: %v", err)
+	}
+
+	mgr, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	loaded, err := mgr.LoadShardGroupCheckpointForWindow(context.Background(), "task1", "sg1", 100, 200)
+	if err != nil {
+		t.Fatalf("LoadShardGroupCheckpointForWindow failed: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected migrated checkpoint")
+	}
+	if loaded.Status != types.StatusInProgress {
+		t.Fatalf("expected legacy completed checkpoint to be downgraded to %s, got %s", types.StatusInProgress, loaded.Status)
+	}
+	if loaded.LastCompletedBatch != -1 || loaded.LastTimestamp != 0 || loaded.TotalProcessedRows != 0 {
+		t.Fatalf("expected migration to reset progress fields, got %+v", loaded)
 	}
 }

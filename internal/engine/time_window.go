@@ -36,7 +36,7 @@ func SplitTimeWindows(start, end time.Time, windowDuration time.Duration) []Time
 
 // ShardGroupOverlaps returns true if shard group overlaps with query range
 func ShardGroupOverlaps(sg *adapter.ShardGroup, queryStart, queryEnd time.Time) bool {
-	return !queryEnd.Before(sg.StartTime) && !queryStart.After(sg.EndTime)
+	return queryStart.Before(sg.EndTime) && sg.StartTime.Before(queryEnd)
 }
 
 // ShardGroupEffectiveTimeRange returns the intersection of shard group and query time range

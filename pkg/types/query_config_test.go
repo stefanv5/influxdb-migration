@@ -54,6 +54,22 @@ func TestQueryConfig_WithBothFields(t *testing.T) {
 	}
 }
 
+func TestQueryConfig_WithOptionalTimeBounds(t *testing.T) {
+	start := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	end := time.Date(2024, 1, 3, 3, 4, 5, 0, time.UTC)
+	cfg := &QueryConfig{
+		StartTime: start,
+		EndTime:   end,
+	}
+
+	if !cfg.StartTime.Equal(start) {
+		t.Errorf("Expected StartTime %v, got %v", start, cfg.StartTime)
+	}
+	if !cfg.EndTime.Equal(end) {
+		t.Errorf("Expected EndTime %v, got %v", end, cfg.EndTime)
+	}
+}
+
 func TestQueryConfig_EdgeCases(t *testing.T) {
 	tests := []struct {
 		name       string

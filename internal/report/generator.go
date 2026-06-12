@@ -88,6 +88,12 @@ func (g *Generator) GenerateWithDetails(ctx context.Context, migrationID, taskNa
 	if err != nil {
 		return nil, fmt.Errorf("failed to list checkpoints: %w", err)
 	}
+	if len(checkpoints) == 0 && migrationID != taskName {
+		checkpoints, err = g.checkpointMgr.ListCheckpoints(ctx, migrationID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list checkpoints by migration id: %w", err)
+		}
+	}
 
 	var totalRows, transferredRows, failedRows int64
 	var latestTime time.Time
@@ -95,12 +101,13 @@ func (g *Generator) GenerateWithDetails(ctx context.Context, migrationID, taskNa
 	measurementSet := make(map[string]bool)
 
 	for _, cp := range checkpoints {
-		totalRows += cp.TotalMigratedRows
+		rowCount := reportRowCount(cp)
+		totalRows += rowCount
 		measurementSet[cp.TargetMeas] = true
 		if cp.Status == types.StatusCompleted {
-			transferredRows += cp.TotalMigratedRows
+			transferredRows += rowCount
 		} else if cp.Status == types.StatusFailed {
-			failedRows += cp.TotalMigratedRows
+			failedRows += rowCount
 			status = "failed"
 		}
 		if cp.UpdatedAt.After(latestTime) {
@@ -153,6 +160,13 @@ func (g *Generator) GenerateWithDetails(ctx context.Context, migrationID, taskNa
 	}
 
 	return report, nil
+}
+
+func reportRowCount(cp *types.Checkpoint) int64 {
+	if cp.TotalMigratedRows != 0 {
+		return cp.TotalMigratedRows
+	}
+	return cp.ProcessedRows
 }
 
 func (g *Generator) SaveJSON(report *Report) error {

@@ -151,18 +151,10 @@ func (a *InfluxDBV1TargetAdapter) formatInfluxLine(measurement string, r types.R
 		return ""
 	}
 
-	timestampStr := ""
-	if r.Time != 0 {
-		timestampStr = fmt.Sprintf(" %d", r.Time)
-	} else {
-		logger.Warn("record has zero timestamp, InfluxDB will assign current time",
-			zap.String("measurement", measurement))
-	}
-
 	if tagsStr != "" {
-		return fmt.Sprintf("%s,%s %s%s", measurement, tagsStr, fieldsStr, timestampStr)
+		return fmt.Sprintf("%s,%s %s %d", escapeMeasurement(measurement), tagsStr, fieldsStr, r.Time)
 	}
-	return fmt.Sprintf("%s %s%s", measurement, fieldsStr, timestampStr)
+	return fmt.Sprintf("%s %s %d", escapeMeasurement(measurement), fieldsStr, r.Time)
 }
 
 func formatTags(tags map[string]string) string {
@@ -220,6 +212,12 @@ func formatFieldValue(v interface{}) string {
 func escapeTagValue(s string) string {
 	s = strings.ReplaceAll(s, ",", "\\,")
 	s = strings.ReplaceAll(s, "=", "\\=")
+	s = strings.ReplaceAll(s, " ", "\\ ")
+	return s
+}
+
+func escapeMeasurement(s string) string {
+	s = strings.ReplaceAll(s, ",", "\\,")
 	s = strings.ReplaceAll(s, " ", "\\ ")
 	return s
 }
@@ -552,9 +550,9 @@ func (a *InfluxDBV2TargetAdapter) formatFluxRecords(measurement string, records 
 		// InfluxDB v2 write line protocol: measurement,tag1=val1 field1=val1,field2=val2 timestamp
 		tagsStr := formatTags(r.Tags)
 		if tagsStr != "" {
-			lines = append(lines, fmt.Sprintf("%s,%s %s %d", measurement, tagsStr, strings.Join(fieldParts, ","), r.Time))
+			lines = append(lines, fmt.Sprintf("%s,%s %s %d", escapeMeasurement(measurement), tagsStr, strings.Join(fieldParts, ","), r.Time))
 		} else {
-			lines = append(lines, fmt.Sprintf("%s %s %d", measurement, strings.Join(fieldParts, ","), r.Time))
+			lines = append(lines, fmt.Sprintf("%s %s %d", escapeMeasurement(measurement), strings.Join(fieldParts, ","), r.Time))
 		}
 	}
 
@@ -574,6 +572,11 @@ func (a *InfluxDBV2TargetAdapter) writeLines(ctx context.Context, lines []string
 	}
 	u.Path = "/api/v2/write"
 
+	queryParams := url.Values{}
+	queryParams.Set("org", a.config.Org)
+	queryParams.Set("bucket", a.config.Bucket)
+	u.RawQuery = queryParams.Encode()
+
 	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewBufferString(body))
 	if err != nil {
 		return err
@@ -582,11 +585,6 @@ func (a *InfluxDBV2TargetAdapter) writeLines(ctx context.Context, lines []string
 	req.Header.Set("Authorization", "Token "+a.config.Token)
 	req.Header.Set("Content-Type", "text/plain")
 	req.Header.Set("Accept", "application/json")
-
-	queryParams := url.Values{}
-	queryParams.Set("org", a.config.Org)
-	queryParams.Set("bucket", a.config.Bucket)
-	u.RawQuery = queryParams.Encode()
 
 	resp, err := a.client.Do(req)
 	if err != nil {

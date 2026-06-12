@@ -23,6 +23,8 @@ type QueryConfig struct {
 	BatchSize         int
 	TimeWindow        time.Duration
 	MaxSeriesPerQuery int
+	StartTime         time.Time
+	EndTime           time.Time
 	TagKeys           []string // 用于区分 tag 和 field
 }
 

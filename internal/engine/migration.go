@@ -269,13 +269,18 @@ func (e *MigrationEngine) discoverMappings(ctx context.Context, taskConfig types
 }
 
 func (e *MigrationEngine) matchTagFilters(series string, filters map[string][]string) bool {
+	tags := types.ParseSeriesKey(series).Tags
 	for tagKey, allowedValues := range filters {
 		if len(allowedValues) == 0 {
 			continue
 		}
+		tagValue, ok := tags[tagKey]
+		if !ok {
+			return false
+		}
 		found := false
 		for _, val := range allowedValues {
-			if strings.Contains(series, fmt.Sprintf("%s=%s", tagKey, val)) {
+			if tagValue == val {
 				found = true
 				break
 			}
@@ -288,14 +293,12 @@ func (e *MigrationEngine) matchTagFilters(series string, filters map[string][]st
 }
 
 func (e *MigrationEngine) applySubtablePattern(table, series, pattern string) string {
-	parts := strings.Split(series, ",")
+	parsed := types.ParseSeriesKey(series)
 	result := pattern
-	for i, part := range parts {
-		kv := strings.Split(part, "=")
-		if len(kv) == 2 {
-			result = strings.ReplaceAll(result, fmt.Sprintf("{{tag%d}}", i+1), kv[0])
-			result = strings.ReplaceAll(result, fmt.Sprintf("{{value%d}}", i+1), kv[1])
-		}
+	for i, tag := range parsed.TagPairs {
+		idx := i + 1
+		result = strings.ReplaceAll(result, fmt.Sprintf("{{tag%d}}", idx), tag.Key)
+		result = strings.ReplaceAll(result, fmt.Sprintf("{{value%d}}", idx), tag.Value)
 	}
 	result = strings.ReplaceAll(result, "{{table}}", table)
 	result = strings.ReplaceAll(result, "{{series}}", series)
@@ -496,12 +499,12 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 
 	// Build final checkpoint with all fields
 	cp := &types.Checkpoint{
-		TaskID:             task.ID,
-		SourceTable:        task.Mapping.SourceTable,
-		LastID:             0,
-		LastTimestamp:      lastTimestamp,
-		ProcessedRows:      totalProcessed,
-		TotalMigratedRows:  totalProcessed,
+		TaskID:            task.ID,
+		SourceTable:       task.Mapping.SourceTable,
+		LastID:            0,
+		LastTimestamp:     lastTimestamp,
+		ProcessedRows:     totalProcessed,
+		TotalMigratedRows: totalProcessed,
 		Status:            types.StatusCompleted,
 	}
 	if existingCP != nil {
@@ -526,6 +529,16 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		zap.String("task_id", task.ID),
 		zap.String("source_table", task.Mapping.SourceTable),
 		zap.String("target_measurement", task.Mapping.TargetMeasurement))
+
+	lastCheckpoint, err := e.startTaskCheckpoint(ctx, task)
+	if err != nil {
+		return err
+	}
+	if lastCheckpoint != nil && lastCheckpoint.Status == types.StatusCompleted {
+		logger.Info("batch mode task already completed, skipping",
+			zap.String("task_id", task.ID))
+		return nil
+	}
 
 	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
 	if err != nil {
@@ -572,6 +585,7 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 	if len(series) == 0 {
 		logger.Info("no series to migrate in batch mode",
 			zap.String("task_id", task.ID))
+		e.saveCompletedTaskCheckpoint(ctx, task, lastCheckpoint, 0, 0, 0)
 		return nil
 	}
 
@@ -645,12 +659,6 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		if tw, err := time.ParseDuration(task.Mapping.TimeWindow); err == nil {
 			windowDuration = tw
 		}
-	}
-
-	// Load checkpoint to resume from previous position
-	lastCheckpoint, err := e.checkpointMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
-	if err != nil {
-		return fmt.Errorf("failed to load checkpoint: %w", err)
 	}
 
 	// Track progress across windows
@@ -748,13 +756,13 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 
 		// Save checkpoint after each window
 		windowCP := &types.Checkpoint{
-			TaskID:             task.ID,
-			SourceTable:        task.Mapping.SourceTable,
-			LastID:             0,
-			LastTimestamp:      lastTimestamp,
-			ProcessedRows:      int64(windowIdx + 1), // Store window index for resume
-			TotalMigratedRows:  totalMigratedRows,
-			Status:             types.StatusInProgress,
+			TaskID:            task.ID,
+			SourceTable:       task.Mapping.SourceTable,
+			LastID:            0,
+			LastTimestamp:     lastTimestamp,
+			ProcessedRows:     int64(windowIdx + 1), // Store window index for resume
+			TotalMigratedRows: totalMigratedRows,
+			Status:            types.StatusInProgress,
 		}
 		if lastCheckpoint != nil {
 			windowCP.TaskName = lastCheckpoint.TaskName
@@ -776,27 +784,7 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		zap.Int("total_windows", len(windows)),
 		zap.Int("total_batches", len(batches)))
 
-	// Save final checkpoint with completed status
-	finalCP := &types.Checkpoint{
-		TaskID:             task.ID,
-		SourceTable:        task.Mapping.SourceTable,
-		LastID:             0,
-		LastTimestamp:      lastTimestamp,
-		ProcessedRows:      int64(len(windows)),
-		TotalMigratedRows:  totalMigratedRows,
-		Status:            types.StatusCompleted,
-	}
-	if lastCheckpoint != nil {
-		finalCP.TaskName = lastCheckpoint.TaskName
-		finalCP.TargetMeas = lastCheckpoint.TargetMeas
-		finalCP.MappingConfig = lastCheckpoint.MappingConfig
-	}
-	if err := e.checkpointMgr.SaveCheckpoint(ctx, finalCP); err != nil {
-		logger.Warn("failed to save final checkpoint", zap.Error(err))
-	}
-	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
-		logger.Warn("failed to mark task completed", zap.Error(err))
-	}
+	e.saveCompletedTaskCheckpoint(ctx, task, lastCheckpoint, lastTimestamp, int64(len(windows)), totalMigratedRows)
 
 	return nil
 }
@@ -806,6 +794,16 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 		zap.String("task_id", task.ID),
 		zap.String("source_table", task.Mapping.SourceTable),
 		zap.String("target_measurement", task.Mapping.TargetMeasurement))
+
+	startCP, err := e.startTaskCheckpoint(ctx, task)
+	if err != nil {
+		return err
+	}
+	if startCP != nil && startCP.Status == types.StatusCompleted {
+		logger.Info("shard-group mode task already completed, skipping",
+			zap.String("task_id", task.ID))
+		return nil
+	}
 
 	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
 	if err != nil {
@@ -838,6 +836,7 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 	if len(shardGroups) == 0 {
 		logger.Info("no shard groups found",
 			zap.String("task_id", task.ID))
+		e.saveCompletedTaskCheckpoint(ctx, task, startCP, 0, 0, 0)
 		return nil
 	}
 
@@ -884,6 +883,7 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 	if len(relevantGroups) == 0 {
 		logger.Info("no relevant shard groups in time range",
 			zap.String("task_id", task.ID))
+		e.saveCompletedTaskCheckpoint(ctx, task, startCP, 0, 0, 0)
 		return nil
 	}
 
@@ -984,30 +984,8 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 		}
 	}
 
-	// Save final task-level checkpoint with aggregated row count
-	finalCP := &types.Checkpoint{
-		TaskID:            task.ID,
-		SourceTable:       task.Mapping.SourceTable,
-		LastID:            0,
-		LastTimestamp:     lastTimestamp,
-		ProcessedRows:     int64(len(relevantGroups)), // shard count for resume
-		TotalMigratedRows: totalMigratedRows,
-		Status:            types.StatusCompleted,
-	}
-	// Preserve task metadata from existing checkpoint if available
 	lastCheckpoint, _ := e.checkpointMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
-	if lastCheckpoint != nil {
-		finalCP.TaskName = lastCheckpoint.TaskName
-		finalCP.TargetMeas = lastCheckpoint.TargetMeas
-		finalCP.MappingConfig = lastCheckpoint.MappingConfig
-	}
-	if err := e.checkpointMgr.SaveCheckpoint(ctx, finalCP); err != nil {
-		logger.Warn("failed to save final checkpoint", zap.Error(err))
-	}
-
-	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
-		logger.Warn("failed to mark task completed", zap.Error(err))
-	}
+	e.saveCompletedTaskCheckpoint(ctx, task, lastCheckpoint, lastTimestamp, int64(len(relevantGroups)), totalMigratedRows)
 
 	return nil
 }
@@ -1019,15 +997,6 @@ func (e *MigrationEngine) migrateShardGroup(ctx context.Context, task *Migration
 		zap.Int("shard_id", sg.ID),
 		zap.String("start", start.Format(time.RFC3339)),
 		zap.String("end", end.Format(time.RFC3339)))
-
-	// Load existing shard group checkpoint to check completion status and resume point
-	sgCP, err := e.checkpointMgr.LoadShardGroupCheckpoint(ctx, task.ID, fmt.Sprintf("%d", sg.ID))
-	if err != nil {
-		logger.Warn("failed to load shard group checkpoint, starting from beginning",
-			zap.Int("shard_id", sg.ID),
-			zap.Error(err))
-		sgCP = nil
-	}
 
 	// Get tag keys at shard group level (once per shard group, not per window)
 	// Tag keys are used by executeFluxSelect to distinguish tags from fields
@@ -1061,28 +1030,12 @@ func (e *MigrationEngine) migrateShardGroup(ctx context.Context, task *Migration
 		zap.Int("window_count", len(windows)),
 		zap.Duration("window_duration", timeWindow))
 
-	// Initialize shard group checkpoint for tracking progress
-	if sgCP == nil {
-		sgCP = &types.ShardGroupCheckpoint{
-			TaskID:       task.ID,
-			ShardGroupID: fmt.Sprintf("%d", sg.ID),
-			Status:       types.StatusInProgress,
-		}
-	}
-
 	// Process each time window - pass tagKeys to all windows
 	for windowIdx := 0; windowIdx < len(windows); windowIdx++ {
 		window := windows[windowIdx]
 		if err := e.migrateTimeWindow(ctx, task, sg, window, sourceAdapter, targetAdapter, tagKeys); err != nil {
 			return fmt.Errorf("time window [%s, %s) migration failed: %w",
 				window.Start.Format(time.RFC3339), window.End.Format(time.RFC3339), err)
-		}
-
-		// Update shard group checkpoint after each window completes
-		sgCP.WindowStart = window.Start.UnixNano()
-		sgCP.WindowEnd = window.End.UnixNano()
-		if err := e.checkpointMgr.SaveShardGroupCheckpoint(ctx, sgCP); err != nil {
-			logger.Warn("failed to save shard group checkpoint", zap.Error(err))
 		}
 	}
 
@@ -1148,10 +1101,7 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 	}
 
 	// Partition into batches
-	batchSize := e.config.InfluxToInflux.MaxSeriesPerQuery
-	if batchSize <= 0 {
-		batchSize = 100
-	}
+	batchSize := e.shardGroupSeriesBatchSize()
 	batches := PartitionSeries(series, batchSize)
 
 	logger.Info("processing time window",
@@ -1199,14 +1149,14 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 		}
 
 		sgCP := &types.ShardGroupCheckpoint{
-			TaskID:              task.ID,
-			ShardGroupID:        fmt.Sprintf("%d", sg.ID),
-			WindowStart:         window.Start.UnixNano(),
-			WindowEnd:           window.End.UnixNano(),
-			LastCompletedBatch:  batchIdx,
-			LastTimestamp:       lastTimestamp,
-			TotalProcessedRows:  totalProcessed,
-			Status:              types.StatusInProgress,
+			TaskID:             task.ID,
+			ShardGroupID:       fmt.Sprintf("%d", sg.ID),
+			WindowStart:        window.Start.UnixNano(),
+			WindowEnd:          window.End.UnixNano(),
+			LastCompletedBatch: batchIdx,
+			LastTimestamp:      lastTimestamp,
+			TotalProcessedRows: totalProcessed,
+			Status:             types.StatusInProgress,
 		}
 		if err := e.checkpointMgr.SaveShardGroupCheckpoint(ctx, sgCP); err != nil {
 			logger.Warn("failed to save shard group checkpoint", zap.Error(err))
@@ -1215,14 +1165,14 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 
 	// Mark window as completed after all batches processed successfully
 	sgCP := &types.ShardGroupCheckpoint{
-		TaskID:              task.ID,
-		ShardGroupID:        fmt.Sprintf("%d", sg.ID),
-		WindowStart:         window.Start.UnixNano(),
-		WindowEnd:           window.End.UnixNano(),
-		LastCompletedBatch:  len(batches) - 1,
-		LastTimestamp:       lastTimestamp,
-		TotalProcessedRows:  totalProcessed,
-		Status:              types.StatusCompleted,
+		TaskID:             task.ID,
+		ShardGroupID:       fmt.Sprintf("%d", sg.ID),
+		WindowStart:        window.Start.UnixNano(),
+		WindowEnd:          window.End.UnixNano(),
+		LastCompletedBatch: len(batches) - 1,
+		LastTimestamp:      lastTimestamp,
+		TotalProcessedRows: totalProcessed,
+		Status:             types.StatusCompleted,
 	}
 	if err := e.checkpointMgr.SaveShardGroupCheckpoint(ctx, sgCP); err != nil {
 		return fmt.Errorf("failed to save window completed checkpoint: %w", err)
@@ -1275,11 +1225,27 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 	currentCp := lastCp
 	totalProcessed := int64(0)
 	var lastTimestamp int64
+	var resumeAfter time.Time
+	if lastCp != nil {
+		totalProcessed = lastCp.ProcessedRows
+		lastTimestamp = lastCp.LastTimestamp
+		if lastCp.LastTimestamp != 0 {
+			resumeAfter = time.Unix(0, lastCp.LastTimestamp)
+		}
+	}
 
 	for windowStart := startTime; windowStart.Before(endTime); windowStart = windowStart.Add(windowDuration) {
 		windowEnd := windowStart.Add(windowDuration)
 		if windowEnd.After(endTime) {
 			windowEnd = endTime
+		}
+		if !resumeAfter.IsZero() && !windowEnd.After(resumeAfter) {
+			logger.Debug("skipping time-range window completed by checkpoint",
+				zap.String("task_id", taskID),
+				zap.Time("window_start", windowStart),
+				zap.Time("window_end", windowEnd),
+				zap.Time("checkpoint_time", resumeAfter))
+			continue
 		}
 
 		windowMapping := taskMapping
@@ -1287,6 +1253,8 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 			Start: windowStart.Format(time.RFC3339),
 			End:   windowEnd.Format(time.RFC3339),
 		}
+
+		windowQueryCfg := queryConfigWithTimeRange(queryCfg, windowStart, windowEnd)
 
 		cp, err := sourceAdapter.QueryData(ctx, table, currentCp, func(records []types.Record) error {
 			if len(records) == 0 {
@@ -1327,7 +1295,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 			totalProcessed = saveProcessed
 			lastTimestamp = saveTimestamp
 			return nil
-		}, queryCfg)
+		}, windowQueryCfg)
 
 		if err != nil {
 			return nil, err
@@ -1359,6 +1327,83 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 		ProcessedRows: totalProcessed,
 		LastTimestamp: lastTimestamp,
 	}, nil
+}
+
+func (e *MigrationEngine) startTaskCheckpoint(ctx context.Context, task *MigrationTask) (*types.Checkpoint, error) {
+	cp, err := e.checkpointMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load checkpoint: %w", err)
+	}
+	if cp != nil && cp.Status == types.StatusCompleted {
+		return cp, nil
+	}
+	if cp == nil {
+		cp = &types.Checkpoint{
+			TaskID:        task.ID,
+			TaskName:      task.ID,
+			SourceTable:   task.Mapping.SourceTable,
+			TargetMeas:    task.Mapping.TargetMeasurement,
+			Status:        types.StatusInProgress,
+			MappingConfig: *task.Mapping,
+		}
+		if err := e.checkpointMgr.SaveCheckpoint(ctx, cp); err != nil {
+			return nil, fmt.Errorf("failed to create in-progress checkpoint: %w", err)
+		}
+		return cp, nil
+	}
+	if err := e.checkpointMgr.MarkTaskInProgress(ctx, task.ID, task.Mapping.SourceTable); err != nil {
+		return nil, fmt.Errorf("failed to mark task in progress: %w", err)
+	}
+	cp.Status = types.StatusInProgress
+	return cp, nil
+}
+
+func (e *MigrationEngine) saveCompletedTaskCheckpoint(ctx context.Context, task *MigrationTask, existingCP *types.Checkpoint, lastTimestamp, processedRows, totalMigratedRows int64) {
+	finalCP := &types.Checkpoint{
+		TaskID:            task.ID,
+		SourceTable:       task.Mapping.SourceTable,
+		LastID:            0,
+		LastTimestamp:     lastTimestamp,
+		ProcessedRows:     processedRows,
+		TotalMigratedRows: totalMigratedRows,
+		Status:            types.StatusCompleted,
+	}
+	if existingCP != nil {
+		finalCP.TaskName = existingCP.TaskName
+		finalCP.TargetMeas = existingCP.TargetMeas
+		finalCP.MappingConfig = existingCP.MappingConfig
+	} else {
+		finalCP.TaskName = task.ID
+		finalCP.TargetMeas = task.Mapping.TargetMeasurement
+		finalCP.MappingConfig = *task.Mapping
+	}
+	if err := e.checkpointMgr.SaveCheckpoint(ctx, finalCP); err != nil {
+		logger.Warn("failed to save final checkpoint", zap.Error(err))
+	}
+	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
+		logger.Warn("failed to mark task completed", zap.Error(err))
+	}
+}
+
+func (e *MigrationEngine) shardGroupSeriesBatchSize() int {
+	if e.config.InfluxToInflux.ShardGroupConfig != nil && e.config.InfluxToInflux.ShardGroupConfig.SeriesBatchSize > 0 {
+		return e.config.InfluxToInflux.ShardGroupConfig.SeriesBatchSize
+	}
+	if e.config.InfluxToInflux.MaxSeriesPerQuery > 0 {
+		return e.config.InfluxToInflux.MaxSeriesPerQuery
+	}
+	return 100
+}
+
+func queryConfigWithTimeRange(base *types.QueryConfig, start, end time.Time) *types.QueryConfig {
+	cfg := &types.QueryConfig{}
+	if base != nil {
+		copied := *base
+		cfg = &copied
+	}
+	cfg.StartTime = start
+	cfg.EndTime = end
+	return cfg
 }
 
 func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.MappingConfig, records []types.Record, targetAdapter adapter.TargetAdapter) error {
