@@ -883,7 +883,7 @@ func TestQueryWithTimeRangePassesWindowBoundsInQueryConfig(t *testing.T) {
 		TimeWindow: "24h",
 	}
 
-	_, err = engine.queryWithTimeRange(context.Background(), sourceAdapter, "test_measurement", mapping, nil, targetAdapter, "query-bounds", &types.QueryConfig{BatchSize: 100})
+	_, err = engine.queryWithTimeRange(context.Background(), sourceAdapter, "test_measurement", mapping, nil, targetAdapter, "query-bounds", &types.QueryConfig{BatchSize: 100}, nil)
 	if err != nil {
 		t.Fatalf("queryWithTimeRange failed: %v", err)
 	}
@@ -957,7 +957,7 @@ func TestQueryWithTimeRangeResumeSkipsCompletedFirstWindow(t *testing.T) {
 		MappingConfig: *mapping,
 	}
 
-	_, err = engine.queryWithTimeRange(context.Background(), sourceAdapter, mapping.SourceTable, mapping, lastCheckpoint, targetAdapter, "query-resume", &types.QueryConfig{BatchSize: 100})
+	_, err = engine.queryWithTimeRange(context.Background(), sourceAdapter, mapping.SourceTable, mapping, lastCheckpoint, targetAdapter, "query-resume", &types.QueryConfig{BatchSize: 100}, nil)
 	if err != nil {
 		t.Fatalf("queryWithTimeRange failed: %v", err)
 	}

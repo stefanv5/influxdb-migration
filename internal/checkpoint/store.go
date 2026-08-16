@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -13,35 +12,93 @@ import (
 )
 
 type SQLiteStore struct {
-	db *sql.DB
+	db          *sql.DB
+	releaseLock func() error // removes the cross-process lock file; nil if no lock held
 }
 
 func NewSQLiteStore(dir string) (*SQLiteStore, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create checkpoint dir: %w", err)
+	// Acquire an exclusive cross-process lock BEFORE opening the database.
+	// Two `migrate` processes pointing at the same checkpoint_dir would race
+	// on MarkInProgressAsInterrupted and could regress persisted cursors via
+	// ON CONFLICT DO UPDATE; this is the one unrecoverable scenario. See
+	// lock.go for the approach and its limitations.
+	release, err := acquireLockFile(dir)
+	if err != nil {
+		return nil, err
 	}
 
 	dbPath := filepath.Join(dir, "checkpoints.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
+		_ = release()
 		return nil, fmt.Errorf("failed to open sqlite: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		_ = release()
 		return nil, fmt.Errorf("failed to ping sqlite: %w", err)
 	}
 
-	store := &SQLiteStore{db: db}
+	store := &SQLiteStore{db: db, releaseLock: release}
 	if err := store.initSchema(); err != nil {
+		_ = db.Close()
+		_ = release()
 		return nil, fmt.Errorf("failed to init schema: %w", err)
 	}
 	// Best-effort migration: add total_migrated_rows column if it doesn't exist
 	_ = store.maybeAddTotalMigratedRowsColumn()
 	if err := store.maybeMigrateShardGroupCheckpointUniqueKey(); err != nil {
+		_ = db.Close()
+		_ = release()
 		return nil, fmt.Errorf("failed to migrate shard group checkpoint schema: %w", err)
 	}
 
+	// Configure SQLite for safe concurrent access:
+	//   - WAL journal mode allows readers and a single writer to coexist without
+	//     blocking (correctness under the Manager's sync.RWMutex).
+	//   - synchronous=NORMAL is the recommended durability/throughput tradeoff
+	//     for WAL-mode databases; commits are durable across application crashes
+	//     but not guaranteed across OS-level power loss (acceptable for a
+	//     checkpoint store that can always re-read source data).
+	//   - busy_timeout=5000ms makes a connection wait up to 5s for a lock
+	//     instead of immediately returning SQLITE_BUSY.
+	//   - SetMaxOpenConns(1) serializes all SQL access at the driver level.
+	//     Combined with WAL this gives correct read/write semantics; the
+	//     Manager's sync.RWMutex still serializes Go-level calls. Throughput
+	//     tradeoff: no parallel SQL execution, but checkpoint I/O is not the
+	//     bottleneck for migration throughput.
+	if err := store.applyConnectionPragmas(); err != nil {
+		_ = db.Close()
+		_ = release()
+		return nil, fmt.Errorf("failed to configure sqlite pragmas: %w", err)
+	}
+
 	return store, nil
+}
+
+// applyConnectionPragmas configures the SQLite connection for safe concurrent
+// access. See NewSQLiteStore for the rationale of each setting.
+func (s *SQLiteStore) applyConnectionPragmas() error {
+	// Serialize all SQL access on a single connection FIRST. modernc.org/sqlite
+	// pools connections, and PRAGMAs like journal_mode and busy_timeout are
+	// connection-scoped (journal_mode is persistent in the file header, but a
+	// second pooled connection opened before WAL is established can leave the
+	// db in the default "delete" mode). Pinning the pool to one connection
+	// guarantees every PRAGMA and every subsequent query share the same state.
+	s.db.SetMaxOpenConns(1)
+
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA busy_timeout=5000",
+	}
+	for _, p := range pragmas {
+		if _, err := s.db.Exec(p); err != nil {
+			return fmt.Errorf("failed to execute %q: %w", p, err)
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) initSchema() error {
@@ -226,7 +283,13 @@ func (s *SQLiteStore) indexColumns(indexName string) ([]string, error) {
 }
 
 func (s *SQLiteStore) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	// Release the cross-process lock file. Best-effort: a failed removal is
+	// ignored because a stale lock is recoverable via the pid-liveness check.
+	if s.releaseLock != nil {
+		_ = s.releaseLock()
+	}
+	return err
 }
 
 func (s *SQLiteStore) SaveCheckpoint(cp *types.Checkpoint) error {

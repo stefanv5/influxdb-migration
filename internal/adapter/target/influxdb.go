@@ -63,6 +63,9 @@ func (a *InfluxDBV1TargetAdapter) Connect(ctx context.Context, config map[string
 	if err := decodeInfluxV1TargetConfig(config, cfg); err != nil {
 		return err
 	}
+	if err := validateInfluxV1TargetConfig(cfg); err != nil {
+		return err
+	}
 	a.config = cfg
 	a.baseURL = cfg.URL
 
@@ -83,6 +86,16 @@ func (a *InfluxDBV1TargetAdapter) Connect(ctx context.Context, config map[string
 		Timeout:   30 * time.Second,
 	}
 
+	return nil
+}
+
+func validateInfluxV1TargetConfig(cfg *InfluxDBV1TargetConfig) error {
+	if cfg.URL == "" {
+		return fmt.Errorf("influxdb v1 target url is required")
+	}
+	if cfg.Database == "" {
+		return fmt.Errorf("influxdb v1 target database is required")
+	}
 	return nil
 }
 
@@ -210,6 +223,11 @@ func formatFieldValue(v interface{}) string {
 }
 
 func escapeTagValue(s string) string {
+	// Backslash MUST be escaped first; otherwise a literal backslash preceding
+	// a special char would form an ambiguous escape sequence (e.g. `\,` could
+	// be read as an escaped comma rather than a literal backslash + comma).
+	// Matches InfluxDB line protocol spec for tag keys and tag values.
+	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, ",", "\\,")
 	s = strings.ReplaceAll(s, "=", "\\=")
 	s = strings.ReplaceAll(s, " ", "\\ ")
@@ -217,19 +235,33 @@ func escapeTagValue(s string) string {
 }
 
 func escapeMeasurement(s string) string {
+	// Backslash first, then comma and space (measurement names cannot contain
+	// `=`). See escapeTagValue for the ordering rationale.
+	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, ",", "\\,")
 	s = strings.ReplaceAll(s, " ", "\\ ")
 	return s
 }
 
 func escapeStringValue(s string) string {
-	// Must escape backslashes first, then quotes
+	// Order matters with sequential ReplaceAll: backslash MUST be first so that
+	// the backslashes introduced by later escapes (e.g. `\n` -> backslash+n)
+	// are not themselves re-escaped. Then double-quote, then newline and CR.
+	// A literal newline in a string field otherwise splits one logical point
+	// into two physical lines -> HTTP 400 -> whole batch fails.
+	//
+	// This matches the official influxdata/line-protocol stringFieldEscaper,
+	// which escapes \t \n \f \r " and \ (decoded back by the server parser).
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
 	return s
 }
 
 func escapeFieldKey(s string) string {
+	// Backslash first; see escapeTagValue for the ordering rationale.
+	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, ",", "\\,")
 	s = strings.ReplaceAll(s, "=", "\\=")
 	s = strings.ReplaceAll(s, " ", "\\ ")
@@ -269,6 +301,15 @@ func (a *InfluxDBV1TargetAdapter) writeLines(ctx context.Context, body string) e
 	}
 	defer resp.Body.Close()
 
+	// Non-2xx: InfluxDB V1 /write returns HTTP 400 (not 2xx) for partial-write
+	// rejections — field-type conflict, points beyond retention policy, etc. —
+	// with the cause carried in a JSON body of the form {"error":"..."}. A
+	// successful V1 write returns 204 No Content with an empty body. This 4xx
+	// branch is therefore the PRIMARY partial-write detection mechanism: it
+	// reads the body and surfaces both the status and the error message. The
+	// engine's isRetryableWriteError then classifies 400 (a 4xx, non-429) as
+	// permanent/non-retryable, so writeWithRetry returns the error immediately
+	// rather than masking it as a transient failure.
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -279,6 +320,37 @@ func (a *InfluxDBV1TargetAdapter) writeLines(ctx context.Context, body string) e
 			bodyStr = bodyStr[:200] + "..."
 		}
 		return fmt.Errorf("write failed with status %d: %s", resp.StatusCode, bodyStr)
+	}
+
+	// B4 DEFENSE-IN-DEPTH (NOT the primary partial-write path): InfluxDB V1
+	// returns HTTP 400 for partial-write rejections, which the 4xx branch above
+	// already surfaces. A conforming V1 server never reaches here with an error
+	// body. This 2xx body-parse is a guard for non-conforming proxies, API
+	// gateways, or future InfluxDB builds that might return 2xx while still
+	// carrying an {"error":"..."} body. Without it, such a response would be
+	// treated as full success and the engine would count every source row as
+	// written. An empty body (the common 204/200 success case) parses to an
+	// empty Error and returns nil, preserving the happy path. See
+	// TestInfluxDBV1WriteBatchSurfacesErrorBodyOn2xxDefenseInDepth.
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("write succeeded with status %d but failed to read response body: %w", resp.StatusCode, err)
+	}
+	if len(respBody) == 0 {
+		return nil
+	}
+	var writeResult influxV1WriteResult
+	if err := json.Unmarshal(respBody, &writeResult); err != nil {
+		// Non-JSON body on a 2xx is unexpected but not fatal; treat as success
+		// to avoid breaking a deployment that returns plain-text acknowledgements.
+		return nil
+	}
+	if writeResult.Error != "" {
+		errMsg := writeResult.Error
+		if len(errMsg) > 200 {
+			errMsg = errMsg[:200] + "..."
+		}
+		return fmt.Errorf("influxdb v1 partial write rejected (status %d): %s", resp.StatusCode, errMsg)
 	}
 
 	return nil
@@ -458,6 +530,9 @@ func (a *InfluxDBV2TargetAdapter) Connect(ctx context.Context, config map[string
 	if err := decodeInfluxV2TargetConfig(config, cfg); err != nil {
 		return err
 	}
+	if err := validateInfluxV2TargetConfig(cfg); err != nil {
+		return err
+	}
 	a.config = cfg
 
 	transport := &http.Transport{}
@@ -477,6 +552,22 @@ func (a *InfluxDBV2TargetAdapter) Connect(ctx context.Context, config map[string
 		Timeout:   30 * time.Second,
 	}
 
+	return nil
+}
+
+func validateInfluxV2TargetConfig(cfg *InfluxDBV2TargetConfig) error {
+	if cfg.URL == "" {
+		return fmt.Errorf("influxdb v2 target url is required")
+	}
+	if cfg.Token == "" {
+		return fmt.Errorf("influxdb v2 target token is required")
+	}
+	if cfg.Org == "" {
+		return fmt.Errorf("influxdb v2 target org is required")
+	}
+	if cfg.Bucket == "" {
+		return fmt.Errorf("influxdb v2 target bucket is required")
+	}
 	return nil
 }
 
@@ -608,6 +699,13 @@ func (a *InfluxDBV2TargetAdapter) writeLines(ctx context.Context, lines []string
 		return fmt.Errorf("write failed with status %d: %s", resp.StatusCode, bodyStr)
 	}
 
+	// B4 V2 LIMITATION: InfluxDB 2.x returns 204 with an EMPTY body even when
+	// it silently drops points (field-type conflict, shard-tier limits, etc.).
+	// Unlike V1, the V2 /api/v2/write endpoint does not carry a per-point error
+	// body at the HTTP layer, so partial-write rejections are NOT visible here.
+	// 204 + empty body therefore returns nil (accepted). Surfacing V2 partial
+	// drops requires engine-side source-vs-written reconciliation, which is out
+	// of scope for this target adapter. See TestInfluxDBV2WriteBatchReturnsNilOn204WithEmptyBody.
 	return nil
 }
 

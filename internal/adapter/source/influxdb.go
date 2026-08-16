@@ -24,6 +24,12 @@ type InfluxDBV1Adapter struct {
 	client  *http.Client
 	config  *InfluxDBV1Config
 	baseURL string
+
+	// tagKeyCache memoizes DiscoverTagKeys results per measurement so that
+	// repeated QueryDataBatch calls (one per time window/series batch) do not
+	// re-issue SHOW TAG KEYS on every batch. SHOW TAG KEYS returns
+	// whole-measurement metadata, so the result is stable for a measurement.
+	tagKeyCache map[string][]string
 }
 
 type InfluxDBV1Config struct {
@@ -52,10 +58,93 @@ type influxV1Series struct {
 	Values  [][]interface{}   `json:"values"`
 }
 
+func decodeInfluxV1Result(body []byte, result *influxV1Result) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	return decoder.Decode(result)
+}
+
+func influxNumberValue(n json.Number) (any, error) {
+	text := n.String()
+	if strings.ContainsAny(text, ".eE") {
+		v, err := n.Float64()
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
+	}
+	v, err := n.Int64()
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+func addInfluxField(record *types.Record, field string, value any) error {
+	switch v := value.(type) {
+	case json.Number:
+		converted, err := influxNumberValue(v)
+		if err != nil {
+			return fmt.Errorf("failed to preserve InfluxDB numeric field %q value %q: %w", field, v.String(), err)
+		}
+		record.AddField(field, converted)
+	case float64:
+		record.AddField(field, v)
+	case string:
+		record.AddField(field, v)
+	case bool:
+		record.AddField(field, v)
+	case int64:
+		record.AddField(field, v)
+	case int:
+		record.AddField(field, int64(v))
+	}
+	return nil
+}
+
 func init() {
 	adapter.RegisterSourceAdapter("influxdb-v1", func() adapter.SourceAdapter {
 		return &InfluxDBV1Adapter{}
 	})
+}
+
+// sourceHTTPResponseHeaderTimeout bounds the time the HTTP client waits for
+// response headers. Unlike http.Client.Timeout, it does NOT cover reading the
+// response body, so chunked query streams can take arbitrarily long while a
+// slow batchFunc writes to the target. Overall request lifetime is governed by
+// the per-request context.Context threaded through every query method.
+const sourceHTTPResponseHeaderTimeout = 30 * time.Second
+
+// seriesPaginationBatchSize is the SHOW SERIES page size used by
+// DiscoverSeries. It is a package-level variable (rather than a const) so
+// tests can override it to exercise multi-page pagination without emitting
+// 10000 rows. Production code uses the default of 10000.
+var seriesPaginationBatchSize = 10000
+
+// dedupAndSortSeries returns the sorted unique keys from the input slice.
+// It is the defensive core of DiscoverSeries (A7): SHOW SERIES pagination
+// assumes lexicographic ordering, but a multi-shard response can return
+// non-lexicographic or duplicate keys. Deduplicating into a set and returning
+// sorted unique keys makes the result internally consistent and prevents
+// duplicate series from being emitted to the target.
+func dedupAndSortSeries(keys []string) []string {
+	set := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		set[k] = struct{}{}
+	}
+	out := keysFromSet(set)
+	sort.Strings(out)
+	return out
+}
+
+// keysFromSet returns the keys of the set as a slice. The order is
+// non-deterministic; callers that need ordering should sort the result.
+func keysFromSet(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	return out
 }
 
 func (a *InfluxDBV1Adapter) Name() string {
@@ -74,7 +163,16 @@ func (a *InfluxDBV1Adapter) Connect(ctx context.Context, config map[string]inter
 	a.config = cfg
 	a.baseURL = cfg.URL
 
-	transport := &http.Transport{}
+	transport := &http.Transport{
+		// ResponseHeaderTimeout bounds only the time waiting for response
+		// headers. The body is allowed to stream indefinitely so chunked
+		// query responses (which may feed a slow batchFunc) are not
+		// cancelled mid-stream. Overall cancellation is driven by the
+		// per-request context.Context threaded through every query method.
+		// Do NOT set http.Client.Timeout here: Go's client Timeout covers
+		// reading the response body and would abort long migrations.
+		ResponseHeaderTimeout: sourceHTTPResponseHeaderTimeout,
+	}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		// Require explicit opt-in via environment variable for insecure TLS
 		if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
@@ -88,7 +186,9 @@ func (a *InfluxDBV1Adapter) Connect(ctx context.Context, config map[string]inter
 	}
 	a.client = &http.Client{
 		Transport: transport,
-		Timeout:   30 * time.Second,
+		// Timeout intentionally left zero (indefinite) so chunked response
+		// bodies can stream beyond 30s while a slow batchFunc writes to the
+		// target. Per-request context.Context governs cancellation.
 	}
 
 	return nil
@@ -156,9 +256,17 @@ func (a *InfluxDBV1Adapter) DiscoverTables(ctx context.Context) ([]string, error
 }
 
 func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
-	var allSeries []string
+	// Collect all series keys into a dedup set. SHOW SERIES pagination uses
+	// `series_key > lastKey`, which assumes lexicographic ordering. A
+	// multi-shard response can return non-lexicographic order, causing the
+	// predicate to skip legitimately unseen keys or re-emit already-seen keys.
+	// Deduplicating into a set and returning sorted unique keys makes the
+	// result internally consistent regardless of the engine's ordering, and
+	// prevents duplicate series from being emitted (which would cause
+	// redundant work and duplicate writes on the target).
+	seriesSet := make(map[string]struct{})
 	var lastKey string
-	batchSize := 10000 // Process series in batches to avoid OOM
+	batchSize := seriesPaginationBatchSize
 
 	for {
 		var query string
@@ -173,11 +281,12 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 
 		results, err := a.executeQuery(ctx, query)
 		if err != nil {
-			// If pagination query fails (older InfluxDB), fall back to collecting all
+			// If pagination query fails (older InfluxDB), fall back to a single
+			// non-paginated query for ALL series. Dedup handles any overlap with
+			// keys already collected, so no `key <= lastKey` skip is needed.
 			if lastKey != "" {
-				logger.Warn("series_key pagination not supported, falling back",
+				logger.Warn("series_key pagination not supported, falling back to non-paginated SHOW SERIES",
 					zap.Error(err))
-				// Retry with non-paginated query for remaining
 				fallbackQuery := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
 				fallbackResults, fallbackErr := a.executeQuery(ctx, fallbackQuery)
 				if fallbackErr != nil {
@@ -187,16 +296,12 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 					for _, values := range result.Values {
 						if len(values) > 0 {
 							if key, ok := values[0].(string); ok {
-								// Skip already collected keys
-								if key <= lastKey {
-									continue
-								}
-								allSeries = append(allSeries, key)
+								seriesSet[key] = struct{}{}
 							}
 						}
 					}
 				}
-				return allSeries, nil
+				return dedupAndSortSeries(keysFromSet(seriesSet)), nil
 			}
 			return nil, err
 		}
@@ -206,7 +311,7 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 			for _, values := range result.Values {
 				if len(values) > 0 {
 					if key, ok := values[0].(string); ok {
-						allSeries = append(allSeries, key)
+						seriesSet[key] = struct{}{}
 						lastKey = key
 						batchCount++
 					}
@@ -227,7 +332,7 @@ func (a *InfluxDBV1Adapter) DiscoverSeries(ctx context.Context, measurement stri
 		}
 	}
 
-	return allSeries, nil
+	return dedupAndSortSeries(keysFromSet(seriesSet)), nil
 }
 
 func (a *InfluxDBV1Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
@@ -237,17 +342,35 @@ func (a *InfluxDBV1Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter
 		return nil, err
 	}
 
-	// Group by shard_group ID, extract time range
+	// Group by shard_group ID, extract time range.
+	// A shard whose start or end time cannot be parsed is skipped with a
+	// warning so one malformed shard does not abort discovery; storing a
+	// zero-start/end shard would instead produce empty time windows and
+	// silently no-op the migration. If every shard fails to parse, return an
+	// error so the caller does not mistake an empty result for "no shards".
 	shardGroups := make(map[int]*adapter.ShardGroup)
+	totalShards := 0
+	skippedShards := 0
 	for _, result := range results {
 		for _, values := range result.Values {
 			if len(values) < 6 {
 				continue
 			}
+			totalShards++
 			// Parse: id, database, retention_policy, shard_group, start_time, end_time
 			shardGroupID := parseInt(values[3])
-			startTime := parseTime(values[4])
-			endTime := parseTime(values[5])
+			startTime, startErr := parseTime(values[4])
+			endTime, endErr := parseTime(values[5])
+			if startErr != nil || endErr != nil {
+				skippedShards++
+				logger.Warn("skipping shard with unparseable time bounds",
+					zap.Int("shard_group_id", shardGroupID),
+					zap.Any("start_value", values[4]),
+					zap.Any("end_value", values[5]),
+					zap.NamedError("start_error", startErr),
+					zap.NamedError("end_error", endErr))
+				continue
+			}
 
 			if _, exists := shardGroups[shardGroupID]; !exists {
 				shardGroups[shardGroupID] = &adapter.ShardGroup{
@@ -257,6 +380,10 @@ func (a *InfluxDBV1Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter
 				}
 			}
 		}
+	}
+
+	if totalShards > 0 && skippedShards == totalShards {
+		return nil, fmt.Errorf("all %d shard(s) failed to parse time bounds during SHOW SHARDS", totalShards)
 	}
 
 	var result []*adapter.ShardGroup
@@ -273,6 +400,10 @@ func (a *InfluxDBV1Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, meas
 	// Note: InfluxDB SHOW SERIES does not support time-based WHERE filtering.
 	// The time parameters are accepted for interface compatibility but ignored.
 	// All series for the measurement are returned.
+	logger.Debug("DiscoverSeriesInTimeWindow using all-series fallback; point queries remain time-bounded",
+		zap.String("measurement", measurement),
+		zap.Time("window_start", startTime),
+		zap.Time("window_end", endTime))
 	query := fmt.Sprintf(`SHOW SERIES FROM %s`, influxQuoteIdentifier(measurement))
 
 	series, err := a.executeShowSeries(ctx, query)
@@ -285,12 +416,18 @@ func (a *InfluxDBV1Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, meas
 
 // DiscoverTagKeys returns tag keys for V1 adapter using SHOW TAG KEYS.
 // This allows proper distinction between tags and fields when parsing query results.
+// Results are cached per measurement for the lifetime of the adapter because
+// SHOW TAG KEYS returns whole-measurement metadata that is stable across
+// batches; re-issuing it per QueryDataBatch call wastes a round-trip and can
+// return an incomplete set if a shard is transiently offline.
 func (a *InfluxDBV1Adapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
+	if cached, ok := a.lookupCachedTagKeys(measurement); ok {
+		return cached, nil
+	}
 	query := fmt.Sprintf("SHOW TAG KEYS FROM %s", influxQuoteIdentifier(measurement))
 	results, err := a.executeQuery(ctx, query)
 	if err != nil {
-		logger.Warn("SHOW TAG KEYS failed for V1 adapter", zap.String("measurement", measurement), zap.Error(err))
-		return nil, nil
+		return nil, fmt.Errorf("discover tag keys for measurement %q failed: %w", measurement, err)
 	}
 
 	var tagKeys []string
@@ -303,7 +440,56 @@ func (a *InfluxDBV1Adapter) DiscoverTagKeys(ctx context.Context, measurement str
 			}
 		}
 	}
+	a.storeCachedTagKeys(measurement, tagKeys)
 	return tagKeys, nil
+}
+
+// resolveTagKeySet returns the tag-key set to use for a QueryData(Batch) call.
+// It prefers caller-supplied cfg.TagKeys (authoritative, avoids any network
+// round-trip), then falls back to DiscoverTagKeys (cached on the adapter).
+// Returning a non-nil set keeps the tag/field classification path consistent.
+func (a *InfluxDBV1Adapter) resolveTagKeySet(ctx context.Context, measurement string, cfg *types.QueryConfig) (map[string]bool, []string, error) {
+	if cfg != nil && len(cfg.TagKeys) > 0 {
+		set := make(map[string]bool, len(cfg.TagKeys))
+		for _, k := range cfg.TagKeys {
+			set[k] = true
+		}
+		return set, cfg.TagKeys, nil
+	}
+	tagKeys, err := a.DiscoverTagKeys(ctx, measurement)
+	if err != nil {
+		return nil, nil, err
+	}
+	set := make(map[string]bool, len(tagKeys))
+	for _, k := range tagKeys {
+		set[k] = true
+	}
+	return set, tagKeys, nil
+}
+
+// lookupCachedTagKeys returns cached tag keys for a measurement, ok=false if absent.
+func (a *InfluxDBV1Adapter) lookupCachedTagKeys(measurement string) ([]string, bool) {
+	if a.tagKeyCache == nil {
+		return nil, false
+	}
+	cached, ok := a.tagKeyCache[measurement]
+	if !ok {
+		return nil, false
+	}
+	// Return a copy so callers cannot mutate the cached slice.
+	out := make([]string, len(cached))
+	copy(out, cached)
+	return out, true
+}
+
+// storeCachedTagKeys memoizes tag keys for a measurement (immutable copy).
+func (a *InfluxDBV1Adapter) storeCachedTagKeys(measurement string, tagKeys []string) {
+	if a.tagKeyCache == nil {
+		a.tagKeyCache = make(map[string][]string)
+	}
+	stored := make([]string, len(tagKeys))
+	copy(stored, tagKeys)
+	a.tagKeyCache[measurement] = stored
 }
 
 func (a *InfluxDBV1Adapter) executeShowSeries(ctx context.Context, query string) ([]string, error) {
@@ -329,6 +515,16 @@ func (a *InfluxDBV1Adapter) executeShowSeries(ctx context.Context, query string)
 // parseInt parses an interface{} to int
 func parseInt(v interface{}) int {
 	switch val := v.(type) {
+	case json.Number:
+		// Prefer exact integer parsing; fall back to float if the value is
+		// numeric but not integral (shard_group IDs are integral, but be
+		// defensive against any encoded-as-float value).
+		if i, err := val.Int64(); err == nil {
+			return int(i)
+		}
+		if f, err := val.Float64(); err == nil {
+			return int(f)
+		}
 	case float64:
 		return int(val)
 	case int64:
@@ -343,36 +539,57 @@ func parseInt(v interface{}) int {
 	return 0
 }
 
-// parseTime parses an interface{} to time.Time
-func parseTime(v interface{}) time.Time {
+// parseTime parses an interface{} to time.Time. It returns an error when the
+// value cannot be parsed so callers can skip the shard (rather than silently
+// storing a zero start/end that would produce empty time windows downstream
+// and no-op a migration). Numeric inputs (seconds or nanoseconds) are always
+// parseable and never return an error.
+func parseTime(v interface{}) (time.Time, error) {
 	switch val := v.(type) {
 	case string:
 		// Try RFC3339Nano first
 		if t, err := time.Parse(time.RFC3339Nano, val); err == nil {
-			return t
+			return t, nil
 		}
 		// Try RFC3339
 		if t, err := time.Parse(time.RFC3339, val); err == nil {
-			return t
+			return t, nil
 		}
+		// Both parses failed. Use the RFC3339 error as the wrapped cause.
+		_, cause := time.Parse(time.RFC3339, val)
+		return time.Time{}, fmt.Errorf("failed to parse shard time %q: %w", val, cause)
 	case float64:
 		// Unix timestamp in seconds or nanoseconds
 		if val > 1e12 {
 			// Likely nanoseconds
-			return time.Unix(0, int64(val))
+			return time.Unix(0, int64(val)), nil
 		}
 		// Likely seconds
-		return time.Unix(int64(val), 0)
+		return time.Unix(int64(val), 0), nil
 	case int64:
 		if val > 1e12 {
-			return time.Unix(0, val)
+			return time.Unix(0, val), nil
 		}
-		return time.Unix(val, 0)
+		return time.Unix(val, 0), nil
+	case int:
+		if int64(val) > 1e12 {
+			return time.Unix(0, int64(val)), nil
+		}
+		return time.Unix(int64(val), 0), nil
 	}
-	return time.Time{}
+	return time.Time{}, fmt.Errorf("failed to parse shard time: unsupported type %T", v)
 }
 
-func effectiveQueryBounds(lastTS int64, cfg *types.QueryConfig) (string, string) {
+// effectiveQueryBounds computes the start/end time bounds for a single-mode
+// (non-batch) QueryData call. Unlike QueryDataBatch, single-mode does not
+// receive an explicit endTime argument, so the end bound must come from
+// cfg.EndTime. If no end time is configured, this returns an error rather than
+// silently baking end=now+1h, which would truncate the migration tail for any
+// migration running longer than one hour after start (silent data loss).
+//
+// lastTS (from the checkpoint) seeds the start bound when cfg.StartTime is
+// unset, supporting incremental single-mode resumption.
+func effectiveQueryBounds(lastTS int64, cfg *types.QueryConfig) (string, string, error) {
 	var start time.Time
 	if cfg != nil && !cfg.StartTime.IsZero() {
 		start = cfg.StartTime
@@ -385,12 +602,12 @@ func effectiveQueryBounds(lastTS int64, cfg *types.QueryConfig) (string, string)
 		startTime = start.Format(time.RFC3339Nano)
 	}
 
-	end := time.Now().Add(1 * time.Hour)
-	if cfg != nil && !cfg.EndTime.IsZero() {
-		end = cfg.EndTime
+	if cfg == nil || cfg.EndTime.IsZero() {
+		return "", "", fmt.Errorf("single-mode migration requires an explicit end time (time_range.end) to avoid tail data loss")
 	}
+	end := cfg.EndTime
 
-	return startTime, end.Format(time.RFC3339Nano)
+	return startTime, end.Format(time.RFC3339Nano), nil
 }
 
 func checkInfluxV1ResultError(result influxV1Result) error {
@@ -424,7 +641,10 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 		totalProcessed = lastCheckpoint.ProcessedRows
 	}
 
-	startTime, endTime := effectiveQueryBounds(lastTS, cfg)
+	startTime, endTime, err := effectiveQueryBounds(lastTS, cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	chunkSize := 10000
 	if cfg != nil && cfg.BatchSize > 0 {
@@ -444,19 +664,15 @@ func (a *InfluxDBV1Adapter) QueryData(ctx context.Context, measurement string, l
 	var totalRecords int
 	var maxTS int64
 
-	// Discover tag keys to distinguish tags from string fields
-	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	// Resolve tag keys: prefer caller-supplied cfg.TagKeys, else DiscoverTagKeys
+	// (cached per measurement on the adapter).
+	tagKeySet, _, tagErr := a.resolveTagKeySet(ctx, measurement, cfg)
 	if tagErr != nil {
-		logger.Warn("failed to discover tag keys, strings will be treated as fields",
-			zap.String("measurement", measurement), zap.Error(tagErr))
-	}
-	tagKeySet := make(map[string]bool)
-	for _, k := range tagKeys {
-		tagKeySet[k] = true
+		return nil, tagErr
 	}
 
 	// Use chunked query - InfluxDB automatically splits response into chunks
-	err := a.executeChunkedQuery(ctx, query, chunkSize, func(records []types.Record) error {
+	err = a.executeChunkedQuery(ctx, query, chunkSize, func(records []types.Record) error {
 		totalRecords += len(records)
 		totalProcessed += int64(len(records))
 		for _, record := range records {
@@ -492,15 +708,11 @@ func (a *InfluxDBV1Adapter) QueryDataBatch(ctx context.Context, measurement stri
 
 	chunkSize := getBatchSize(cfg)
 
-	// Discover tag keys to distinguish tags from string fields
-	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	// Resolve tag keys: prefer caller-supplied cfg.TagKeys, else DiscoverTagKeys
+	// (cached per measurement on the adapter).
+	tagKeySet, tagKeys, tagErr := a.resolveTagKeySet(ctx, measurement, cfg)
 	if tagErr != nil {
-		logger.Warn("failed to discover tag keys, strings will be treated as fields",
-			zap.String("measurement", measurement), zap.Error(tagErr))
-	}
-	tagKeySet := make(map[string]bool)
-	for _, k := range tagKeys {
-		tagKeySet[k] = true
+		return nil, tagErr
 	}
 	whereClause := BuildWhereClauseWithTagKeys(series, tagKeys)
 
@@ -591,7 +803,7 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 	}
 
 	var result influxV1Result
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := decodeInfluxV1Result(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal result: %w", err)
 	}
 
@@ -604,7 +816,10 @@ func (a *InfluxDBV1Adapter) executeSelectQuery(ctx context.Context, query string
 	for _, r := range result.Results {
 		for _, series := range r.Series {
 			for _, values := range series.Values {
-				record := a.parseValues(series.Columns, values, series.Tags, nil)
+				record, err := a.parseValues(series.Columns, values, series.Tags, nil)
+				if err != nil {
+					return nil, err
+				}
 				records = append(records, *record)
 			}
 		}
@@ -669,6 +884,7 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 
 	// 使用json.Decoder流式读取chunked响应
 	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
 	totalRecords := 0
 	chunkIndex := 0
 
@@ -699,7 +915,10 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 			seriesCount += len(r.Series)
 			for _, series := range r.Series {
 				for _, values := range series.Values {
-					record := a.parseValues(series.Columns, values, series.Tags, tagKeySet)
+					record, err := a.parseValues(series.Columns, values, series.Tags, tagKeySet)
+					if err != nil {
+						return err
+					}
 					records = append(records, *record)
 				}
 			}
@@ -726,7 +945,49 @@ func (a *InfluxDBV1Adapter) executeChunkedQuery(
 	return nil
 }
 
-func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}, seriesTags map[string]string, tagKeySet map[string]bool) *types.Record {
+// isTagColumn decides whether a non-time column holds a tag value.
+// A column is a tag when it appears in the measurement-wide tagKeySet
+// (populated from DiscoverTagKeys / SHOW TAG KEYS), OR when it is a key in
+// seriesTags (the authoritative per-series tag set carried by the InfluxDB
+// series object). The seriesTags cross-check defends against an incomplete
+// DiscoverTagKeys result (e.g. an offline shard during SHOW TAG KEYS), which
+// would otherwise misclassify a tag column as a string field and corrupt
+// series identity on the target.
+func isTagColumn(col string, tagKeySet map[string]bool, seriesTags map[string]string) bool {
+	if tagKeySet != nil && tagKeySet[col] {
+		return true
+	}
+	if seriesTags != nil {
+		if _, ok := seriesTags[col]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// parseInfluxTimestamp parses an InfluxDB timestamp string into nanoseconds.
+// It tries RFC3339Nano first (full precision), then falls back to RFC3339
+// (reduced precision, logged as a warning). A total parse failure is a hard
+// error: returning it would otherwise leave record.Time=0 and the point would
+// be written at epoch, silently corrupting data and stalling the maxTS
+// watermark. The error is wrapped so callers can propagate it through the
+// chunked-query batchFunc path and abort the batch.
+func parseInfluxTimestamp(ts string) (int64, error) {
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t.UnixNano(), nil
+	}
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		logger.Warn("timestamp parsed with reduced precision",
+			zap.String("timestamp", ts))
+		return t.UnixNano(), nil
+	}
+	// Both parses failed. Use the RFC3339 error (the more general format) as
+	// the wrapped cause for a clear diagnostic.
+	_, cause := time.Parse(time.RFC3339, ts)
+	return 0, fmt.Errorf("failed to parse InfluxDB timestamp %q: %w", ts, cause)
+}
+
+func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}, seriesTags map[string]string, tagKeySet map[string]bool) (*types.Record, error) {
 	record := types.NewRecord()
 
 	// First, copy series-level tags (e.g., host, region, env from InfluxDB series tags)
@@ -748,39 +1009,29 @@ func (a *InfluxDBV1Adapter) parseValues(columns []string, values []interface{}, 
 		switch col {
 		case "time":
 			if ts, ok := val.(string); ok {
-				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-					record.Time = t.UnixNano()
-				} else if t, err := time.Parse(time.RFC3339, ts); err == nil {
-					record.Time = t.UnixNano()
-					logger.Warn("timestamp parsed with reduced precision",
-						zap.String("timestamp", ts))
-				} else {
-					logger.Warn("failed to parse InfluxDB timestamp",
-						zap.String("timestamp_string", ts),
-						zap.Error(err))
+				nanos, err := parseInfluxTimestamp(ts)
+				if err != nil {
+					return nil, err
 				}
+				record.Time = nanos
 			}
 		default:
 			switch v := val.(type) {
-			case float64:
-				record.AddField(col, v)
 			case string:
-				if tagKeySet[col] {
+				if isTagColumn(col, tagKeySet, seriesTags) {
 					record.AddTag(col, v)
 				} else {
 					record.AddField(col, v)
 				}
-			case bool:
-				record.AddField(col, v)
-			case int64:
-				record.AddField(col, v)
-			case int:
-				record.AddField(col, int64(v))
+			default:
+				if err := addInfluxField(record, col, v); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
 
-	return record
+	return record, nil
 }
 
 func (a *InfluxDBV1Adapter) executeQuery(ctx context.Context, query string) ([]influxV1Series, error) {
@@ -822,7 +1073,7 @@ func (a *InfluxDBV1Adapter) executeQuery(ctx context.Context, query string) ([]i
 	}
 
 	var result influxV1Result
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := decodeInfluxV1Result(body, &result); err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 
@@ -882,6 +1133,11 @@ func decodeInfluxV1Config(config map[string]interface{}, cfg interface{}) error 
 type InfluxDBV2Adapter struct {
 	client *http.Client
 	config *InfluxDBV2Config
+
+	// tagKeyCache memoizes DiscoverTagKeys results per measurement so that
+	// repeated QueryDataBatch calls do not re-issue SHOW TAG KEYS per batch.
+	// SHOW TAG KEYS returns whole-measurement metadata, stable across batches.
+	tagKeyCache map[string][]string
 }
 
 type InfluxDBV2Config struct {
@@ -893,13 +1149,6 @@ type InfluxDBV2Config struct {
 	Password        string
 	RetentionPolicy string // V1 compatibility RP
 	SSL             types.SSLConfig
-}
-
-type fluxRecord struct {
-	Time        time.Time   `json:"_time"`
-	Measurement string      `json:"_measurement"`
-	Field       string      `json:"_field"`
-	Value       interface{} `json:"_value"`
 }
 
 func init() {
@@ -923,7 +1172,14 @@ func (a *InfluxDBV2Adapter) Connect(ctx context.Context, config map[string]inter
 	}
 	a.config = cfg
 
-	transport := &http.Transport{}
+	transport := &http.Transport{
+		// ResponseHeaderTimeout bounds only the time waiting for response
+		// headers. The body streams indefinitely so chunked query responses
+		// are not cancelled mid-stream. Per-request context.Context governs
+		// overall cancellation. Do NOT set http.Client.Timeout: Go's client
+		// Timeout covers reading the body and would abort long migrations.
+		ResponseHeaderTimeout: sourceHTTPResponseHeaderTimeout,
+	}
 	if cfg.SSL.Enabled && cfg.SSL.SkipVerify {
 		// Require explicit opt-in via environment variable for insecure TLS
 		if os.Getenv("ALLOW_INSECURE_TLS") != "1" {
@@ -937,7 +1193,9 @@ func (a *InfluxDBV2Adapter) Connect(ctx context.Context, config map[string]inter
 	}
 	a.client = &http.Client{
 		Transport: transport,
-		Timeout:   30 * time.Second,
+		// Timeout intentionally left zero (indefinite) so chunked response
+		// bodies can stream beyond 30s while a slow batchFunc writes to the
+		// target. Per-request context.Context governs cancellation.
 	}
 
 	return nil
@@ -1015,7 +1273,7 @@ func (a *InfluxDBV2Adapter) executeV1Query(ctx context.Context, query string) (*
 	}
 
 	var result influxV1Result
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := decodeInfluxV1Result(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse V1 response: %w", err)
 	}
 	if err := checkInfluxV1ResultError(result); err != nil {
@@ -1039,9 +1297,12 @@ func (a *InfluxDBV2Adapter) executeV1SelectQuery(ctx context.Context, query stri
 			for _, values := range series.Values {
 				var record *types.Record
 				if tagKeySet != nil {
-					record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet, series.Tags)
+					record, err = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet, series.Tags)
 				} else {
-					record = parseV1Values(series.Columns, values, series.Tags)
+					record, err = parseV1Values(series.Columns, values, series.Tags)
+				}
+				if err != nil {
+					return nil, err
 				}
 				records = append(records, *record)
 			}
@@ -1098,6 +1359,7 @@ func (a *InfluxDBV2Adapter) executeV1ChunkedQuery(
 
 	// Use json.Decoder to stream through chunked response
 	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
 	totalRecords := 0
 
 	for {
@@ -1121,10 +1383,14 @@ func (a *InfluxDBV2Adapter) executeV1ChunkedQuery(
 			for _, series := range r.Series {
 				for _, values := range series.Values {
 					var record *types.Record
+					var parseErr error
 					if tagKeySet != nil {
-						record = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet, series.Tags)
+						record, parseErr = parseV1ValuesWithTagKeys(series.Columns, values, tagKeySet, series.Tags)
 					} else {
-						record = parseV1Values(series.Columns, values, series.Tags)
+						record, parseErr = parseV1Values(series.Columns, values, series.Tags)
+					}
+					if parseErr != nil {
+						return parseErr
 					}
 					records = append(records, *record)
 				}
@@ -1148,7 +1414,7 @@ func (a *InfluxDBV2Adapter) executeV1ChunkedQuery(
 
 // parseV1Values parses V1 query result values into a Record
 // This treats all non-time string values as fields (for V1 adapter or when tagKeys is unavailable)
-func parseV1Values(columns []string, values []interface{}, seriesTags map[string]string) *types.Record {
+func parseV1Values(columns []string, values []interface{}, seriesTags map[string]string) (*types.Record, error) {
 	record := types.NewRecord()
 
 	// First, copy series-level tags
@@ -1169,40 +1435,25 @@ func parseV1Values(columns []string, values []interface{}, seriesTags map[string
 		switch col {
 		case "time":
 			if ts, ok := val.(string); ok {
-				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-					record.Time = t.UnixNano()
-				} else if t, err := time.Parse(time.RFC3339, ts); err == nil {
-					record.Time = t.UnixNano()
-					logger.Warn("timestamp parsed with reduced precision",
-						zap.String("timestamp", ts))
-				} else {
-					logger.Warn("failed to parse timestamp, using 0",
-						zap.String("timestamp_string", ts),
-						zap.Error(err))
+				nanos, err := parseInfluxTimestamp(ts)
+				if err != nil {
+					return nil, err
 				}
+				record.Time = nanos
 			}
 		default:
-			switch v := val.(type) {
-			case float64:
-				record.AddField(col, v)
-			case string:
-				record.AddField(col, v)
-			case bool:
-				record.AddField(col, v)
-			case int64:
-				record.AddField(col, v)
-			case int:
-				record.AddField(col, int64(v))
+			if err := addInfluxField(record, col, val); err != nil {
+				return nil, err
 			}
 		}
 	}
 
-	return record
+	return record, nil
 }
 
 // parseV1ValuesWithTagKeys parses V1 query result values into a Record
 // It uses tagKeySet to distinguish tags from fields - strings in tagKeySet are tags
-func parseV1ValuesWithTagKeys(columns []string, values []interface{}, tagKeySet map[string]bool, seriesTags map[string]string) *types.Record {
+func parseV1ValuesWithTagKeys(columns []string, values []interface{}, tagKeySet map[string]bool, seriesTags map[string]string) (*types.Record, error) {
 	record := types.NewRecord()
 
 	// First, copy series-level tags
@@ -1223,41 +1474,32 @@ func parseV1ValuesWithTagKeys(columns []string, values []interface{}, tagKeySet 
 		switch col {
 		case "time":
 			if ts, ok := val.(string); ok {
-				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-					record.Time = t.UnixNano()
-				} else if t, err := time.Parse(time.RFC3339, ts); err == nil {
-					record.Time = t.UnixNano()
-					logger.Warn("timestamp parsed with reduced precision",
-						zap.String("timestamp", ts))
-				} else {
-					logger.Warn("failed to parse timestamp, using 0",
-						zap.String("timestamp_string", ts),
-						zap.Error(err))
+				nanos, err := parseInfluxTimestamp(ts)
+				if err != nil {
+					return nil, err
 				}
+				record.Time = nanos
 			}
 		default:
-			// If this column is a known tag key, store as tag
-			if tagKeySet[col] {
+			// If this column is a known tag key, store as tag.
+			// Also treat as a tag when the column is a key in series.Tags:
+			// DiscoverTagKeys (SHOW TAG KEYS) returns whole-measurement
+			// metadata and may miss a key if a shard is offline or the index
+			// is not materialized. The series object's Tags are the
+			// authoritative tag set for that series, so cross-checking
+			// prevents misclassifying a tag column as a string field and
+			// corrupting series identity on the target.
+			if isTagColumn(col, tagKeySet, seriesTags) {
 				record.AddTag(col, fmt.Sprintf("%v", val))
 			} else {
-				// Otherwise store as field
-				switch v := val.(type) {
-				case float64:
-					record.AddField(col, v)
-				case string:
-					record.AddField(col, v)
-				case bool:
-					record.AddField(col, v)
-				case int64:
-					record.AddField(col, v)
-				case int:
-					record.AddField(col, int64(v))
+				if err := addInfluxField(record, col, val); err != nil {
+					return nil, err
 				}
 			}
 		}
 	}
 
-	return record
+	return record, nil
 }
 
 func (a *InfluxDBV2Adapter) Ping(ctx context.Context) error {
@@ -1297,15 +1539,20 @@ func (a *InfluxDBV2Adapter) DiscoverTables(ctx context.Context) ([]string, error
 
 // DiscoverTagKeys returns all tag key names for a measurement.
 // Used to distinguish tags from fields in Flux query results.
+// Results are cached per measurement for the lifetime of the adapter because
+// SHOW TAG KEYS returns whole-measurement metadata that is stable across
+// batches; re-issuing it per QueryDataBatch call wastes a round-trip and can
+// return an incomplete set if a shard is transiently offline.
 func (a *InfluxDBV2Adapter) DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error) {
+	if cached, ok := a.lookupCachedTagKeys(measurement); ok {
+		return cached, nil
+	}
 	// Use V1 compatibility API: SHOW TAG KEYS
 	// This returns tag keys without values, which is sufficient for distinguishing tags from fields
 	query := fmt.Sprintf("SHOW TAG KEYS FROM %s", influxQuoteIdentifier(measurement))
 	result, err := a.executeV1Query(ctx, query)
 	if err != nil {
-		// V1 API may not support SHOW TAG KEYS in all cases, return empty
-		logger.Warn("SHOW TAG KEYS failed, returning empty tag keys", zap.Error(err))
-		return nil, nil
+		return nil, fmt.Errorf("discover tag keys for measurement %q failed: %w", measurement, err)
 	}
 
 	var tagKeys []string
@@ -1321,14 +1568,68 @@ func (a *InfluxDBV2Adapter) DiscoverTagKeys(ctx context.Context, measurement str
 		}
 	}
 
+	a.storeCachedTagKeys(measurement, tagKeys)
 	return tagKeys, nil
 }
 
+// resolveTagKeySet returns the tag-key set to use for a QueryData(Batch) call.
+// It prefers caller-supplied cfg.TagKeys (authoritative, no network round-trip),
+// then falls back to DiscoverTagKeys (cached on the adapter).
+func (a *InfluxDBV2Adapter) resolveTagKeySet(ctx context.Context, measurement string, cfg *types.QueryConfig) (map[string]bool, []string, error) {
+	if cfg != nil && len(cfg.TagKeys) > 0 {
+		set := make(map[string]bool, len(cfg.TagKeys))
+		for _, k := range cfg.TagKeys {
+			set[k] = true
+		}
+		return set, cfg.TagKeys, nil
+	}
+	tagKeys, err := a.DiscoverTagKeys(ctx, measurement)
+	if err != nil {
+		return nil, nil, err
+	}
+	set := make(map[string]bool, len(tagKeys))
+	for _, k := range tagKeys {
+		set[k] = true
+	}
+	return set, tagKeys, nil
+}
+
+// lookupCachedTagKeys returns cached tag keys for a measurement, ok=false if absent.
+func (a *InfluxDBV2Adapter) lookupCachedTagKeys(measurement string) ([]string, bool) {
+	if a.tagKeyCache == nil {
+		return nil, false
+	}
+	cached, ok := a.tagKeyCache[measurement]
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, len(cached))
+	copy(out, cached)
+	return out, true
+}
+
+// storeCachedTagKeys memoizes tag keys for a measurement (immutable copy).
+func (a *InfluxDBV2Adapter) storeCachedTagKeys(measurement string, tagKeys []string) {
+	if a.tagKeyCache == nil {
+		a.tagKeyCache = make(map[string][]string)
+	}
+	stored := make([]string, len(tagKeys))
+	copy(stored, tagKeys)
+	a.tagKeyCache[measurement] = stored
+}
+
 func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement string) ([]string, error) {
-	// Use V1 compatibility API: SHOW SERIES with pagination
-	var allSeries []string
+	// Use V1 compatibility API: SHOW SERIES with pagination.
+	// Collect all series keys into a dedup set. SHOW SERIES pagination uses
+	// `series_key > lastKey`, which assumes lexicographic ordering. A
+	// multi-shard response can return non-lexicographic or duplicate keys,
+	// causing the predicate to skip legitimately unseen keys or re-emit
+	// already-seen keys. Deduplicating into a set and returning sorted unique
+	// keys makes the result internally consistent and prevents duplicate
+	// series from being emitted to the target (A7).
+	seriesSet := make(map[string]struct{})
 	var lastKey string
-	batchSize := 10000 // Process series in batches to avoid OOM
+	batchSize := seriesPaginationBatchSize
 
 	for {
 		var query string
@@ -1343,11 +1644,12 @@ func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement stri
 
 		result, err := a.executeV1Query(ctx, query)
 		if err != nil {
-			// If pagination query fails (older InfluxDB), fall back to collecting all
+			// If pagination query fails (older InfluxDB), fall back to a single
+			// non-paginated query for ALL series. Dedup handles any overlap with
+			// keys already collected, so no `key <= lastKey` skip is needed.
 			if lastKey != "" {
-				logger.Warn("series_key pagination not supported, falling back",
+				logger.Warn("series_key pagination not supported, falling back to non-paginated SHOW SERIES",
 					zap.Error(err))
-				// Retry with non-paginated query for remaining
 				fallbackQuery := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
 				fallbackResult, fallbackErr := a.executeV1Query(ctx, fallbackQuery)
 				if fallbackErr != nil {
@@ -1358,17 +1660,13 @@ func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement stri
 						for _, values := range seriesData.Values {
 							if len(values) > 0 {
 								if key, ok := values[0].(string); ok {
-									// Skip already collected keys
-									if key <= lastKey {
-										continue
-									}
-									allSeries = append(allSeries, key)
+									seriesSet[key] = struct{}{}
 								}
 							}
 						}
 					}
 				}
-				return allSeries, nil
+				return dedupAndSortSeries(keysFromSet(seriesSet)), nil
 			}
 			return nil, err
 		}
@@ -1379,7 +1677,7 @@ func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement stri
 				for _, values := range seriesData.Values {
 					if len(values) > 0 {
 						if key, ok := values[0].(string); ok {
-							allSeries = append(allSeries, key)
+							seriesSet[key] = struct{}{}
 							lastKey = key
 							batchCount++
 						}
@@ -1401,7 +1699,7 @@ func (a *InfluxDBV2Adapter) DiscoverSeries(ctx context.Context, measurement stri
 		}
 	}
 
-	return allSeries, nil
+	return dedupAndSortSeries(keysFromSet(seriesSet)), nil
 }
 
 func (a *InfluxDBV2Adapter) DiscoverShardGroups(ctx context.Context) ([]*adapter.ShardGroup, error) {
@@ -1453,6 +1751,10 @@ func (a *InfluxDBV2Adapter) DiscoverSeriesInTimeWindow(ctx context.Context, meas
 	// Note: InfluxDB SHOW SERIES does not support time-based WHERE filtering.
 	// The time parameters are accepted for interface compatibility but ignored.
 	// All series for the measurement are returned.
+	logger.Debug("DiscoverSeriesInTimeWindow using all-series fallback; point queries remain time-bounded",
+		zap.String("measurement", measurement),
+		zap.Time("window_start", startTime),
+		zap.Time("window_end", endTime))
 	query := fmt.Sprintf("SHOW SERIES FROM %s", influxQuoteIdentifier(measurement))
 
 	result, err := a.executeV1Query(ctx, query)
@@ -1494,22 +1796,21 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 		lastTS = lastCheckpoint.LastTimestamp
 	}
 
-	startTime, endTime := effectiveQueryBounds(lastTS, cfg)
+	startTime, endTime, err := effectiveQueryBounds(lastTS, cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	chunkSize := 10000
 	if cfg != nil && cfg.BatchSize > 0 {
 		chunkSize = cfg.BatchSize
 	}
 
-	// Discover tag keys to distinguish tags from fields
-	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	// Resolve tag keys: prefer caller-supplied cfg.TagKeys, else DiscoverTagKeys
+	// (cached per measurement on the adapter).
+	tagKeySet, _, tagErr := a.resolveTagKeySet(ctx, measurement, cfg)
 	if tagErr != nil {
-		logger.Warn("failed to discover tag keys, strings will be treated as fields",
-			zap.String("measurement", measurement), zap.Error(tagErr))
-	}
-	tagKeySet := make(map[string]bool)
-	for _, k := range tagKeys {
-		tagKeySet[k] = true
+		return nil, tagErr
 	}
 
 	// Build query without LIMIT - InfluxDB will return data in chunks
@@ -1527,7 +1828,7 @@ func (a *InfluxDBV2Adapter) QueryData(ctx context.Context, measurement string, l
 	var maxTS int64
 
 	// Use chunked query - InfluxDB automatically splits response into chunks
-	err := a.executeV1ChunkedQuery(ctx, query, chunkSize, tagKeySet, func(records []types.Record) error {
+	err = a.executeV1ChunkedQuery(ctx, query, chunkSize, tagKeySet, func(records []types.Record) error {
 		totalRecords += len(records)
 		totalProcessed += int64(len(records))
 		for _, record := range records {
@@ -1563,15 +1864,11 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 
 	chunkSize := getBatchSize(cfg)
 
-	// Discover tag keys to distinguish tags from fields
-	tagKeys, tagErr := a.DiscoverTagKeys(ctx, measurement)
+	// Resolve tag keys: prefer caller-supplied cfg.TagKeys, else DiscoverTagKeys
+	// (cached per measurement on the adapter).
+	tagKeySet, tagKeys, tagErr := a.resolveTagKeySet(ctx, measurement, cfg)
 	if tagErr != nil {
-		logger.Warn("failed to discover tag keys, strings will be treated as fields",
-			zap.String("measurement", measurement), zap.Error(tagErr))
-	}
-	tagKeySet := make(map[string]bool)
-	for _, k := range tagKeys {
-		tagKeySet[k] = true
+		return nil, tagErr
 	}
 	whereClause := BuildWhereClauseWithTagKeys(series, tagKeys)
 
@@ -1618,140 +1915,6 @@ func (a *InfluxDBV2Adapter) QueryDataBatch(ctx context.Context, measurement stri
 		LastTimestamp: maxTS,
 		ProcessedRows: int64(totalRecords),
 	}, nil
-}
-
-func (a *InfluxDBV2Adapter) executeFluxSelect(ctx context.Context, query string, tagKeys []string) ([]types.Record, error) {
-	params, err := json.Marshal(map[string]string{"query": query})
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal query: %w", err)
-	}
-
-	u, err := url.Parse(a.config.URL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid URL: %w", err)
-	}
-	u.Path = "/api/v2/query"
-
-	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(params))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Token "+a.config.Token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// Check HTTP status code before decoding
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("flux query failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Decode into generic map to capture all fields including tags
-	var rawResults []map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&rawResults); err != nil {
-		return nil, fmt.Errorf("failed to decode flux result: %w", err)
-	}
-
-	// Build tagKeys set for O(1) lookup
-	tagKeySet := make(map[string]bool)
-	for _, k := range tagKeys {
-		tagKeySet[k] = true
-	}
-
-	var records []types.Record
-	for _, r := range rawResults {
-		record := types.NewRecord()
-
-		// Extract _time
-		if t, ok := r["_time"].(string); ok {
-			if tm, err := time.Parse(time.RFC3339Nano, t); err == nil {
-				record.Time = tm.UnixNano()
-			}
-		}
-
-		// Extract _measurement as tag
-		if m, ok := r["_measurement"].(string); ok {
-			record.AddTag("_measurement", m)
-		}
-
-		// Extract _field and _value as field
-		if f, ok := r["_field"].(string); ok {
-			if v, ok := r["_value"]; ok {
-				record.AddField(f, v)
-			}
-		}
-
-		// Distinguish tags from fields
-		// System fields: _time, _measurement, _field, _value
-		// Tag fields: any field whose name is in tagKeys
-		// Other fields: regular fields (float, int, bool)
-		for k, v := range r {
-			switch k {
-			case "_time", "_measurement", "_field", "_value":
-				continue
-			}
-			if tagKeySet[k] {
-				// This is a tag - convert value to string
-				record.AddTag(k, fmt.Sprintf("%v", v))
-			} else if k != "_field" && k != "_value" {
-				// This is a regular field
-				record.AddField(k, v)
-			}
-		}
-
-		records = append(records, *record)
-	}
-
-	return records, nil
-}
-
-func (a *InfluxDBV2Adapter) executeFluxQuery(ctx context.Context, query string) ([][]interface{}, error) {
-	params, err := json.Marshal(map[string]string{"query": query})
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal query: %w", err)
-	}
-
-	u, err := url.Parse(a.config.URL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid URL: %w", err)
-	}
-	u.Path = "/api/v2/query"
-
-	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(params))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Token "+a.config.Token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		if resp != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("flux query failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result [][]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode flux result: %w", err)
-	}
-
-	return result, nil
 }
 
 func decodeInfluxV2Config(config map[string]interface{}, cfg interface{}) error {

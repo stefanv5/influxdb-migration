@@ -168,9 +168,25 @@ func (v *ConfigValidator) validateTargets() {
 		seen[tgt.Name] = true
 
 		switch tgt.Type {
-		case "influxdb-v1", "influxdb-v2":
+		case "influxdb-v1":
 			if tgt.InfluxDB.URL == "" {
 				v.errors = append(v.errors, fmt.Errorf("target %s: influxdb URL is required", tgt.Name))
+			}
+			if tgt.Database == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: influxdb database is required for V1 target", tgt.Name))
+			}
+		case "influxdb-v2":
+			if tgt.InfluxDB.URL == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: influxdb URL is required", tgt.Name))
+			}
+			if tgt.InfluxDB.Token == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: influxdb token is required for V2 target", tgt.Name))
+			}
+			if tgt.InfluxDB.Org == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: influxdb org is required for V2 target", tgt.Name))
+			}
+			if tgt.InfluxDB.Bucket == "" {
+				v.errors = append(v.errors, fmt.Errorf("target %s: influxdb bucket is required for V2 target", tgt.Name))
 			}
 		case "mysql":
 			if tgt.Host == "" {

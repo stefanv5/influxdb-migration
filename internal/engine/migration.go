@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,63 @@ import (
 	"github.com/migration-tools/influx-migrator/pkg/types"
 	"go.uber.org/zap"
 )
+
+// writeStatusRe extracts the HTTP status code from the target adapter's
+// string-based write error of the form "write failed with status <N>: ...".
+// This is a pragmatic bridge until the target adapter returns a typed error
+// (see B4/engine-typed-error work). Matching the status lets writeWithRetry
+// avoid burning retries on permanent 4xx failures (auth/permission/malformed
+// line protocol) that no amount of backoff will fix.
+var writeStatusRe = regexp.MustCompile(`status (\d{3})`)
+
+// rateLimitStatus is the 4xx status that IS retryable: 429 Too Many Requests
+// indicates a transient rate-limit condition, not a permanent configuration
+// error.
+const rateLimitStatus = 429
+
+// isRetryableWriteError classifies a target WriteBatch error as retryable or
+// permanent. It treats 5xx server errors, 429 rate-limit responses, and
+// non-HTTP (network/timeout) errors as retryable. 4xx client errors (except
+// 429) are permanent: they reflect misconfiguration (auth, permissions) or
+// malformed input (line protocol) that retries cannot fix, so retrying only
+// wastes time and masks the underlying config bug as a transient failure.
+//
+// NOTE: This inspects the error *string* because the current target adapter
+// returns fmt.Errorf("write failed with status %d: ...") rather than a typed
+// error. Once the target adapter is refactored to return a typed
+// WriteHTTPError (deferred to the B4/engine-typed-error stream), this should
+// switch to errors.As for robustness. A nil error is treated as retryable
+// (callers must not invoke this on nil, but the safe default avoids masking a
+// nil-check bug as a permanent failure).
+func isRetryableWriteError(err error) bool {
+	if err == nil {
+		return true
+	}
+	msg := err.Error()
+	m := writeStatusRe.FindStringSubmatch(msg)
+	if m == nil {
+		// No HTTP status in the message: treat as a network/timeout error,
+		// which is retryable.
+		return true
+	}
+	var code int
+	if _, parseErr := fmt.Sscanf(m[1], "%d", &code); parseErr != nil {
+		return true
+	}
+	switch {
+	case code == rateLimitStatus:
+		return true
+	case code >= 500 && code < 600:
+		return true
+	case code >= 400 && code < 500:
+		// 4xx (except 429 handled above) is a permanent client error.
+		return false
+	default:
+		// Unknown status class (e.g. 3xx, 2xx reported as an error): default
+		// to retryable to preserve prior behavior for unusual cases.
+		return true
+	}
+}
 
 // PartitionSeries splits a slice of series into batches of maxPerBatch size
 func PartitionSeries(series []string, maxPerBatch int) [][]string {
@@ -43,6 +101,8 @@ type MigrationEngine struct {
 	wg             sync.WaitGroup
 	queueMu        sync.Mutex
 	queueClosed    bool
+	workerErrMu    sync.Mutex
+	workerErrs     []error
 }
 
 type MigrationTask struct {
@@ -69,8 +129,22 @@ func NewMigrationEngine(cfg *types.MigrationConfig, checkpointMgr *checkpoint.Ma
 		rateLimiter:    rateLimiter,
 		transformer:    NewTransformEngine(),
 		config:         cfg,
-		taskQueue:      make(chan *MigrationTask, cfg.Migration.ParallelTasks*2),
+		taskQueue:      make(chan *MigrationTask, taskQueueCapacity(cfg.Migration.ParallelTasks)),
 	}
+}
+
+func taskQueueCapacity(parallelTasks int) int {
+	if parallelTasks <= 0 {
+		return 2
+	}
+	return parallelTasks * 2
+}
+
+func workerCount(parallelTasks int) int {
+	if parallelTasks <= 0 {
+		return 1
+	}
+	return parallelTasks
 }
 
 func (e *MigrationEngine) closeQueueOnce() {
@@ -92,15 +166,81 @@ func (e *MigrationEngine) resetQueue() {
 	e.queueMu.Lock()
 	defer e.queueMu.Unlock()
 	if e.queueClosed {
-		e.taskQueue = make(chan *MigrationTask, e.config.Migration.ParallelTasks*2)
+		e.taskQueue = make(chan *MigrationTask, taskQueueCapacity(e.config.Migration.ParallelTasks))
 		e.queueClosed = false
 	}
 }
 
-func (e *MigrationEngine) Run(ctx context.Context) error {
+func (e *MigrationEngine) resetWorkerErrors() {
+	e.workerErrMu.Lock()
+	defer e.workerErrMu.Unlock()
+	e.workerErrs = nil
+}
+
+func (e *MigrationEngine) recordWorkerError(err error) {
+	if err == nil {
+		return
+	}
+	e.workerErrMu.Lock()
+	defer e.workerErrMu.Unlock()
+	e.workerErrs = append(e.workerErrs, err)
+}
+
+func (e *MigrationEngine) workerError() error {
+	e.workerErrMu.Lock()
+	defer e.workerErrMu.Unlock()
+	if len(e.workerErrs) == 0 {
+		return nil
+	}
+	if len(e.workerErrs) == 1 {
+		return e.workerErrs[0]
+	}
+	return fmt.Errorf("%d migration tasks failed; first error: %w", len(e.workerErrs), e.workerErrs[0])
+}
+
+func (e *MigrationEngine) startWorkers(ctx context.Context) int {
+	count := workerCount(e.config.Migration.ParallelTasks)
+	for i := 0; i < count; i++ {
+		e.wg.Add(1)
+		go e.worker(ctx, i)
+	}
+	return count
+}
+
+func (e *MigrationEngine) finishWorkers() error {
+	e.closeQueueOnce()
+	e.wg.Wait()
+	return e.workerError()
+}
+
+func (e *MigrationEngine) enqueueTask(ctx context.Context, task *MigrationTask) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case e.taskQueue <- task:
+		return nil
+	}
+}
+
+func (e *MigrationEngine) Run(ctx context.Context) (err error) {
+	if e.isQueueClosed() {
+		e.resetQueue()
+	}
+	e.resetWorkerErrors()
+	workerCount := e.startWorkers(ctx)
+	defer func() {
+		if workerErr := e.finishWorkers(); err == nil && workerErr != nil {
+			err = workerErr
+		}
+	}()
+
 	taskCount := 0
 	for _, taskConfig := range e.config.Tasks {
-		sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(taskConfig.Source)
+		sourceAdapterType, err := e.getSourceAdapterType(taskConfig.Source)
+		if err != nil {
+			return err
+		}
+		sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(sourceAdapterType)
 		if err != nil {
 			return fmt.Errorf("failed to get source adapter: %w", err)
 		}
@@ -139,23 +279,16 @@ func (e *MigrationEngine) Run(ctx context.Context) error {
 				return fmt.Errorf("failed to create checkpoint: %w", err)
 			}
 
-			e.taskQueue <- task
+			if err := e.enqueueTask(ctx, task); err != nil {
+				return fmt.Errorf("failed to enqueue task: %w", err)
+			}
 			taskCount++
 		}
 	}
 
-	e.closeQueueOnce()
-
-	logger.Info("starting workers",
-		zap.Int("worker_count", e.config.Migration.ParallelTasks),
+	logger.Info("queued migration tasks",
+		zap.Int("worker_count", workerCount),
 		zap.Int("task_count", taskCount))
-
-	for i := 0; i < e.config.Migration.ParallelTasks; i++ {
-		e.wg.Add(1)
-		go e.worker(ctx, i)
-	}
-
-	e.wg.Wait()
 	return nil
 }
 
@@ -320,12 +453,14 @@ func (e *MigrationEngine) worker(ctx context.Context, workerID int) {
 			func(t *MigrationTask) {
 				defer func() {
 					if r := recover(); r != nil {
+						panicErr := fmt.Errorf("panic: %v", r)
 						logger.Error("worker recovered from panic",
 							zap.Int("worker_id", workerID),
 							zap.String("task_id", t.ID),
 							zap.String("source_table", t.Mapping.SourceTable),
 							zap.Any("panic", r))
-						e.checkpointMgr.MarkTaskFailed(ctx, t.ID, t.Mapping.SourceTable, fmt.Sprintf("panic: %v", r))
+						e.checkpointMgr.MarkTaskFailed(ctx, t.ID, t.Mapping.SourceTable, panicErr.Error())
+						e.recordWorkerError(fmt.Errorf("task %s failed: %w", t.ID, panicErr))
 					}
 				}()
 				if err := e.runTask(ctx, t); err != nil {
@@ -335,6 +470,7 @@ func (e *MigrationEngine) worker(ctx context.Context, workerID int) {
 						zap.String("source_table", t.Mapping.SourceTable),
 						zap.Error(err))
 					e.checkpointMgr.MarkTaskFailed(ctx, t.ID, t.Mapping.SourceTable, err.Error())
+					e.recordWorkerError(fmt.Errorf("task %s failed: %w", t.ID, err))
 				}
 			}(task)
 		}
@@ -373,7 +509,11 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 		return fmt.Errorf("failed to mark task in progress: %w", err)
 	}
 
-	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
+	sourceAdapterType, err := e.getSourceAdapterType(task.SourceAdapter)
+	if err != nil {
+		return err
+	}
+	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(sourceAdapterType)
 	if err != nil {
 		return fmt.Errorf("failed to get source adapter: %w", err)
 	}
@@ -384,7 +524,11 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 	}
 	defer sourceAdapter.Disconnect(ctx)
 
-	targetAdapter, err := e.targetRegistry.GetTargetAdapter(task.TargetAdapter)
+	targetAdapterType, err := e.getTargetAdapterType(task.TargetAdapter)
+	if err != nil {
+		return err
+	}
+	targetAdapter, err := e.targetRegistry.GetTargetAdapter(targetAdapterType)
 	if err != nil {
 		return fmt.Errorf("failed to get target adapter: %w", err)
 	}
@@ -398,6 +542,10 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 	var lastCheckpoint *types.Checkpoint
 	var lastTimestamp int64
 	var totalProcessed int64
+	// totalWrittenRows tracks records actually passed to the target (after
+	// transform-side drops) so the completion reconciliation can compare
+	// source-read rows against written-to-target rows.
+	var totalWrittenRows int64
 
 	if existingCP != nil && existingCP.Status == types.StatusInProgress {
 		lastCheckpoint = existingCP
@@ -440,12 +588,15 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 				return nil
 			}
 
-			// Save checkpoint BEFORE write to prevent data loss on crash.
-			// This uses "at-least-once" semantics: on crash we may re-process
-			// this batch, but we will never lose data.
 			lastRecord := records[len(records)-1]
 			saveTimestamp := lastRecord.Time
 			saveProcessed := totalProcessed + int64(len(records))
+
+			written, err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
+			if err != nil {
+				return err
+			}
+			totalWrittenRows += int64(written)
 
 			// Build checkpoint with updated progress fields, preserving existing data
 			cp := &types.Checkpoint{
@@ -465,12 +616,7 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 				if e.config.Migration.FailOnCheckpointError {
 					return fmt.Errorf("failed to save checkpoint: %w", err)
 				}
-				logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
-			}
-
-			err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
-			if err != nil {
-				return err
+				logger.Warn("checkpoint save failed; persisted cursor is stale — duplication/re-work risk on crash (safe for InfluxDB overwrite semantics)", zap.Error(err))
 			}
 
 			totalProcessed = saveProcessed
@@ -486,7 +632,7 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 			lastTimestamp = checkpoint.LastTimestamp
 		}
 	default:
-		checkpoint, queryErr := e.queryWithTimeRange(ctx, sourceAdapter, sourceTable, task.Mapping, lastCheckpoint, targetAdapter, task.ID, queryCfg)
+		checkpoint, queryErr := e.queryWithTimeRange(ctx, sourceAdapter, sourceTable, task.Mapping, lastCheckpoint, targetAdapter, task.ID, queryCfg, &totalWrittenRows)
 		if queryErr != nil {
 			e.checkpointMgr.MarkTaskFailed(ctx, task.ID, task.Mapping.SourceTable, queryErr.Error())
 			return queryErr
@@ -518,6 +664,12 @@ func (e *MigrationEngine) runTaskSingleMode(ctx context.Context, task *Migration
 	if err := e.checkpointMgr.MarkTaskCompleted(ctx, task.ID, task.Mapping.SourceTable); err != nil {
 		logger.Warn("failed to mark task completed", zap.Error(err))
 	}
+	if msg := reconcileRowCounts(totalProcessed, totalWrittenRows); msg != "" {
+		logger.Warn(msg,
+			zap.String("task_id", task.ID),
+			zap.Int64("source_rows", totalProcessed),
+			zap.Int64("written_rows", totalWrittenRows))
+	}
 	logger.Info("task completed successfully",
 		zap.String("task_id", task.ID))
 
@@ -540,7 +692,11 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		return nil
 	}
 
-	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
+	sourceAdapterType, err := e.getSourceAdapterType(task.SourceAdapter)
+	if err != nil {
+		return err
+	}
+	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(sourceAdapterType)
 	if err != nil {
 		return fmt.Errorf("failed to get source adapter: %w", err)
 	}
@@ -551,7 +707,11 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 	}
 	defer sourceAdapter.Disconnect(ctx)
 
-	targetAdapter, err := e.targetRegistry.GetTargetAdapter(task.TargetAdapter)
+	targetAdapterType, err := e.getTargetAdapterType(task.TargetAdapter)
+	if err != nil {
+		return err
+	}
+	targetAdapter, err := e.targetRegistry.GetTargetAdapter(targetAdapterType)
 	if err != nil {
 		return fmt.Errorf("failed to get target adapter: %w", err)
 	}
@@ -663,16 +823,28 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 
 	// Track progress across windows
 	var lastCompletedWindowIdx int = -1
+	resumeWindowIdx := -1
+	lastCompletedBatchIdx := -1
 	var lastTimestamp int64
 	var totalMigratedRows int64
+	// totalWrittenRows accumulates records actually written to the target
+	// (after transform-side drops) across all batches for the completion
+	// reconciliation against totalMigratedRows (source-reported row count).
+	var totalWrittenRows int64
 	if lastCheckpoint != nil && lastCheckpoint.Status == types.StatusInProgress {
-		// For backward compatibility, decode window index from ProcessedRows
+		// ProcessedRows stores completed window count in batch mode. LastID stores
+		// the last completed series-batch index within the current incomplete window.
 		lastCompletedWindowIdx = int(lastCheckpoint.ProcessedRows) - 1
+		if lastCheckpoint.LastID >= 0 && (lastCheckpoint.LastTimestamp != 0 || lastCheckpoint.TotalMigratedRows != 0) {
+			resumeWindowIdx = int(lastCheckpoint.ProcessedRows)
+			lastCompletedBatchIdx = int(lastCheckpoint.LastID)
+		}
 		lastTimestamp = lastCheckpoint.LastTimestamp
 		totalMigratedRows = lastCheckpoint.TotalMigratedRows
 		logger.Info("resuming batch mode from checkpoint",
 			zap.String("task_id", task.ID),
-			zap.Int("last_completed_window", lastCompletedWindowIdx+1))
+			zap.Int("completed_window_count", int(lastCheckpoint.ProcessedRows)),
+			zap.Int("last_completed_batch", lastCompletedBatchIdx+1))
 	}
 
 	// Split time range into windows
@@ -709,6 +881,14 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 			zap.Time("window_end", windowEnd))
 
 		for i, batch := range batches {
+			if windowIdx == resumeWindowIdx && i <= lastCompletedBatchIdx {
+				logger.Debug("skipping already completed batch",
+					zap.String("task_id", task.ID),
+					zap.Int("window", windowIdx+1),
+					zap.Int("batch_index", i+1))
+				continue
+			}
+
 			logger.Debug("processing batch",
 				zap.String("task_id", task.ID),
 				zap.Int("window", windowIdx+1),
@@ -730,7 +910,12 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 					if len(records) == 0 {
 						return nil
 					}
-					return e.processBatch(ctx, task.Mapping, records, targetAdapter)
+					written, err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
+					if err != nil {
+						return err
+					}
+					totalWrittenRows += int64(written)
+					return nil
 				},
 				queryCfg,
 			)
@@ -740,8 +925,35 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 			}
 
 			if cp != nil {
-				lastTimestamp = cp.LastTimestamp
+				// Take the window-wide max rather than overwriting: different
+				// series batches cover non-monotonic time ranges, so a later
+				// batch can report a lower max timestamp than an earlier one.
+				// Overwriting would regress the reported high-water mark.
+				if cp.LastTimestamp > lastTimestamp {
+					lastTimestamp = cp.LastTimestamp
+				}
 				totalMigratedRows += cp.ProcessedRows
+			}
+
+			batchCP := &types.Checkpoint{
+				TaskID:            task.ID,
+				SourceTable:       task.Mapping.SourceTable,
+				LastID:            int64(i),
+				LastTimestamp:     lastTimestamp,
+				ProcessedRows:     int64(windowIdx),
+				TotalMigratedRows: totalMigratedRows,
+				Status:            types.StatusInProgress,
+			}
+			if lastCheckpoint != nil {
+				batchCP.TaskName = lastCheckpoint.TaskName
+				batchCP.TargetMeas = lastCheckpoint.TargetMeas
+				batchCP.MappingConfig = lastCheckpoint.MappingConfig
+			}
+			if err := e.checkpointMgr.SaveCheckpoint(ctx, batchCP); err != nil {
+				if e.config.Migration.FailOnCheckpointError {
+					return fmt.Errorf("failed to save checkpoint: %w", err)
+				}
+				logger.Warn("checkpoint save failed; persisted cursor is stale — duplication/re-work risk on crash (safe for InfluxDB overwrite semantics)", zap.Error(err))
 			}
 
 			// Progress feedback every 10 batches
@@ -758,9 +970,9 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		windowCP := &types.Checkpoint{
 			TaskID:            task.ID,
 			SourceTable:       task.Mapping.SourceTable,
-			LastID:            0,
+			LastID:            -1,
 			LastTimestamp:     lastTimestamp,
-			ProcessedRows:     int64(windowIdx + 1), // Store window index for resume
+			ProcessedRows:     int64(windowIdx + 1),
 			TotalMigratedRows: totalMigratedRows,
 			Status:            types.StatusInProgress,
 		}
@@ -773,7 +985,7 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 			if e.config.Migration.FailOnCheckpointError {
 				return fmt.Errorf("failed to save checkpoint: %w", err)
 			}
-			logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
+			logger.Warn("checkpoint save failed; persisted cursor is stale — duplication/re-work risk on crash (safe for InfluxDB overwrite semantics)", zap.Error(err))
 		}
 
 		lastCompletedWindowIdx = windowIdx
@@ -783,6 +995,13 @@ func (e *MigrationEngine) runTaskBatchMode(ctx context.Context, task *MigrationT
 		zap.String("task_id", task.ID),
 		zap.Int("total_windows", len(windows)),
 		zap.Int("total_batches", len(batches)))
+
+	if msg := reconcileRowCounts(totalMigratedRows, totalWrittenRows); msg != "" {
+		logger.Warn(msg,
+			zap.String("task_id", task.ID),
+			zap.Int64("source_rows", totalMigratedRows),
+			zap.Int64("written_rows", totalWrittenRows))
+	}
 
 	e.saveCompletedTaskCheckpoint(ctx, task, lastCheckpoint, lastTimestamp, int64(len(windows)), totalMigratedRows)
 
@@ -805,7 +1024,11 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 		return nil
 	}
 
-	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(task.SourceAdapter)
+	sourceAdapterType, err := e.getSourceAdapterType(task.SourceAdapter)
+	if err != nil {
+		return err
+	}
+	sourceAdapter, err := e.sourceRegistry.GetSourceAdapter(sourceAdapterType)
 	if err != nil {
 		return fmt.Errorf("failed to get source adapter: %w", err)
 	}
@@ -816,7 +1039,11 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 	}
 	defer sourceAdapter.Disconnect(ctx)
 
-	targetAdapter, err := e.targetRegistry.GetTargetAdapter(task.TargetAdapter)
+	targetAdapterType, err := e.getTargetAdapterType(task.TargetAdapter)
+	if err != nil {
+		return err
+	}
+	targetAdapter, err := e.targetRegistry.GetTargetAdapter(targetAdapterType)
 	if err != nil {
 		return fmt.Errorf("failed to get target adapter: %w", err)
 	}
@@ -985,6 +1212,16 @@ func (e *MigrationEngine) runTaskShardGroupMode(ctx context.Context, task *Migra
 	}
 
 	lastCheckpoint, _ := e.checkpointMgr.LoadCheckpoint(ctx, task.ID, task.Mapping.SourceTable)
+	// NOTE: Source-vs-written row reconciliation is NOT performed here for
+	// shard-group mode. The written-row count is accumulated inside
+	// migrateTimeWindow per window but is not propagated to this aggregator
+	// (shard groups run concurrently and the per-window written count is not
+	// persisted in the ShardGroupCheckpoint schema). Adding reconciliation
+	// here requires either a TotalWrittenRows field on ShardGroupCheckpoint
+	// (a SQLite store schema change, out of scope for this stream) or a
+	// shared atomic counter across concurrent shard-group goroutines. This is
+	// deferred to a later stream. Single-mode and batch-mode paths DO
+	// reconcile; see reconcileRowCounts.
 	e.saveCompletedTaskCheckpoint(ctx, task, lastCheckpoint, lastTimestamp, int64(len(relevantGroups)), totalMigratedRows)
 
 	return nil
@@ -999,13 +1236,12 @@ func (e *MigrationEngine) migrateShardGroup(ctx context.Context, task *Migration
 		zap.String("end", end.Format(time.RFC3339)))
 
 	// Get tag keys at shard group level (once per shard group, not per window)
-	// Tag keys are used by executeFluxSelect to distinguish tags from fields
+	// Tag keys feed resolveTagKeySet, whose tagKeySet is used by
+	// parseV1ValuesWithTagKeys / isTagColumn to distinguish tags from fields
+	// when parsing rows read via executeV1ChunkedQuery.
 	tagKeys, err := sourceAdapter.DiscoverTagKeys(ctx, task.Mapping.SourceTable)
 	if err != nil {
-		logger.Warn("failed to discover tag keys, treating all as fields",
-			zap.Int("shard_id", sg.ID),
-			zap.Error(err))
-		tagKeys = nil // ensure nil not empty slice on error
+		return fmt.Errorf("failed to discover tag keys for shard group %d: %w", sg.ID, err)
 	} else {
 		logger.Info("discovered tag keys for shard group",
 			zap.Int("shard_id", sg.ID),
@@ -1135,7 +1371,14 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 			window.End,
 			&types.Checkpoint{LastTimestamp: lastTimestamp},
 			func(records []types.Record) error {
-				return e.processBatch(ctx, task.Mapping, records, targetAdapter)
+				// processBatch returns the written count, but migrateTimeWindow
+				// does not currently aggregate it across windows/shard groups
+				// (that requires persisting written rows in the shard-group
+				// checkpoint, a schema change deferred to a later stream). The
+				// count is discarded here; reconciliation for shard-group mode
+				// is documented at the task-completion site.
+				_, err := e.processBatch(ctx, task.Mapping, records, targetAdapter)
+				return err
 			},
 			&types.QueryConfig{BatchSize: e.config.Migration.ChunkSize, TagKeys: tagKeys},
 		)
@@ -1144,7 +1387,13 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 		}
 
 		if batchCheckpoint != nil {
-			lastTimestamp = batchCheckpoint.LastTimestamp
+			// Take the window-wide max rather than overwriting: different
+			// series batches cover non-monotonic time ranges, so a later
+			// batch can report a lower max timestamp than an earlier one.
+			// Overwriting would regress the reported high-water mark.
+			if batchCheckpoint.LastTimestamp > lastTimestamp {
+				lastTimestamp = batchCheckpoint.LastTimestamp
+			}
 			totalProcessed += batchCheckpoint.ProcessedRows
 		}
 
@@ -1159,7 +1408,10 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 			Status:             types.StatusInProgress,
 		}
 		if err := e.checkpointMgr.SaveShardGroupCheckpoint(ctx, sgCP); err != nil {
-			logger.Warn("failed to save shard group checkpoint", zap.Error(err))
+			if e.config.Migration.FailOnCheckpointError {
+				return fmt.Errorf("failed to save shard group checkpoint: %w", err)
+			}
+			logger.Warn("checkpoint save failed; persisted cursor is stale — duplication/re-work risk on crash (safe for InfluxDB overwrite semantics)", zap.Error(err))
 		}
 	}
 
@@ -1175,13 +1427,25 @@ func (e *MigrationEngine) migrateTimeWindow(ctx context.Context, task *Migration
 		Status:             types.StatusCompleted,
 	}
 	if err := e.checkpointMgr.SaveShardGroupCheckpoint(ctx, sgCP); err != nil {
-		return fmt.Errorf("failed to save window completed checkpoint: %w", err)
+		if e.config.Migration.FailOnCheckpointError {
+			return fmt.Errorf("failed to save window completed checkpoint: %w", err)
+		}
+		// The window's data is already written to the target; a failed
+		// completion checkpoint only means the persisted cursor is stale, so
+		// on resume this window will be re-migrated. Under InfluxDB overwrite
+		// semantics that is safe duplication/re-work, not data loss.
+		logger.Warn("checkpoint save failed; persisted cursor is stale — duplication/re-work risk on crash (safe for InfluxDB overwrite semantics)", zap.Error(err))
 	}
 
 	return nil
 }
 
-func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter adapter.SourceAdapter, table string, mapping *types.MappingConfig, lastCp *types.Checkpoint, targetAdapter adapter.TargetAdapter, taskID string, queryCfg *types.QueryConfig) (*types.Checkpoint, error) {
+// queryWithTimeRange iterates over the overall time range in chunks of
+// windowDuration, calling sourceAdapter.QueryData per chunk. writtenRows, when
+// non-nil, accumulates the count of records actually written to the target
+// (after transform-side drops) so the caller can reconcile source-read vs
+// written-to-target rows at task completion.
+func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter adapter.SourceAdapter, table string, mapping *types.MappingConfig, lastCp *types.Checkpoint, targetAdapter adapter.TargetAdapter, taskID string, queryCfg *types.QueryConfig, writtenRows *int64) (*types.Checkpoint, error) {
 	// queryWithTimeRange iterates over the overall time range in chunks of windowDuration.
 	// For each chunk, it calls sourceAdapter.QueryData() which may use queryCfg.TimeWindow
 	// for its internal query batching (e.g., TDengine uses TimeWindow to set query range).
@@ -1261,10 +1525,17 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 				return nil
 			}
 
-			// Save checkpoint BEFORE write to prevent data loss on crash
 			lastRecord := records[len(records)-1]
 			saveTimestamp := lastRecord.Time
 			saveProcessed := totalProcessed + int64(len(records))
+
+			written, err := e.processBatch(ctx, &windowMapping, records, targetAdapter)
+			if err != nil {
+				return err
+			}
+			if writtenRows != nil {
+				*writtenRows += int64(written)
+			}
 
 			// Build checkpoint with updated progress fields, preserving existing data
 			windowCP := &types.Checkpoint{
@@ -1284,12 +1555,7 @@ func (e *MigrationEngine) queryWithTimeRange(ctx context.Context, sourceAdapter 
 				if e.config.Migration.FailOnCheckpointError {
 					return fmt.Errorf("failed to save checkpoint: %w", err)
 				}
-				logger.Error("failed to save checkpoint, data loss risk on crash", zap.Error(err))
-			}
-
-			err := e.processBatch(ctx, &windowMapping, records, targetAdapter)
-			if err != nil {
-				return err
+				logger.Warn("checkpoint save failed; persisted cursor is stale — duplication/re-work risk on crash (safe for InfluxDB overwrite semantics)", zap.Error(err))
 			}
 
 			totalProcessed = saveProcessed
@@ -1358,6 +1624,32 @@ func (e *MigrationEngine) startTaskCheckpoint(ctx context.Context, task *Migrati
 	return cp, nil
 }
 
+// reconcileRowCounts builds a warning message comparing the number of records
+// read from the source against the number actually written to the target. It
+// returns an empty string when the counts match (or are both zero), so callers
+// can log only on a real divergence.
+//
+// LIMITATION: This reconciliation detects transform-side drops (records that
+// became fieldless after FilterNulls/schema-transform and were skipped). It
+// CANNOT detect target-side partial-write drops such as InfluxDB's HTTP 204
+// "partial write" response that silently drops some points — the target
+// adapter currently returns nil for such responses without reporting how many
+// points were accepted. Detecting those requires the target adapter to return
+// a typed error or an accepted-count (deferred to the B4/engine-typed-error
+// stream). Persistence of the source-row count in the checkpoint is also
+// deferred: the Checkpoint struct and its SQLite store schema would need a new
+// TotalSourceRows field, which is out of scope for this stream.
+func reconcileRowCounts(sourceRows, writtenRows int64) string {
+	if sourceRows == writtenRows {
+		return ""
+	}
+	delta := sourceRows - writtenRows
+	if delta < 0 {
+		delta = -delta
+	}
+	return fmt.Sprintf("row count mismatch: source=%d target=%d, delta=%d — possible transform-side drops; verify target", sourceRows, writtenRows, delta)
+}
+
 func (e *MigrationEngine) saveCompletedTaskCheckpoint(ctx context.Context, task *MigrationTask, existingCP *types.Checkpoint, lastTimestamp, processedRows, totalMigratedRows int64) {
 	finalCP := &types.Checkpoint{
 		TaskID:            task.ID,
@@ -1406,14 +1698,22 @@ func queryConfigWithTimeRange(base *types.QueryConfig, start, end time.Time) *ty
 	return cfg
 }
 
-func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.MappingConfig, records []types.Record, targetAdapter adapter.TargetAdapter) error {
+// processBatch filters, transforms, and writes a batch of records to the
+// target. It returns the number of records actually written (after dropping
+// unwritable records) alongside any write error. A record with no fields
+// after filtering/transform cannot be encoded as valid InfluxDB line protocol
+// (a point requires at least one field), so such records are dropped here and
+// counted as a transform-side drop. The returned count lets callers reconcile
+// source-read rows against written-to-target rows.
+func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.MappingConfig, records []types.Record, targetAdapter adapter.TargetAdapter) (int, error) {
 	if e.rateLimiter != nil {
 		if err := e.rateLimiter.WaitContext(ctx, len(records)); err != nil {
-			return fmt.Errorf("rate limit wait cancelled: %w", err)
+			return 0, fmt.Errorf("rate limit wait cancelled: %w", err)
 		}
 	}
 
 	transformed := make([]types.Record, 0, len(records))
+	dropped := 0
 	for i := range records {
 		filtered := e.transformer.FilterNulls(&records[i])
 
@@ -1425,23 +1725,51 @@ func (e *MigrationEngine) processBatch(ctx context.Context, mapping *types.Mappi
 				zap.String("measurement", mapping.TargetMeasurement))
 		}
 
+		// A record with no fields cannot be written to InfluxDB: line protocol
+		// requires at least one field per point. Drop it and account for the
+		// loss so the source/written row reconciliation can surface the delta.
+		if len(filtered.Fields) == 0 {
+			dropped++
+			continue
+		}
+
 		transformed = append(transformed, *filtered)
 	}
 
 	if mapping != nil && (len(mapping.Schema.Fields) > 0 || len(mapping.Schema.Tags) > 0) {
 		schemaTransformed := make([]types.Record, 0, len(transformed))
+		schemaDropped := 0
 		for i := range transformed {
 			result := e.transformer.Transform(&transformed[i], mapping)
+			// The schema transform can also produce a fieldless record (e.g.
+			// when none of the source fields map to a configured target
+			// field). Drop those for the same line-protocol reason.
+			if len(result.Fields) == 0 {
+				schemaDropped++
+				continue
+			}
 			schemaTransformed = append(schemaTransformed, *result)
 		}
+		dropped += schemaDropped
 		transformed = schemaTransformed
+	}
+
+	if dropped > 0 {
+		logger.Warn("dropped records with no fields during transform",
+			zap.Int("input_records", len(records)),
+			zap.Int("output_records", len(transformed)),
+			zap.Int("dropped_records", dropped),
+			zap.String("measurement", mapping.TargetMeasurement))
 	}
 
 	logger.Debug("processing batch",
 		zap.Int("input_records", len(records)),
 		zap.Int("output_records", len(transformed)))
 
-	return e.writeWithRetry(ctx, mapping.TargetMeasurement, transformed, targetAdapter)
+	if err := e.writeWithRetry(ctx, mapping.TargetMeasurement, transformed, targetAdapter); err != nil {
+		return len(transformed), err
+	}
+	return len(transformed), nil
 }
 
 // writeWithRetry attempts to write records to the target adapter with exponential backoff.
@@ -1478,6 +1806,19 @@ func (e *MigrationEngine) writeWithRetry(ctx context.Context, measurement string
 		}
 
 		lastErr = err
+
+		// Permanent (non-retryable) errors — e.g. 4xx auth/permission/malformed
+		// line protocol — must not be retried. Retrying would waste time and
+		// mask the underlying config bug as a transient failure. Surface the
+		// error immediately so the operator can fix the configuration.
+		if !isRetryableWriteError(err) {
+			logger.Warn("write batch failed with permanent error, not retrying",
+				zap.Int("attempt", attempt),
+				zap.Int("max_attempts", maxAttempts),
+				zap.Error(err))
+			return fmt.Errorf("write batch failed with non-retryable error: %w", err)
+		}
+
 		logger.Warn("write batch failed, will retry",
 			zap.Int("attempt", attempt),
 			zap.Int("max_attempts", maxAttempts),
@@ -1527,6 +1868,24 @@ func (e *MigrationEngine) getTargetConfig(name string) map[string]interface{} {
 		}
 	}
 	return nil
+}
+
+func (e *MigrationEngine) getSourceAdapterType(name string) (string, error) {
+	for _, src := range e.config.Sources {
+		if src.Name == name {
+			return src.Type, nil
+		}
+	}
+	return name, nil
+}
+
+func (e *MigrationEngine) getTargetAdapterType(name string) (string, error) {
+	for _, tgt := range e.config.Targets {
+		if tgt.Name == name {
+			return tgt.Type, nil
+		}
+	}
+	return name, nil
 }
 
 func (e *MigrationEngine) sourceConfigToMap(src types.SourceConfig) map[string]interface{} {
@@ -1652,7 +2011,7 @@ func (e *MigrationEngine) getAdaptersForTask(taskName string) (string, string) {
 	return "", ""
 }
 
-func (e *MigrationEngine) Resume(ctx context.Context) error {
+func (e *MigrationEngine) Resume(ctx context.Context) (err error) {
 	// First, mark all in-progress tasks as interrupted to prevent race with running workers.
 	// This ensures that any task still being processed by workers will be properly
 	// abandoned rather than having both the worker and Resume() operate on it.
@@ -1672,6 +2031,13 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 	if e.isQueueClosed() {
 		e.resetQueue()
 	}
+	e.resetWorkerErrors()
+	e.startWorkers(ctx)
+	defer func() {
+		if workerErr := e.finishWorkers(); err == nil && workerErr != nil {
+			err = workerErr
+		}
+	}()
 
 	for _, cp := range failedTasks {
 		logger.Info("resuming failed task",
@@ -1688,7 +2054,9 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 			Status:        types.StatusPending,
 		}
 
-		e.taskQueue <- task
+		if err := e.enqueueTask(ctx, task); err != nil {
+			return fmt.Errorf("failed to enqueue failed task: %w", err)
+		}
 	}
 
 	for _, cp := range inProgressTasks {
@@ -1706,17 +2074,10 @@ func (e *MigrationEngine) Resume(ctx context.Context) error {
 			Status:        types.StatusPending,
 		}
 
-		e.taskQueue <- task
+		if err := e.enqueueTask(ctx, task); err != nil {
+			return fmt.Errorf("failed to enqueue interrupted task: %w", err)
+		}
 	}
-
-	e.closeQueueOnce()
-
-	for i := 0; i < e.config.Migration.ParallelTasks; i++ {
-		e.wg.Add(1)
-		go e.worker(ctx, i)
-	}
-
-	e.wg.Wait()
 	return nil
 }
 

@@ -28,6 +28,8 @@ func (m *Manager) Close() error {
 }
 
 func (m *Manager) CreateCheckpoint(task *types.Checkpoint) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.store.SaveCheckpoint(task)
 }
 
@@ -70,14 +72,20 @@ func (m *Manager) ListCheckpoints(ctx context.Context, taskName string) ([]*type
 }
 
 func (m *Manager) GetPendingTasks(ctx context.Context) ([]*types.Checkpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.store.GetTasksByStatus(types.StatusPending)
 }
 
 func (m *Manager) GetFailedTasks(ctx context.Context) ([]*types.Checkpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.store.GetTasksByStatus(types.StatusFailed)
 }
 
 func (m *Manager) GetInProgressTasks(ctx context.Context) ([]*types.Checkpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.store.GetTasksByStatus(types.StatusInProgress)
 }
 

@@ -3,6 +3,7 @@ package checkpoint
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -489,6 +490,166 @@ func TestManager_ShardGroupCheckpointUpsertUpdatesSameWindow(t *testing.T) {
 	if loaded.LastCompletedBatch != 3 || loaded.LastTimestamp != 4000 || loaded.TotalProcessedRows != 40 || loaded.Status != types.StatusCompleted {
 		t.Fatalf("loaded checkpoint was not updated: %+v", loaded)
 	}
+}
+
+func queryPragma(t *testing.T, db *sql.DB, pragma string) string {
+	t.Helper()
+	var val string
+	if err := db.QueryRow("PRAGMA " + pragma).Scan(&val); err != nil {
+		t.Fatalf("failed to query PRAGMA %s: %v", pragma, err)
+	}
+	return val
+}
+
+func TestSQLiteStore_JournalModeIsWAL(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	mode := queryPragma(t, store.db, "journal_mode")
+	if mode != "wal" {
+		t.Fatalf("expected journal_mode=wal, got %q", mode)
+	}
+}
+
+func TestSQLiteStore_BusyTimeoutIs5000(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	val := queryPragma(t, store.db, "busy_timeout")
+	if val != "5000" {
+		t.Fatalf("expected busy_timeout=5000, got %q", val)
+	}
+}
+
+func TestSQLiteStore_SynchronousIsNormal(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	val := queryPragma(t, store.db, "synchronous")
+	if val != "1" { // NORMAL maps to 1 in pragma output
+		t.Fatalf("expected synchronous=1 (NORMAL), got %q", val)
+	}
+}
+
+func TestSQLiteStore_MaxOpenConnsIsOne(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("expected MaxOpenConnections=1, got %d", got)
+	}
+}
+
+// --- D1: cross-process file lock tests ---
+
+func TestSQLiteStore_SecondLiveProcessIsBlocked(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("first NewSQLiteStore failed: %v", err)
+	}
+	defer first.Close()
+
+	// A second store on the same dir while the first is alive must fail.
+	_, err = NewSQLiteStore(dir)
+	if err == nil {
+		t.Fatal("expected second NewSQLiteStore to fail with a lock error, got nil")
+	}
+}
+
+func TestSQLiteStore_LockFileCreatedOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	lockPath := filepath.Join(dir, "checkpoints.db.lock")
+	info, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatalf("expected lock file to exist at %s: %v", lockPath, err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("expected lock file to contain pid/host/timestamp, got empty file")
+	}
+}
+
+func TestSQLiteStore_StaleLockFromDeadPidIsReclaimed(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "checkpoints.db.lock")
+
+	// Write a stale lock file with a pid that is almost certainly not alive.
+	// current pid + 100000 is far outside the realistic pid range on any OS.
+	stalePid := os.Getpid() + 100000
+	host, _ := os.Hostname()
+	content := fmt.Sprintf("pid=%d\nhost=%s\nstarted=%s\n", stalePid, host, time.Now().UTC().Format(time.RFC3339))
+	if err := os.WriteFile(lockPath, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write stale lock file: %v", err)
+	}
+
+	// NewSQLiteStore should detect the stale holder and reclaim the lock.
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("expected NewSQLiteStore to reclaim stale lock, got error: %v", err)
+	}
+	defer store.Close()
+}
+
+func TestSQLiteStore_CloseRemovesLockFile(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	lockPath := filepath.Join(dir, "checkpoints.db.lock")
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("lock file should exist before Close: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected lock file removed after Close, got err=%v", err)
+	}
+}
+
+func TestSQLiteStore_LockReleasedAllowsSecondOpen(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("first NewSQLiteStore failed: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+
+	// After the first store is closed, a second store must succeed.
+	second, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatalf("expected second NewSQLiteStore to succeed after Close, got: %v", err)
+	}
+	defer second.Close()
 }
 
 func TestManager_MigratesLegacyCompletedShardGroupCheckpointAsInProgressWithResetProgress(t *testing.T) {

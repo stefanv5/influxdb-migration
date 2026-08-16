@@ -39,7 +39,9 @@ type SourceAdapter interface {
 	DiscoverSeriesInTimeWindow(ctx context.Context, measurement string, startTime, endTime time.Time) ([]string, error)
 
 	// DiscoverTagKeys returns all tag key names for a measurement.
-	// Used by executeFluxSelect to distinguish tags from fields in V2 sources.
+	// Used by resolveTagKeySet to build the tagKeySet that parseV1ValuesWithTagKeys
+	// and isTagColumn consult to distinguish tags from fields when parsing rows
+	// read via the V1-compatibility chunked InfluxQL API (executeV1ChunkedQuery).
 	// V1 sources return nil/empty slice as they don't need tag/field distinction.
 	DiscoverTagKeys(ctx context.Context, measurement string) ([]string, error)
 

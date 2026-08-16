@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -299,7 +300,7 @@ func TestValidate_ValidConfig(t *testing.T) {
 			{Name: "src1", Type: "mysql", Host: "localhost", Port: 3306},
 		},
 		Targets: []types.TargetConfig{
-			{Name: "tgt1", Type: "influxdb-v1", InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"}},
+			{Name: "tgt1", Type: "influxdb-v1", Database: "metrics", InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"}},
 		},
 		Tasks: []types.TaskConfig{
 			{Name: "task1", Source: "src1", Target: "tgt1", Mappings: []types.MappingConfig{
@@ -323,7 +324,7 @@ func TestValidate_DefaultValues(t *testing.T) {
 			{Name: "src1", Type: "mysql", Host: "localhost", Port: 3306},
 		},
 		Targets: []types.TargetConfig{
-			{Name: "tgt1", Type: "influxdb-v1", InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"}},
+			{Name: "tgt1", Type: "influxdb-v1", Database: "metrics", InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"}},
 		},
 		Tasks: []types.TaskConfig{
 			{Name: "task1", Source: "src1", Target: "tgt1", Mappings: []types.MappingConfig{
@@ -360,6 +361,91 @@ func TestValidate_DefaultValues(t *testing.T) {
 
 	if cfg.Retry.MaxAttempts != 3 {
 		t.Errorf("Expected default max attempts 3, got %d", cfg.Retry.MaxAttempts)
+	}
+}
+
+func TestValidate_InfluxDBV1TargetRequiresDatabase(t *testing.T) {
+	cfg := validInfluxTargetValidationConfig()
+	cfg.Targets[0] = types.TargetConfig{
+		Name:     "tgt1",
+		Type:     "influxdb-v1",
+		InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"},
+	}
+
+	err := NewValidator(cfg).Validate()
+	if err == nil {
+		t.Fatal("expected error for missing V1 target database")
+	}
+	if !strings.Contains(err.Error(), "database is required") {
+		t.Fatalf("expected database error, got %v", err)
+	}
+}
+
+func TestValidate_InfluxDBV1TargetCompleteConfig(t *testing.T) {
+	cfg := validInfluxTargetValidationConfig()
+	cfg.Targets[0] = types.TargetConfig{
+		Name:     "tgt1",
+		Type:     "influxdb-v1",
+		Database: "metrics",
+		InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"},
+	}
+
+	if err := NewValidator(cfg).Validate(); err != nil {
+		t.Fatalf("expected complete V1 target config to validate, got %v", err)
+	}
+}
+
+func TestValidate_InfluxDBV2TargetRequiresTokenOrgAndBucket(t *testing.T) {
+	cfg := validInfluxTargetValidationConfig()
+	cfg.Targets[0] = types.TargetConfig{
+		Name:     "tgt1",
+		Type:     "influxdb-v2",
+		InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"},
+	}
+
+	err := NewValidator(cfg).Validate()
+	if err == nil {
+		t.Fatal("expected error for missing V2 target fields")
+	}
+	for _, want := range []string{"token is required", "org is required", "bucket is required"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected %q in validation error, got %v", want, err)
+		}
+	}
+}
+
+func TestValidate_InfluxDBV2TargetCompleteConfig(t *testing.T) {
+	cfg := validInfluxTargetValidationConfig()
+	cfg.Targets[0] = types.TargetConfig{
+		Name: "tgt1",
+		Type: "influxdb-v2",
+		InfluxDB: types.InfluxDBTargetConfig{
+			URL:    "http://localhost:8086",
+			Token:  "token",
+			Org:    "org",
+			Bucket: "bucket",
+		},
+	}
+
+	if err := NewValidator(cfg).Validate(); err != nil {
+		t.Fatalf("expected complete V2 target config to validate, got %v", err)
+	}
+}
+
+func validInfluxTargetValidationConfig() *types.MigrationConfig {
+	return &types.MigrationConfig{
+		Global: types.GlobalConfig{Name: "test"},
+		Sources: []types.SourceConfig{
+			{Name: "src1", Type: "mysql", Host: "localhost", Port: 3306},
+		},
+		Targets: []types.TargetConfig{
+			{Name: "tgt1", Type: "influxdb-v1", Database: "metrics", InfluxDB: types.InfluxDBTargetConfig{URL: "http://localhost:8086"}},
+		},
+		Tasks: []types.TaskConfig{
+			{Name: "task1", Source: "src1", Target: "tgt1", Mappings: []types.MappingConfig{
+				{SourceTable: "t1", TargetMeasurement: "m1"},
+			}},
+		},
 	}
 }
 
